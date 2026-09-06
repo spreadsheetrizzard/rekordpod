@@ -27,6 +27,11 @@ except ImportError as exc:
         "rekordbox-pdb is required: python3 -m pip install rekordbox-pdb"
     ) from exc
 
+try:
+    from pyrekordbox.anlz import AnlzFile
+except ImportError:
+    AnlzFile = None
+
 
 SCHEMA_VERSION = 1
 RS = "\x1e"
@@ -105,12 +110,94 @@ def create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(stable_key) REFERENCES tracks(stable_key)
         );
         CREATE INDEX playlist_tracks_track ON playlist_tracks(stable_key);
+        CREATE TABLE beat_grid_points (
+            stable_key TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            beat INTEGER NOT NULL,
+            bpm REAL NOT NULL,
+            time_seconds REAL NOT NULL,
+            PRIMARY KEY(stable_key, ordinal),
+            FOREIGN KEY(stable_key) REFERENCES tracks(stable_key)
+        );
+        CREATE TABLE cue_points (
+            stable_key TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            cue_kind TEXT NOT NULL,
+            hot_cue INTEGER NOT NULL,
+            time_seconds REAL NOT NULL,
+            loop_time_seconds REAL,
+            comment TEXT NOT NULL DEFAULT '',
+            color_rgb TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(stable_key, ordinal),
+            FOREIGN KEY(stable_key) REFERENCES tracks(stable_key)
+        );
         """
     )
 
 
-def convert(source: Path, destination: Path) -> dict[str, int]:
+def read_analysis(root: Path | None) -> dict[str, dict]:
+    if root is None:
+        return {}
+    if AnlzFile is None:
+        raise SystemExit(
+            "pyrekordbox is required for --analysis-root: "
+            "python3 -m pip install pyrekordbox"
+        )
+
+    result: dict[str, dict] = {}
+    for dat_path in sorted(root.rglob("ANLZ*.DAT")):
+        try:
+            dat = AnlzFile.parse_file(dat_path)
+            audio_path = dat.get("PPTH")
+        except Exception as exc:
+            print(f"warning: could not parse {dat_path}: {exc}", file=sys.stderr)
+            continue
+
+        analysis = {"beats": [], "cues": []}
+        if "PQTZ" in dat:
+            beats, bpms, times = dat.get("PQTZ")
+            analysis["beats"] = [
+                (int(beat), float(bpm), float(time))
+                for beat, bpm, time in zip(beats, bpms, times)
+            ]
+
+        files = [dat]
+        ext_path = dat_path.with_suffix(".EXT")
+        if ext_path.exists():
+            try:
+                files.append(AnlzFile.parse_file(ext_path))
+            except Exception as exc:
+                print(f"warning: could not parse {ext_path}: {exc}", file=sys.stderr)
+
+        extended = []
+        legacy = []
+        for anlz in files:
+            for tag_name, target in (("PCO2", extended), ("PCOB", legacy)):
+                if tag_name not in anlz:
+                    continue
+                for cue_list in anlz.getall(tag_name):
+                    list_kind = str(cue_list.get("type", cue_list.get("cue_type", "memory")))
+                    for entry in cue_list.entries:
+                        time_ms = int(entry.time)
+                        loop_ms = int(entry.loop_time)
+                        color = ""
+                        if all(key in entry for key in ("color_red", "color_green", "color_blue")):
+                            color = "#{:02X}{:02X}{:02X}".format(
+                                entry.color_red, entry.color_green, entry.color_blue
+                            )
+                        target.append(
+                            (list_kind, int(entry.hot_cue), time_ms / 1000,
+                             None if loop_ms < 0 else loop_ms / 1000,
+                             str(entry.get("comment", "")), color)
+                        )
+        analysis["cues"] = list(dict.fromkeys(extended or legacy))
+        result[audio_path] = analysis
+    return result
+
+
+def convert(source: Path, destination: Path, analysis_root: Path | None = None) -> dict[str, int]:
     db = Database.from_file(source)
+    analyses = read_analysis(analysis_root)
     destination.mkdir(parents=True, exist_ok=True)
     playlist_root = destination / "Playlists"
     playlist_root.mkdir(exist_ok=True)
@@ -147,19 +234,33 @@ def convert(source: Path, destination: Path) -> dict[str, int]:
             track_id = str(track.id)
             stable_key = f"rb:{track_id}"
             bpm = track.tempo / 100 if track.tempo else None
+            analysis = analyses.get(track.file_path, {"beats": [], "cues": []})
+            cue_count = len(analysis["cues"])
+            beat_grid_count = len(analysis["beats"])
             values = [
                 track_id, track.file_path, track.title, artist, album, genre,
                 "" if bpm is None else str(bpm), musical_key,
                 str(track.year or ""), str(track.rating or ""),
                 str(track.play_count or ""), track.comment, track.date_added,
-                color, "0", "0",
+                color, str(cue_count), str(beat_grid_count),
             ]
             connection.execute(
                 "INSERT INTO tracks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (stable_key, track_id, track.file_path, track.title, artist, album,
                  genre, bpm, musical_key, track.year or None, track.rating or None,
                  track.play_count or None, track.comment, track.date_added, color,
-                 0, 0, digest(values)),
+                 cue_count, beat_grid_count, digest(values)),
+            )
+            connection.executemany(
+                "INSERT INTO beat_grid_points VALUES (?,?,?,?,?)",
+                ((stable_key, ordinal, beat, grid_bpm, time_seconds)
+                 for ordinal, (beat, grid_bpm, time_seconds)
+                 in enumerate(analysis["beats"])),
+            )
+            connection.executemany(
+                "INSERT INTO cue_points VALUES (?,?,?,?,?,?,?,?)",
+                ((stable_key, ordinal, *cue)
+                 for ordinal, cue in enumerate(analysis["cues"])),
             )
 
         playlist_count = 0
@@ -197,6 +298,9 @@ def convert(source: Path, destination: Path) -> dict[str, int]:
         "playlists": playlist_count,
         "playlist_entries": playlist_entry_count,
         "folders": sum(node.is_folder for node in db.playlist_tree),
+        "analyzed_tracks": sum(bool(value["beats"] or value["cues"]) for value in analyses.values()),
+        "beat_grid_points": sum(len(value["beats"]) for value in analyses.values()),
+        "cue_points": sum(len(value["cues"]) for value in analyses.values()),
     }
     (destination / "rbprep-summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -208,11 +312,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("export_pdb", type=Path)
     parser.add_argument("output_directory", type=Path)
+    parser.add_argument("--analysis-root", type=Path,
+                        help="directory containing Rekordbox USBANLZ folders")
     args = parser.parse_args()
-    summary = convert(args.export_pdb, args.output_directory)
+    summary = convert(args.export_pdb, args.output_directory, args.analysis_root)
     print(
         f"Imported {summary['tracks']} tracks and {summary['playlist_entries']} "
-        f"ordered entries across {summary['playlists']} playlists."
+        f"ordered entries across {summary['playlists']} playlists; "
+        f"{summary['beat_grid_points']} beat-grid points and "
+        f"{summary['cue_points']} cues."
     )
     return 0
 

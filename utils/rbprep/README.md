@@ -9,16 +9,17 @@ database and produces two inputs:
   Drag'n'Dunk (`rb:<TrackID>`).
 
 The SQLite cache includes title, artist, album, genre, BPM, key, year, rating,
-play count, comments, date added, color, playlist membership, and ordinal.
-Cue and beat-grid columns are present but remain zero until the ANLZ importer is
-connected.
+play count, comments, date added, color, playlist membership, and ordinal. When
+`--analysis-root` is supplied, it also joins ANLZ files to tracks by their exact
+`PPTH` audio paths and imports every beat-grid point and memory/hot cue.
 
 Install the parser and run:
 
 ```
-python3 -m pip install rekordbox-pdb
+python3 -m pip install -r utils/rbprep/requirements.txt
 python3 utils/rbprep/import_rekordbox.py \
-    /Volumes/RIZZPOD/PIONEER/rekordbox/export.pdb output-directory
+    /Volumes/RIZZPOD/PIONEER/rekordbox/export.pdb output-directory \
+    --analysis-root /Volumes/RIZZPOD/PIONEER/USBANLZ
 ```
 
 The importer builds the SQLite cache under a temporary name and atomically

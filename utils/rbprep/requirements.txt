@@ -1,1 +1,2 @@
 rekordbox-pdb==0.1.0
+pyrekordbox==0.4.4
