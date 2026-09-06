@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Convert a rekordbox Device Library export into RBPrep/Rockbox inputs.
+
+The metadata model deliberately mirrors Drag'n'Dunk's ImportedTrackRow and
+playlist ordering.  Audio paths in export.pdb are already rooted at the
+export volume (normally /Contents/...) and are written unchanged to M3U8.
+
+Requires the MIT-licensed ``rekordbox-pdb`` Python package.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+try:
+    from rekordbox_pdb import Database
+except ImportError as exc:
+    raise SystemExit(
+        "rekordbox-pdb is required: python3 -m pip install rekordbox-pdb"
+    ) from exc
+
+
+SCHEMA_VERSION = 1
+RS = "\x1e"
+BAD_COMPONENT = re.compile(r"[/:\\\x00-\x1f]")
+
+
+def digest(values: list[str]) -> str:
+    """Match Drag'n'Dunk's SHA-256 metadata hashing convention."""
+    return hashlib.sha256(RS.join(values).encode("utf-8")).hexdigest()
+
+
+def safe_component(value: str) -> str:
+    value = BAD_COMPONENT.sub("_", value).strip().rstrip(".")
+    return value or "UNTITLED"
+
+
+def playlist_paths(nodes) -> dict[int, tuple[str, ...]]:
+    by_id = {node.id: node for node in nodes}
+    memo: dict[int, tuple[str, ...]] = {}
+
+    def resolve(node_id: int, seen: frozenset[int] = frozenset()) -> tuple[str, ...]:
+        if node_id in memo:
+            return memo[node_id]
+        if node_id in seen:
+            raise ValueError(f"playlist tree cycle at node {node_id}")
+        node = by_id[node_id]
+        parent = () if not node.parent_id else resolve(node.parent_id, seen | {node_id})
+        memo[node_id] = parent + (node.name,)
+        return memo[node_id]
+
+    for node in nodes:
+        resolve(node.id)
+    return memo
+
+
+def create_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE tracks (
+            stable_key TEXT PRIMARY KEY,
+            rekordbox_track_id TEXT NOT NULL UNIQUE,
+            location TEXT,
+            title TEXT NOT NULL,
+            artist TEXT NOT NULL DEFAULT '',
+            album TEXT NOT NULL DEFAULT '',
+            genre TEXT NOT NULL DEFAULT 'UNCLASSIFIED',
+            bpm REAL,
+            musical_key TEXT NOT NULL DEFAULT '',
+            year INTEGER,
+            rating INTEGER,
+            play_count INTEGER,
+            comments TEXT NOT NULL DEFAULT '',
+            date_added TEXT NOT NULL DEFAULT '',
+            color TEXT NOT NULL DEFAULT '',
+            cue_count INTEGER NOT NULL DEFAULT 0,
+            beat_grid_count INTEGER NOT NULL DEFAULT 0,
+            metadata_hash TEXT NOT NULL
+        );
+        CREATE INDEX tracks_location ON tracks(location);
+        CREATE INDEX tracks_artist ON tracks(artist);
+        CREATE INDEX tracks_genre ON tracks(genre);
+        CREATE TABLE playlists (
+            rekordbox_playlist_id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            membership_hash TEXT NOT NULL
+        );
+        CREATE TABLE playlist_tracks (
+            rekordbox_playlist_id INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            stable_key TEXT NOT NULL,
+            PRIMARY KEY(rekordbox_playlist_id, ordinal),
+            FOREIGN KEY(rekordbox_playlist_id) REFERENCES playlists(rekordbox_playlist_id),
+            FOREIGN KEY(stable_key) REFERENCES tracks(stable_key)
+        );
+        CREATE INDEX playlist_tracks_track ON playlist_tracks(stable_key);
+        """
+    )
+
+
+def convert(source: Path, destination: Path) -> dict[str, int]:
+    db = Database.from_file(source)
+    destination.mkdir(parents=True, exist_ok=True)
+    playlist_root = destination / "Playlists"
+    playlist_root.mkdir(exist_ok=True)
+    cache_path = destination / "rbprep-library.sqlite"
+    temporary_cache = destination / ".rbprep-library.sqlite.tmp"
+    temporary_cache.unlink(missing_ok=True)
+
+    artists = {row.id: row.name for row in db.artists}
+    albums = {row.id: row.name for row in db.albums}
+    genres = {row.id: row.name for row in db.genres}
+    keys = {row.id: row.name for row in db.keys}
+    colors = {row.id: row.name for row in db.colors}
+    tracks = {row.id: row for row in db.tracks}
+    paths = playlist_paths(db.playlist_tree)
+    entries: dict[int, list] = defaultdict(list)
+    for entry in db.playlist_entries:
+        entries[entry.playlist_id].append(entry)
+    for rows in entries.values():
+        rows.sort(key=lambda row: row.entry_index)
+
+    connection = sqlite3.connect(temporary_cache)
+    try:
+        create_schema(connection)
+        connection.executemany(
+            "INSERT INTO metadata(key, value) VALUES (?, ?)",
+            [("schema_version", str(SCHEMA_VERSION)), ("source", str(source))],
+        )
+        for track in tracks.values():
+            artist = artists.get(track.artist_id, "")
+            album = albums.get(track.album_id, "")
+            genre = genres.get(track.genre_id, "").strip() or "UNCLASSIFIED"
+            musical_key = keys.get(track.key_id, "")
+            color = colors.get(track.color_id, "")
+            track_id = str(track.id)
+            stable_key = f"rb:{track_id}"
+            bpm = track.tempo / 100 if track.tempo else None
+            values = [
+                track_id, track.file_path, track.title, artist, album, genre,
+                "" if bpm is None else str(bpm), musical_key,
+                str(track.year or ""), str(track.rating or ""),
+                str(track.play_count or ""), track.comment, track.date_added,
+                color, "0", "0",
+            ]
+            connection.execute(
+                "INSERT INTO tracks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (stable_key, track_id, track.file_path, track.title, artist, album,
+                 genre, bpm, musical_key, track.year or None, track.rating or None,
+                 track.play_count or None, track.comment, track.date_added, color,
+                 0, 0, digest(values)),
+            )
+
+        playlist_count = 0
+        playlist_entry_count = 0
+        for node in sorted(db.playlist_tree, key=lambda row: (paths[row.id][:-1], row.sort_order)):
+            if node.is_folder:
+                continue
+            components = tuple(safe_component(value) for value in paths[node.id])
+            relative = Path(*components).with_suffix(".m3u8")
+            target = playlist_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            ordered = [row for row in entries.get(node.id, []) if row.track_id in tracks]
+            track_ids = [str(row.track_id) for row in ordered]
+            playlist_path = " / ".join(paths[node.id])
+            connection.execute(
+                "INSERT INTO playlists VALUES (?,?,?,?)",
+                (node.id, playlist_path, node.name, digest(track_ids)),
+            )
+            connection.executemany(
+                "INSERT INTO playlist_tracks VALUES (?,?,?)",
+                ((node.id, ordinal, f"rb:{row.track_id}") for ordinal, row in enumerate(ordered)),
+            )
+            body = "#EXTM3U\n" + "".join(f"{tracks[row.track_id].file_path}\n" for row in ordered)
+            target.write_text(body, encoding="utf-8", newline="\n")
+            playlist_count += 1
+            playlist_entry_count += len(ordered)
+
+        connection.commit()
+    finally:
+        connection.close()
+    os.replace(temporary_cache, cache_path)
+
+    summary = {
+        "tracks": len(tracks),
+        "playlists": playlist_count,
+        "playlist_entries": playlist_entry_count,
+        "folders": sum(node.is_folder for node in db.playlist_tree),
+    }
+    (destination / "rbprep-summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return summary
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("export_pdb", type=Path)
+    parser.add_argument("output_directory", type=Path)
+    args = parser.parse_args()
+    summary = convert(args.export_pdb, args.output_directory)
+    print(
+        f"Imported {summary['tracks']} tracks and {summary['playlist_entries']} "
+        f"ordered entries across {summary['playlists']} playlists."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
