@@ -18,6 +18,7 @@ import re
 import sqlite3
 import struct
 import sys
+import time
 import zlib
 from collections import defaultdict
 from pathlib import Path
@@ -38,6 +39,32 @@ except ImportError:
 SCHEMA_VERSION = 1
 RS = "\x1e"
 BAD_COMPONENT = re.compile(r"[/:\\\x00-\x1f]")
+
+
+class Progress:
+    """Small dependency-free terminal progress bar for long RBPrep jobs."""
+
+    def __init__(self, phase: str, total: int):
+        self.phase = phase
+        self.total = max(0, total)
+        self.started = time.monotonic()
+        self.last_drawn = -1
+        self.update(0, force=True)
+
+    def update(self, completed: int, force: bool = False) -> None:
+        completed = min(max(0, completed), self.total)
+        percent = 100 if self.total == 0 else int(completed * 100 / self.total)
+        if not force and completed != self.total and percent == self.last_drawn:
+            return
+        self.last_drawn = percent
+        filled = int(28 * percent / 100)
+        bar = "█" * filled + "░" * (28 - filled)
+        elapsed = int(time.monotonic() - self.started)
+        line = (
+            f"\r{self.phase:<12} [{bar}] {percent:3d}%  "
+            f"{completed:,}/{self.total:,}  {elapsed // 60:02d}:{elapsed % 60:02d}"
+        )
+        print(line, end="\n" if completed == self.total else "", flush=True)
 
 
 def digest(values: list[str]) -> str:
@@ -156,12 +183,15 @@ def read_analysis(root: Path | None) -> dict[str, dict]:
         )
 
     result: dict[str, dict] = {}
-    for dat_path in sorted(root.rglob("ANLZ*.DAT")):
+    dat_paths = sorted(root.rglob("ANLZ*.DAT"))
+    progress = Progress("ANLZ files", len(dat_paths))
+    for file_index, dat_path in enumerate(dat_paths, 1):
         try:
             dat = AnlzFile.parse_file(dat_path)
             audio_path = dat.get("PPTH")
         except Exception as exc:
             print(f"warning: could not parse {dat_path}: {exc}", file=sys.stderr)
+            progress.update(file_index)
             continue
 
         analysis = {"beats": [], "cues": [], "waveform": None}
@@ -221,10 +251,12 @@ def read_analysis(root: Path | None) -> dict[str, dict]:
                         )
         analysis["cues"] = list(dict.fromkeys(extended or legacy))
         result[audio_path] = analysis
+        progress.update(file_index)
     return result
 
 
 def convert(source: Path, destination: Path, analysis_root: Path | None = None) -> dict[str, int]:
+    print("Reading Rekordbox Device Library…", flush=True)
     db = Database.from_file(source)
     analyses = read_analysis(analysis_root)
     destination.mkdir(parents=True, exist_ok=True)
@@ -254,7 +286,8 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
             "INSERT INTO metadata(key, value) VALUES (?, ?)",
             [("schema_version", str(SCHEMA_VERSION)), ("source", str(source))],
         )
-        for track in tracks.values():
+        track_progress = Progress("Tracks", len(tracks))
+        for track_index, track in enumerate(tracks.values(), 1):
             artist = artists.get(track.artist_id, "")
             album = albums.get(track.album_id, "")
             genre = genres.get(track.genre_id, "").strip() or "UNCLASSIFIED"
@@ -298,12 +331,13 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
                     "INSERT INTO waveforms VALUES (?,?,?,?,?,?)",
                     (stable_key, *analysis["waveform"]),
                 )
+            track_progress.update(track_index)
 
         playlist_count = 0
         playlist_entry_count = 0
-        for node in sorted(db.playlist_tree, key=lambda row: (paths[row.id][:-1], row.sort_order)):
-            if node.is_folder:
-                continue
+        playlist_nodes = [node for node in db.playlist_tree if not node.is_folder]
+        playlist_progress = Progress("Playlists", len(playlist_nodes))
+        for node in sorted(playlist_nodes, key=lambda row: (paths[row.id][:-1], row.sort_order)):
             components = tuple(safe_component(value) for value in paths[node.id])
             relative = Path(*components).with_suffix(".m3u8")
             target = playlist_root / relative
@@ -323,6 +357,7 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
             target.write_text(body, encoding="utf-8", newline="\n")
             playlist_count += 1
             playlist_entry_count += len(ordered)
+            playlist_progress.update(playlist_count)
 
         connection.commit()
     finally:
