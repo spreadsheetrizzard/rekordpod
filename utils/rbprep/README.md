@@ -12,6 +12,9 @@ The SQLite cache includes title, artist, album, genre, BPM, key, year, rating,
 play count, comments, date added, color, playlist membership, and ordinal. When
 `--analysis-root` is supplied, it also joins ANLZ files to tracks by their exact
 `PPTH` audio paths and imports every beat-grid point and memory/hot cue.
+The compact `waveforms` table preserves Rekordbox's native `PWV4` RGB overview
+as zlib-compressed amplitude/red/green/blue byte tuples (1,200 points on the
+captured exports), ready for a viewport without decoding the audio.
 
 Install the parser and run:
 

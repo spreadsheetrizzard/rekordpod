@@ -16,7 +16,9 @@ import json
 import os
 import re
 import sqlite3
+import struct
 import sys
+import zlib
 from collections import defaultdict
 from pathlib import Path
 
@@ -131,6 +133,15 @@ def create_schema(connection: sqlite3.Connection) -> None:
             PRIMARY KEY(stable_key, ordinal),
             FOREIGN KEY(stable_key) REFERENCES tracks(stable_key)
         );
+        CREATE TABLE waveforms (
+            stable_key TEXT PRIMARY KEY,
+            source_format TEXT NOT NULL,
+            point_count INTEGER NOT NULL,
+            channels TEXT NOT NULL,
+            encoding TEXT NOT NULL,
+            samples BLOB NOT NULL,
+            FOREIGN KEY(stable_key) REFERENCES tracks(stable_key)
+        );
         """
     )
 
@@ -153,7 +164,7 @@ def read_analysis(root: Path | None) -> dict[str, dict]:
             print(f"warning: could not parse {dat_path}: {exc}", file=sys.stderr)
             continue
 
-        analysis = {"beats": [], "cues": []}
+        analysis = {"beats": [], "cues": [], "waveform": None}
         if "PQTZ" in dat:
             beats, bpms, times = dat.get("PQTZ")
             analysis["beats"] = [
@@ -168,6 +179,24 @@ def read_analysis(root: Path | None) -> dict[str, dict]:
                 files.append(AnlzFile.parse_file(ext_path))
             except Exception as exc:
                 print(f"warning: could not parse {ext_path}: {exc}", file=sys.stderr)
+
+        for anlz in reversed(files):
+            if "PWV4" not in anlz:
+                continue
+            heights, colors, _ = anlz.get("PWV4")
+            samples = bytearray()
+            for height, color in zip(heights, colors):
+                samples.extend(
+                    struct.pack(
+                        "BBBB", int(max(height)),
+                        *(max(0, min(255, int(value))) for value in color[1]),
+                    )
+                )
+            analysis["waveform"] = (
+                "PWV4", len(heights), "amplitude,r,g,b", "zlib-u8x4",
+                zlib.compress(bytes(samples), level=9),
+            )
+            break
 
         extended = []
         legacy = []
@@ -234,7 +263,9 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
             track_id = str(track.id)
             stable_key = f"rb:{track_id}"
             bpm = track.tempo / 100 if track.tempo else None
-            analysis = analyses.get(track.file_path, {"beats": [], "cues": []})
+            analysis = analyses.get(
+                track.file_path, {"beats": [], "cues": [], "waveform": None}
+            )
             cue_count = len(analysis["cues"])
             beat_grid_count = len(analysis["beats"])
             values = [
@@ -262,6 +293,11 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
                 ((stable_key, ordinal, *cue)
                  for ordinal, cue in enumerate(analysis["cues"])),
             )
+            if analysis["waveform"] is not None:
+                connection.execute(
+                    "INSERT INTO waveforms VALUES (?,?,?,?,?,?)",
+                    (stable_key, *analysis["waveform"]),
+                )
 
         playlist_count = 0
         playlist_entry_count = 0
@@ -301,6 +337,11 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
         "analyzed_tracks": sum(bool(value["beats"] or value["cues"]) for value in analyses.values()),
         "beat_grid_points": sum(len(value["beats"]) for value in analyses.values()),
         "cue_points": sum(len(value["cues"]) for value in analyses.values()),
+        "waveform_tracks": sum(value["waveform"] is not None for value in analyses.values()),
+        "waveform_points": sum(
+            0 if value["waveform"] is None else value["waveform"][1]
+            for value in analyses.values()
+        ),
     }
     (destination / "rbprep-summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -320,7 +361,7 @@ def main() -> int:
         f"Imported {summary['tracks']} tracks and {summary['playlist_entries']} "
         f"ordered entries across {summary['playlists']} playlists; "
         f"{summary['beat_grid_points']} beat-grid points and "
-        f"{summary['cue_points']} cues."
+        f"{summary['cue_points']} cues; {summary['waveform_tracks']} RGB waveforms."
     )
     return 0
 
