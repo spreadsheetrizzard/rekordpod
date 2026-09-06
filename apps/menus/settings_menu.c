@@ -374,6 +374,9 @@ MENUITEM_SETTING(usb_audio, &global_settings.usb_audio, NULL);
 #if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE)
 MENUITEM_SETTING(usb_skip_first_drive, &global_settings.usb_skip_first_drive, NULL);
 #endif
+#ifdef IPOD_6G
+MENUITEM_SETTING(usb_rbprep, &global_settings.usb_rbprep, NULL);
+#endif
 
 #ifdef HAVE_MORSE_INPUT
 MENUITEM_SETTING(morse_input, &global_settings.morse_input, NULL);
@@ -426,6 +429,9 @@ MAKE_MENU(usb_menu, ID2P(LANG_USB_MENU), 0, Icon_NOICON,
 #endif
 #if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE)
             &usb_skip_first_drive,
+#endif
+#ifdef IPOD_6G
+            &usb_rbprep,
 #endif
 #ifdef HAVE_USB_MODE
             &usb_mode,

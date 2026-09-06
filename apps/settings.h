@@ -828,6 +828,10 @@ struct user_settings
     bool usb_skip_first_drive;
 #endif
 
+#ifdef IPOD_6G
+    bool usb_rbprep;
+#endif
+
     unsigned char ui_vp_config[64]; /* viewport string for the lists */
 #ifdef HAVE_REMOTE_LCD
     unsigned char remote_ui_vp_config[64]; /* viewport string for the remote lists */

@@ -10759,6 +10759,23 @@
   </voice>
 </phrase>
 <phrase>
+  id: LANG_USB_RBPREP
+  desc: RBPrep translated USB disk geometry
+  user: core
+  <source>
+    *: none
+    ipod6g: "Fake Sector Enumeration"
+  </source>
+  <dest>
+    *: none
+    ipod6g: "Fake Sector Enumeration"
+  </dest>
+  <voice>
+    *: none
+    ipod6g: "Fake Sector Enumeration"
+  </voice>
+</phrase>
+<phrase>
   id: LANG_USB_HID
   desc: in settings_menu
   user: core

@@ -315,6 +315,276 @@ static void receive_block_data(void *data,int size);
 static void receive_time(void);
 #endif
 static void fill_inquiry(IF_MD_NONVOID(int lun));
+
+#ifdef IPOD_6G
+static bool rbprep_enabled = true;
+static sector_t rbprep_fat_start[NUM_DRIVES];
+static sector_t rbprep_fat_end[NUM_DRIVES];
+#endif
+
+void usb_storage_set_rbprep(bool enable)
+{
+#ifdef IPOD_6G
+    rbprep_enabled = enable;
+    memset(rbprep_fat_start, 0, sizeof(rbprep_fat_start));
+    memset(rbprep_fat_end, 0, sizeof(rbprep_fat_end));
+#else
+    (void)enable;
+#endif
+}
+
+/*
+ * RBPrep USB MSC compatibility helpers.
+ *
+ * Rockbox mounts the ipod6g FAT32 filesystem using 4096-byte virtual
+ * sectors while the underlying storage exposes 512-byte logical sectors.
+ *
+ * When enabled, USB presents native 512-byte geometry and translates the
+ * host-visible MBR and FAT32 BPB in RAM in both directions.
+ */
+
+static uint32_t rbprep_get_le32(const unsigned char *p)
+{
+    return (uint32_t)p[0]
+        | ((uint32_t)p[1] << 8)
+        | ((uint32_t)p[2] << 16)
+        | ((uint32_t)p[3] << 24);
+}
+
+static void rbprep_put_le32(unsigned char *p, uint32_t value)
+{
+    p[0] = value & 0xff;
+    p[1] = (value >> 8) & 0xff;
+    p[2] = (value >> 16) & 0xff;
+    p[3] = (value >> 24) & 0xff;
+}
+
+static uint16_t rbprep_get_le16(const unsigned char *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static void rbprep_put_le16(unsigned char *p, uint16_t value)
+{
+    p[0] = value & 0xff;
+    p[1] = (value >> 8) & 0xff;
+}
+
+static void rbprep_patch_mbr_for_512(unsigned char *data,
+                                     unsigned int size)
+{
+#ifdef IPOD_6G
+    unsigned int mult;
+    unsigned char fat_entry[16];
+    bool found = false;
+    int i;
+
+    if(!rbprep_enabled || cur_cmd.sector != 0 || size < 512)
+        return;
+
+    mult = disk_get_sector_multiplier(IF_MD(cur_cmd.lun));
+
+    if(mult <= 1)
+        return;
+
+    if(data[510] != 0x55 || data[511] != 0xaa)
+        return;
+
+    /* Locate the existing FAT32 partition. */
+    for(i = 0; i < 4; i++)
+    {
+        unsigned int off = 446 + i * 16;
+        uint32_t start = rbprep_get_le32(&data[off + 8]);
+        uint32_t count = rbprep_get_le32(&data[off + 12]);
+        unsigned int type = data[off + 4];
+
+        if((type == 0x0b || type == 0x0c) &&
+           start != 0 && count != 0)
+        {
+            memcpy(fat_entry, &data[off], sizeof(fat_entry));
+
+            rbprep_put_le32(&fat_entry[8], start * mult);
+            rbprep_put_le32(&fat_entry[12], count * mult);
+
+            rbprep_fat_start[cur_cmd.lun] = (sector_t)start * mult;
+            rbprep_fat_end[cur_cmd.lun] =
+                rbprep_fat_start[cur_cmd.lun] + (sector_t)count * mult;
+
+            found = true;
+            break;
+        }
+    }
+
+    if(!found)
+        return;
+
+    /*
+     * Present exactly one FAT32 partition to the USB host.
+     * The iPod firmware partition remains physically untouched.
+     */
+    memset(&data[446], 0, 64);
+    memcpy(&data[446], fat_entry, sizeof(fat_entry));
+#else
+    (void)data;
+    (void)size;
+#endif
+}
+
+static void rbprep_patch_fat32_bpb_for_512(unsigned char *data,
+                                           unsigned int size)
+{
+#ifdef IPOD_6G
+    unsigned int mult;
+    unsigned int off;
+
+    if(!rbprep_enabled)
+        return;
+
+    mult = disk_get_sector_multiplier(IF_MD(cur_cmd.lun));
+
+    if(mult <= 1)
+        return;
+
+    /*
+     * A USB transfer can contain several 512-byte sectors.
+     * Look for FAT32 boot sectors within the returned buffer.
+     */
+    for(off = 0; off + 512 <= size; off += 512)
+    {
+        unsigned char *b = &data[off];
+
+        if(b[510] != 0x55 || b[511] != 0xaa)
+            continue;
+
+        if(memcmp(&b[82], "FAT32   ", 8) != 0)
+            continue;
+
+        /* Native RBPrep target is the 4096-byte ipod6g FAT view. */
+        if(rbprep_get_le16(&b[11]) != 4096)
+            continue;
+
+        unsigned int spc = b[13];
+        unsigned int reserved = rbprep_get_le16(&b[14]);
+        unsigned int fsinfo = rbprep_get_le16(&b[48]);
+        unsigned int backup = rbprep_get_le16(&b[50]);
+
+        /*
+         * Preserve all byte offsets while changing sector units
+         * from 4096 bytes to 512 bytes.
+         */
+        rbprep_put_le16(&b[11], 512);
+
+        b[13] = spc * mult;
+
+        rbprep_put_le16(&b[14], reserved * mult);
+
+        /*
+         * Deliberately leave BPB_HiddSec (offset 28) unchanged for
+         * this first experiment. RIZZPOD currently contains 63 here,
+         * which does not describe its actual partition start.
+         */
+
+        rbprep_put_le32(&b[32],
+            rbprep_get_le32(&b[32]) * mult);
+
+        rbprep_put_le32(&b[36],
+            rbprep_get_le32(&b[36]) * mult);
+
+        if(fsinfo != 0 && fsinfo != 0xffff)
+            rbprep_put_le16(&b[48], fsinfo * mult);
+
+        if(backup != 0 && backup != 0xffff)
+            rbprep_put_le16(&b[50], backup * mult);
+    }
+#else
+    (void)data;
+    (void)size;
+#endif
+}
+
+static bool rbprep_prepare_write(unsigned char *data, unsigned int size)
+{
+#ifdef IPOD_6G
+    unsigned int mult;
+    unsigned int off;
+
+    if(!rbprep_enabled)
+        return true;
+
+    mult = disk_get_sector_multiplier(IF_MD(cur_cmd.lun));
+    if(mult <= 1)
+        return true;
+
+    for(off = 0; off + 512 <= size; off += 512)
+    {
+        unsigned char *b = &data[off];
+        unsigned int spc;
+        unsigned int reserved;
+        uint32_t total;
+        uint32_t fatsz;
+        unsigned int fsinfo;
+        unsigned int backup;
+
+        if(b[510] != 0x55 || b[511] != 0xaa ||
+           memcmp(&b[82], "FAT32   ", 8) != 0 ||
+           rbprep_get_le16(&b[11]) != 512)
+            continue;
+
+        spc = b[13];
+        reserved = rbprep_get_le16(&b[14]);
+        total = rbprep_get_le32(&b[32]);
+        fatsz = rbprep_get_le32(&b[36]);
+        fsinfo = rbprep_get_le16(&b[48]);
+        backup = rbprep_get_le16(&b[50]);
+
+        if(spc == 0 || spc % mult != 0 ||
+           reserved % mult != 0 || total % mult != 0 ||
+           fatsz % mult != 0 ||
+           (fsinfo != 0 && fsinfo != 0xffff && fsinfo % mult != 0) ||
+           (backup != 0 && backup != 0xffff && backup % mult != 0))
+            return false;
+
+        rbprep_put_le16(&b[11], 4096);
+        b[13] = spc / mult;
+        rbprep_put_le16(&b[14], reserved / mult);
+        rbprep_put_le32(&b[32], total / mult);
+        rbprep_put_le32(&b[36], fatsz / mult);
+
+        if(fsinfo != 0 && fsinfo != 0xffff)
+            rbprep_put_le16(&b[48], fsinfo / mult);
+
+        if(backup != 0 && backup != 0xffff)
+            rbprep_put_le16(&b[50], backup / mult);
+    }
+#else
+    (void)data;
+    (void)size;
+#endif
+    return true;
+}
+
+static bool rbprep_write_in_fat(int lun, sector_t sector,
+                                unsigned int count)
+{
+#ifdef IPOD_6G
+    sector_t start;
+    sector_t end;
+
+    if(!rbprep_enabled)
+        return true;
+
+    start = rbprep_fat_start[lun];
+    end = rbprep_fat_end[lun];
+
+    return start != 0 && sector >= start && sector < end &&
+           count <= end - sector;
+#else
+    (void)lun;
+    (void)sector;
+    (void)count;
+    return true;
+#endif
+}
 static void send_and_read_next(void);
 static bool ejected[NUM_DRIVES];
 static bool locked[NUM_DRIVES];
@@ -535,13 +805,22 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                         cur_cmd.data[cur_cmd.data_select],
                         MIN(WRITE_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
 #else
-                int result = USBSTOR_WRITE_SECTORS_FILTER();
+                unsigned int write_size =
+                    MIN(WRITE_BUFFER_SIZE / cur_cmd.block_size,
+                        cur_cmd.count) * cur_cmd.block_size;
+                int result;
 
-                if (result == 0) {
-                    result = storage_write_sectors(IF_MD(cur_cmd.lun,)
-                        cur_cmd.sector,
-                        MIN(WRITE_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
-                        cur_cmd.data[cur_cmd.data_select]);
+                if(!rbprep_prepare_write(
+                        cur_cmd.data[cur_cmd.data_select], write_size))
+                    result = -1;
+                else
+                {
+                    result = USBSTOR_WRITE_SECTORS_FILTER();
+                    if(result == 0)
+                        result = storage_write_sectors(IF_MD(cur_cmd.lun,)
+                            cur_cmd.sector,
+                            write_size / cur_cmd.block_size,
+                            cur_cmd.data[cur_cmd.data_select]);
                 }
 
                 if(result != 0) {
@@ -738,8 +1017,20 @@ static void send_and_read_next(void)
     if(result != 0 && cur_cmd.last_result == 0)
         cur_cmd.last_result = result;
 
-    send_block_data(cur_cmd.data[cur_cmd.data_select],
-                    MIN(READ_BUFFER_SIZE,cur_cmd.count*cur_cmd.block_size));
+    unsigned int rbprep_send_size =
+        MIN(READ_BUFFER_SIZE,
+            cur_cmd.count * cur_cmd.block_size);
+
+    rbprep_patch_mbr_for_512(
+        cur_cmd.data[cur_cmd.data_select],
+        rbprep_send_size);
+
+    rbprep_patch_fat32_bpb_for_512(
+        cur_cmd.data[cur_cmd.data_select],
+        rbprep_send_size);
+    send_block_data(
+        cur_cmd.data[cur_cmd.data_select],
+        rbprep_send_size);
 
     /* Switch buffers for the next one */
     cur_cmd.data_select=!cur_cmd.data_select;
@@ -808,7 +1099,12 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 
     unsigned int block_size_mult = 1; /* Number of LOGICAL storage device blocks in each USB block */
 #ifdef MAX_VIRT_SECTOR_SIZE
-    block_size_mult = disk_get_sector_multiplier(IF_MD(lun));
+#ifdef IPOD_6G
+    if(rbprep_enabled)
+        block_size_mult = 1;
+    else
+#endif
+        block_size_mult = disk_get_sector_multiplier(IF_MD(lun));
 #endif
 
     uint32_t bsize = block_size*block_size_mult;
@@ -1262,8 +1558,9 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                  cbw->command_block[8]);
             cur_cmd.block_size = block_size;
 
-            /* expect data */
-            if((cur_cmd.sector + cur_cmd.count) > block_count) {
+            /* Only the translated FAT32 partition is writable in RBPrep. */
+            if((cur_cmd.sector + cur_cmd.count) > block_count ||
+               !rbprep_write_in_fat(lun, cur_cmd.sector, cur_cmd.count)) {
                 send_csw(UMS_STATUS_FAIL);
                 cur_sense_data.sense_key=SENSE_ILLEGAL_REQUEST;
                 cur_sense_data.asc=ASC_LBA_OUT_OF_RANGE;
@@ -1303,8 +1600,9 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                  cbw->command_block[13]);
             cur_cmd.block_size = block_size;
 
-            /* expect data */
-            if((cur_cmd.sector + cur_cmd.count) > block_count) {
+            /* Only the translated FAT32 partition is writable in RBPrep. */
+            if((cur_cmd.sector + cur_cmd.count) > block_count ||
+               !rbprep_write_in_fat(lun, cur_cmd.sector, cur_cmd.count)) {
                 send_csw(UMS_STATUS_FAIL);
                 cur_sense_data.sense_key=SENSE_ILLEGAL_REQUEST;
                 cur_sense_data.asc=ASC_LBA_OUT_OF_RANGE;

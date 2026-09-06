@@ -36,6 +36,9 @@
 #include "settings.h"
 #include "debug.h"
 #include "usb.h"
+#ifdef IPOD_6G
+#include "usbstack/usb_storage.h"
+#endif
 #include "backlight.h"
 #include "audio.h"
 #include "talk.h"
@@ -1118,6 +1121,10 @@ void settings_apply(bool read_disk)
 
 #ifdef HAVE_USB_CHARGING_ENABLE
     usb_charging_enable(global_settings.usb_charging);
+#endif
+
+#ifdef IPOD_6G
+    usb_storage_set_rbprep(global_settings.usb_rbprep);
 #endif
 
 #ifdef HAVE_TOUCHSCREEN

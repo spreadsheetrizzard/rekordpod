@@ -35,6 +35,9 @@
 #include "rbpaths.h"
 #include "settings_list.h"
 #include "usb.h"
+#ifdef IPOD_6G
+#include "usbstack/usb_storage.h"
+#endif
 #include "audio.h"
 #include "power.h"
 #include "powermgmt.h"
@@ -2454,7 +2457,7 @@ const struct settings_list settings[] = {
 #endif
 
 #ifdef USB_ENABLE_HID
-    OFFON_SETTING(0, usb_hid, LANG_USB_HID, true, "usb hid", usb_set_hid),
+    OFFON_SETTING(0, usb_hid, LANG_USB_HID, false, "usb hid", usb_set_hid),
     CHOICE_SETTING(0, usb_keypad_mode, LANG_USB_KEYPAD_MODE, 0,
             "usb keypad mode", "multimedia,presentation,browser"
 #ifdef HAVE_USB_HID_MOUSE
@@ -2481,6 +2484,11 @@ const struct settings_list settings[] = {
 
 #if defined(USB_ENABLE_STORAGE) && defined(HAVE_MULTIDRIVE)
     OFFON_SETTING(0, usb_skip_first_drive, LANG_USB_SKIP_FIRST_DRIVE, false, "usb skip first drive", usb_set_skip_first_drive),
+#endif
+
+#ifdef IPOD_6G
+    OFFON_SETTING(0, usb_rbprep, LANG_USB_RBPREP, true,
+                  "fake sector enumeration", usb_storage_set_rbprep),
 #endif
 
     /* Customizable list */

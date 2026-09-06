@@ -23,5 +23,5 @@
 #include "usb_class_driver.h"
 
 extern struct usb_class_driver usb_cdrv_storage;
+void usb_storage_set_rbprep(bool enable);
 #endif
-
