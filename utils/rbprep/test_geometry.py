@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Host-side regression tests for RBPrep's 4096 <-> 512 translations."""
 
+import os
 import struct
 import unittest
+from pathlib import Path
 
 
 MULTIPLIER = 8
@@ -95,11 +97,11 @@ def sample_mbr():
 def sample_bpb():
     data = bytearray(512)
     put16(data, 11, 4096)
-    data[13] = 8
+    data[13] = 4
     put16(data, 14, 32)
     put32(data, 28, 63)
-    put32(data, 32, FAT_COUNT_4096)
-    put32(data, 36, 29_792)
+    put32(data, 32, 244_141_366)
+    put32(data, 36, 59_591)
     put16(data, 48, 1)
     put16(data, 50, 6)
     data[82:90] = b"FAT32   "
@@ -118,7 +120,7 @@ class RBPrepGeometryTests(unittest.TestCase):
         original = sample_bpb()
         translated = translate_bpb_out(original)
         self.assertEqual(get16(translated, 11), 512)
-        self.assertEqual(translated[13], 64)
+        self.assertEqual(translated[13], 32)
         self.assertEqual(get16(translated, 14), 256)
         self.assertEqual(get32(translated, 28), 63)
         self.assertEqual(get16(translated, 48), 8)
@@ -138,6 +140,32 @@ class RBPrepGeometryTests(unittest.TestCase):
         self.assertTrue(start <= end - 1 < end and 1 <= end - (end - 1))
         self.assertFalse(start <= start - 1 < end)
         self.assertFalse(start <= end < end)
+
+
+@unittest.skipUnless(os.environ.get("RBPREP_SNAPSHOT"),
+                     "set RBPREP_SNAPSHOT to test captured sectors")
+class RBPrepCapturedSectorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.snapshot = Path(os.environ["RBPREP_SNAPSHOT"])
+        cls.mbr = (cls.snapshot / "disk-first-1MiB.bin").read_bytes()[:512]
+        cls.bpb = (cls.snapshot / "fat32-first-4MiB.bin").read_bytes()[:512]
+
+    def test_captured_mbr_matches_observed_translation(self):
+        translated = translate_mbr(self.mbr)
+        self.assertEqual(translated[510:512], b"\x55\xaa")
+        self.assertEqual(get32(translated, 454), 394_224)
+        self.assertEqual(get32(translated, 458), 1_953_130_936)
+        self.assertEqual(translated[462:510], bytes(48))
+
+    def test_captured_bpb_round_trip_is_lossless(self):
+        self.assertEqual(get16(self.bpb, 11), 4096)
+        self.assertEqual(self.bpb[13], 4)
+        self.assertEqual(get16(self.bpb, 14), 32)
+        translated = translate_bpb_out(self.bpb)
+        self.assertEqual(get16(translated, 11), 512)
+        self.assertEqual(translated[13], 32)
+        self.assertEqual(translate_bpb_in(translated), self.bpb)
 
 
 if __name__ == "__main__":
