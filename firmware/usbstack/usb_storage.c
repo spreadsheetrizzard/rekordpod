@@ -317,19 +317,19 @@ static void receive_time(void);
 static void fill_inquiry(IF_MD_NONVOID(int lun));
 
 #ifdef IPOD_6G
-static bool rbprep_enabled = true;
+static int rbprep_mode = RBPREP_MODE_READ_WRITE;
 static sector_t rbprep_fat_start[NUM_DRIVES];
 static sector_t rbprep_fat_end[NUM_DRIVES];
 #endif
 
-void usb_storage_set_rbprep(bool enable)
+void usb_storage_set_rbprep(int mode)
 {
 #ifdef IPOD_6G
-    rbprep_enabled = enable;
+    rbprep_mode = mode;
     memset(rbprep_fat_start, 0, sizeof(rbprep_fat_start));
     memset(rbprep_fat_end, 0, sizeof(rbprep_fat_end));
 #else
-    (void)enable;
+    (void)mode;
 #endif
 }
 
@@ -379,7 +379,8 @@ static void rbprep_patch_mbr_for_512(unsigned char *data,
     bool found = false;
     int i;
 
-    if(!rbprep_enabled || cur_cmd.sector != 0 || size < 512)
+    if(rbprep_mode == RBPREP_MODE_TRANSPARENT ||
+       cur_cmd.sector != 0 || size < 512)
         return;
 
     mult = disk_get_sector_multiplier(IF_MD(cur_cmd.lun));
@@ -437,7 +438,7 @@ static void rbprep_patch_fat32_bpb_for_512(unsigned char *data,
     unsigned int mult;
     unsigned int off;
 
-    if(!rbprep_enabled)
+    if(rbprep_mode == RBPREP_MODE_TRANSPARENT)
         return;
 
     mult = disk_get_sector_multiplier(IF_MD(cur_cmd.lun));
@@ -508,7 +509,7 @@ static bool rbprep_prepare_write(unsigned char *data, unsigned int size)
     unsigned int mult;
     unsigned int off;
 
-    if(!rbprep_enabled)
+    if(rbprep_mode == RBPREP_MODE_TRANSPARENT)
         return true;
 
     mult = disk_get_sector_multiplier(IF_MD(cur_cmd.lun));
@@ -570,7 +571,7 @@ static bool rbprep_write_in_fat(int lun, sector_t sector,
     sector_t start;
     sector_t end;
 
-    if(!rbprep_enabled)
+    if(rbprep_mode == RBPREP_MODE_TRANSPARENT)
         return true;
 
     start = rbprep_fat_start[lun];
@@ -810,7 +811,9 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                         cur_cmd.count) * cur_cmd.block_size;
                 int result;
 
-                if(!rbprep_prepare_write(
+                if(rbprep_mode == RBPREP_MODE_READ_ONLY)
+                    result = 0;
+                else if(!rbprep_prepare_write(
                         cur_cmd.data[cur_cmd.data_select], write_size))
                     result = -1;
                 else
@@ -1100,7 +1103,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
     unsigned int block_size_mult = 1; /* Number of LOGICAL storage device blocks in each USB block */
 #ifdef MAX_VIRT_SECTOR_SIZE
 #ifdef IPOD_6G
-    if(rbprep_enabled)
+    if(rbprep_mode != RBPREP_MODE_TRANSPARENT)
         block_size_mult = 1;
     else
 #endif

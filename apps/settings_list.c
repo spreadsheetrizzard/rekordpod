@@ -2487,8 +2487,13 @@ const struct settings_list settings[] = {
 #endif
 
 #ifdef IPOD_6G
-    OFFON_SETTING(0, usb_rbprep, LANG_USB_RBPREP, true,
-                  "fake sector enumeration", usb_storage_set_rbprep),
+    CHOICE_SETTING(0, usb_rbprep, LANG_USB_RBPREP,
+                   RBPREP_MODE_READ_WRITE, "rbprep mode",
+                   "transparent,read-only,read-write",
+                   usb_storage_set_rbprep, 3,
+                   ID2P(LANG_RBPREP_TRANSPARENT),
+                   ID2P(LANG_RBPREP_READ_ONLY),
+                   ID2P(LANG_RBPREP_READ_WRITE)),
 #endif
 
     /* Customizable list */

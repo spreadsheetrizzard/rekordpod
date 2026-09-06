@@ -829,7 +829,7 @@ struct user_settings
 #endif
 
 #ifdef IPOD_6G
-    bool usb_rbprep;
+    int usb_rbprep;
 #endif
 
     unsigned char ui_vp_config[64]; /* viewport string for the lists */

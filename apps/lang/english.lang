@@ -10764,15 +10764,66 @@
   user: core
   <source>
     *: none
-    ipod6g: "Fake Sector Enumeration"
+    ipod6g: "RBPrep Mode"
   </source>
   <dest>
     *: none
-    ipod6g: "Fake Sector Enumeration"
+    ipod6g: "RBPrep Mode"
   </dest>
   <voice>
     *: none
-    ipod6g: "Fake Sector Enumeration"
+    ipod6g: "RBPrep Mode"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_RBPREP_TRANSPARENT
+  desc: RBPrep mode
+  user: core
+  <source>
+    *: none
+    ipod6g: "Transparent"
+  </source>
+  <dest>
+    *: none
+    ipod6g: "Transparent"
+  </dest>
+  <voice>
+    *: none
+    ipod6g: "Transparent"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_RBPREP_READ_ONLY
+  desc: RBPrep mode
+  user: core
+  <source>
+    *: none
+    ipod6g: "Read-only"
+  </source>
+  <dest>
+    *: none
+    ipod6g: "Read-only"
+  </dest>
+  <voice>
+    *: none
+    ipod6g: "Read-only"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_RBPREP_READ_WRITE
+  desc: RBPrep mode
+  user: core
+  <source>
+    *: none
+    ipod6g: "Read/write"
+  </source>
+  <dest>
+    *: none
+    ipod6g: "Read/write"
+  </dest>
+  <voice>
+    *: none
+    ipod6g: "Read/write"
   </voice>
 </phrase>
 <phrase>
