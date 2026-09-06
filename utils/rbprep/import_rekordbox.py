@@ -169,6 +169,15 @@ def create_schema(connection: sqlite3.Connection) -> None:
             samples BLOB NOT NULL,
             FOREIGN KEY(stable_key) REFERENCES tracks(stable_key)
         );
+        CREATE TABLE detail_waveforms (
+            stable_key TEXT PRIMARY KEY,
+            source_format TEXT NOT NULL,
+            point_count INTEGER NOT NULL,
+            channels TEXT NOT NULL,
+            encoding TEXT NOT NULL,
+            samples BLOB NOT NULL,
+            FOREIGN KEY(stable_key) REFERENCES tracks(stable_key)
+        );
         """
     )
 
@@ -194,7 +203,7 @@ def read_analysis(root: Path | None) -> dict[str, dict]:
             progress.update(file_index)
             continue
 
-        analysis = {"beats": [], "cues": [], "waveform": None}
+        analysis = {"beats": [], "cues": [], "waveform": None, "detail": None}
         if "PQTZ" in dat:
             beats, bpms, times = dat.get("PQTZ")
             analysis["beats"] = [
@@ -224,6 +233,20 @@ def read_analysis(root: Path | None) -> dict[str, dict]:
                 )
             analysis["waveform"] = (
                 "PWV4", len(heights), "amplitude,r,g,b", "zlib-u8x4",
+                zlib.compress(bytes(samples), level=9),
+            )
+            break
+        for anlz in reversed(files):
+            if "PWV5" not in anlz:
+                continue
+            heights, colors = anlz.get("PWV5")
+            samples = bytearray()
+            for height, color in zip(heights, colors):
+                samples.extend(struct.pack(
+                    "BBBB", max(0, min(255, round(float(height) * 255))),
+                    *(max(0, min(255, int(value) * 36)) for value in color)))
+            analysis["detail"] = (
+                "PWV5", len(heights), "amplitude,r,g,b", "zlib-u8x4",
                 zlib.compress(bytes(samples), level=9),
             )
             break
@@ -297,7 +320,7 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
             stable_key = f"rb:{track_id}"
             bpm = track.tempo / 100 if track.tempo else None
             analysis = analyses.get(
-                track.file_path, {"beats": [], "cues": [], "waveform": None}
+                track.file_path, {"beats": [], "cues": [], "waveform": None, "detail": None}
             )
             cue_count = len(analysis["cues"])
             beat_grid_count = len(analysis["beats"])
@@ -330,6 +353,11 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
                 connection.execute(
                     "INSERT INTO waveforms VALUES (?,?,?,?,?,?)",
                     (stable_key, *analysis["waveform"]),
+                )
+            if analysis["detail"] is not None:
+                connection.execute(
+                    "INSERT INTO detail_waveforms VALUES (?,?,?,?,?,?)",
+                    (stable_key, *analysis["detail"]),
                 )
             track_progress.update(track_index)
 
@@ -375,6 +403,11 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
         "waveform_tracks": sum(value["waveform"] is not None for value in analyses.values()),
         "waveform_points": sum(
             0 if value["waveform"] is None else value["waveform"][1]
+            for value in analyses.values()
+        ),
+        "detail_waveform_tracks": sum(value["detail"] is not None for value in analyses.values()),
+        "detail_waveform_points": sum(
+            0 if value["detail"] is None else value["detail"][1]
             for value in analyses.values()
         ),
     }

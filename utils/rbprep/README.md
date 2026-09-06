@@ -15,6 +15,8 @@ play count, comments, date added, color, playlist membership, and ordinal. When
 The compact `waveforms` table preserves Rekordbox's native `PWV4` RGB overview
 as zlib-compressed amplitude/red/green/blue byte tuples (1,200 points on the
 captured exports), ready for a viewport without decoding the audio.
+At close zoom levels, the `detail_waveforms` table supplies native `PWV5`
+amplitude and RGB samples instead of enlarging the 1,200-point overview.
 
 Install the parser and run:
 
