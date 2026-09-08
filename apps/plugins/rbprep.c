@@ -81,12 +81,24 @@ enum rbprep_confirm_action {
     CONFIRM_ADD_PLAYLIST
 };
 
+struct rbprep_wave_column {
+    unsigned char amplitude;
+    unsigned char red;
+    unsigned char green;
+    unsigned char blue;
+    bool valid;
+};
+
 static enum rbprep_mode mode;
 static int selection;
 static int playhead;
 static unsigned char waveform[RBPREP_POINTS][4];
 static unsigned char overview_waveform[RBPREP_OVERVIEW_WIDTH][4];
+static struct rbprep_wave_column waveform_columns[RBPREP_DECK_WIDTH];
 static unsigned char waveform_height_lut[256];
+static int waveform_column_first;
+static int waveform_column_span;
+static bool waveform_columns_valid;
 static int waveform_points;
 static int waveform_duration_ms = 1;
 static int beat_times[RBPREP_BEATS];
@@ -209,8 +221,22 @@ static char selected_genre[32];
 static void stop_editor_audio(void);
 static void reset_play_clock(int anchor, long tick);
 
+static void set_storage_performance_mode(bool enabled)
+{
+#ifdef DISK_SPINDOWN
+    /* RBPrep's animation should not stall while ATA/iFlash wakes for the
+       periodic playback-buffer refill. Restore the user's policy on lock or
+       exit so this performance mode does not leak into normal Rockbox use. */
+    rb->storage_spindown(enabled ? 254
+                                 : rb->global_settings->disk_spindown);
+#else
+    (void)enabled;
+#endif
+}
+
 static void rbprep_cleanup(void)
 {
+    set_storage_performance_mode(false);
     backlight_use_settings();
 }
 
@@ -223,8 +249,10 @@ static bool service_display_lock(void)
         return false;
     display_locked = locked;
     if (locked) {
+        set_storage_performance_mode(false);
         backlight_use_settings();
     } else {
+        set_storage_performance_mode(true);
         backlight_ignore_timeout();
 #ifdef HAVE_BACKLIGHT
         rb->backlight_on();
@@ -655,43 +683,25 @@ static void draw_cues(int first, int span)
     }
 }
 
-static void draw_waveform(void)
+static void rebuild_waveform_columns(int first, int span)
 {
-    int first;
-    int span;
     int x;
-    int mid = (RBPREP_WAVE_TOP + RBPREP_WAVE_BOTTOM) / 2;
 
-    viewport(&first, &span);
+    if (waveform_columns_valid && first == waveform_column_first &&
+        span == waveform_column_span)
+        return;
+
     for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
         int begin;
         int end;
         int index;
         int peak_index;
         int peak;
-        int height;
-        int color;
-        int screen_x = RBPREP_DECK_X + x;
-
-        if (waveform_points <= 0) {
-            rb->lcd_set_foreground(LCD_DARKGRAY);
-            if (waveform_half)
-                rb->lcd_vline(screen_x, RBPREP_WAVE_BOTTOM - 5,
-                              RBPREP_WAVE_BOTTOM - 2);
-            else
-                rb->lcd_vline(screen_x, mid - 3, mid + 3);
-            continue;
-        }
 
         begin = first + (long long)x * span / RBPREP_DECK_WIDTH;
         end = first + (long long)(x + 1) * span / RBPREP_DECK_WIDTH;
+        waveform_columns[x].valid = false;
         if (end <= 0 || begin >= waveform_points) {
-            rb->lcd_set_foreground(LCD_RGBPACK(15, 23, 17));
-            if (waveform_half)
-                rb->lcd_vline(screen_x, RBPREP_WAVE_BOTTOM - 3,
-                              RBPREP_WAVE_BOTTOM - 2);
-            else
-                rb->lcd_vline(screen_x, mid - 1, mid + 1);
             continue;
         }
         begin = MAX(0, begin);
@@ -707,10 +717,54 @@ static void draw_waveform(void)
             }
         }
 
-        height = waveform_height_lut[peak];
-        color = LCD_RGBPACK(waveform[peak_index][1],
-                            waveform[peak_index][2],
-                            waveform[peak_index][3]);
+        waveform_columns[x].amplitude = peak;
+        waveform_columns[x].red = waveform[peak_index][1];
+        waveform_columns[x].green = waveform[peak_index][2];
+        waveform_columns[x].blue = waveform[peak_index][3];
+        waveform_columns[x].valid = true;
+    }
+    waveform_column_first = first;
+    waveform_column_span = span;
+    waveform_columns_valid = true;
+}
+
+static void draw_waveform(void)
+{
+    int first;
+    int span;
+    int x;
+    int mid = (RBPREP_WAVE_TOP + RBPREP_WAVE_BOTTOM) / 2;
+
+    viewport(&first, &span);
+    if (waveform_points > 0)
+        rebuild_waveform_columns(first, span);
+    for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
+        struct rbprep_wave_column *column = &waveform_columns[x];
+        int screen_x = RBPREP_DECK_X + x;
+        int height;
+        int color;
+
+        if (waveform_points <= 0) {
+            rb->lcd_set_foreground(LCD_DARKGRAY);
+            if (waveform_half)
+                rb->lcd_vline(screen_x, RBPREP_WAVE_BOTTOM - 5,
+                              RBPREP_WAVE_BOTTOM - 2);
+            else
+                rb->lcd_vline(screen_x, mid - 3, mid + 3);
+            continue;
+        }
+        if (!column->valid) {
+            rb->lcd_set_foreground(LCD_RGBPACK(15, 23, 17));
+            if (waveform_half)
+                rb->lcd_vline(screen_x, RBPREP_WAVE_BOTTOM - 3,
+                              RBPREP_WAVE_BOTTOM - 2);
+            else
+                rb->lcd_vline(screen_x, mid - 1, mid + 1);
+            continue;
+        }
+
+        height = waveform_height_lut[column->amplitude];
+        color = LCD_RGBPACK(column->red, column->green, column->blue);
         rb->lcd_set_foreground(color);
         if (waveform_half)
             rb->lcd_vline(screen_x, RBPREP_WAVE_BOTTOM - height,
@@ -817,10 +871,21 @@ static void update_vu_levels(void)
     vu_right = MAX(peaks.right, vu_right * 7 / 8);
 }
 
+static void draw_vu_lozenge(int center_x, int top)
+{
+    rb->lcd_drawpixel(center_x, top);
+    rb->lcd_hline(center_x - 1, center_x + 1, top + 1);
+    rb->lcd_hline(center_x - 2, center_x + 2, top + 2);
+    rb->lcd_hline(center_x - 2, center_x + 2, top + 3);
+    rb->lcd_hline(center_x - 2, center_x + 2, top + 4);
+    rb->lcd_hline(center_x - 1, center_x + 1, top + 5);
+    rb->lcd_drawpixel(center_x, top + 6);
+}
+
 static void draw_vu_meter(void)
 {
     const int segments = 14;
-    const int segment_pitch = 11;
+    const int segment_pitch = 12;
     int lit_left = MIN(segments, (int)(vu_left * segments / 32768));
     int lit_right = MIN(segments, (int)(vu_right * segments / 32768));
     int segment;
@@ -837,18 +902,10 @@ static void draw_vu_meter(void)
                          : LCD_RGBPACK(55, 225, 105);
         rb->lcd_set_foreground(segment < lit_left
                               ? active_color : LCD_RGBPACK(28, 39, 31));
-        rb->lcd_hline(x + 2, x + 4, y);
-        rb->lcd_hline(x + 1, x + 5, y + 1);
-        rb->lcd_hline(x, x + 6, y + 2);
-        rb->lcd_hline(x + 1, x + 5, y + 3);
-        rb->lcd_hline(x + 2, x + 4, y + 4);
+        draw_vu_lozenge(x, y);
         rb->lcd_set_foreground(segment < lit_right
                               ? active_color : LCD_RGBPACK(28, 39, 31));
-        rb->lcd_hline(x + 11, x + 13, y);
-        rb->lcd_hline(x + 10, x + 14, y + 1);
-        rb->lcd_hline(x + 9, x + 15, y + 2);
-        rb->lcd_hline(x + 10, x + 14, y + 3);
-        rb->lcd_hline(x + 11, x + 13, y + 4);
+        draw_vu_lozenge(x + 10, y);
     }
 }
 
@@ -857,6 +914,7 @@ static void clear_analysis(void)
     int i;
 
     waveform_points = 0;
+    waveform_columns_valid = false;
     rb->memset(overview_waveform, 0, sizeof(overview_waveform));
     waveform_duration_ms = 1;
     beat_count = 0;
@@ -1703,19 +1761,29 @@ static bool update_play_clock(void)
     if (seek_state != SEEK_IDLE || !(status & AUDIO_STATUS_PLAY) ||
         (status & AUDIO_STATUS_PAUSE))
         return false;
+    position = clamp_playhead(play_clock_anchor +
+        (long long)(now - play_clock_tick) * 1000 / HZ);
     id3 = rb->audio_current_track();
     if (id3 && !TIME_BEFORE(now, audio_sync_after)) {
         int observed = clamp_playhead(id3->elapsed);
         if (observed != reported_audio_elapsed) {
-            /* Audio elapsed is authoritative. Interpolate only between its
-               updates so UI work and button traffic can never become clock. */
+            int error = observed - position;
+
+            /* Codec elapsed can arrive several seconds late at a refill
+               boundary. A backwards snap looks like a frozen waveform until
+               the display clock catches up, so reject stale observations and
+               phase-lock only with bounded, monotonic corrections. */
             reported_audio_elapsed = observed;
-            play_clock_anchor = observed;
+            if (error > 0)
+                position += MIN(error, 100);
+            else if (error >= -250)
+                position += MAX(error / 8, -8);
+            position = MAX(playhead, clamp_playhead(position));
+            play_clock_anchor = position;
             play_clock_tick = now;
         }
     }
-    position = clamp_playhead(play_clock_anchor +
-        (long long)(now - play_clock_tick) * 1000 / HZ);
+    position = MAX(playhead, position);
     if (position == playhead)
         return false;
     playhead = position;
@@ -1766,10 +1834,8 @@ static bool service_audio_seek(void)
     long now = *rb->current_tick;
 
     if (seek_state == SEEK_CUE_HOLD) {
-        struct mp3entry *id3 = rb->audio_current_track();
-        int position = id3 ? clamp_playhead(id3->elapsed)
-                           : clamp_playhead(play_clock_anchor +
-                             (long long)(now - play_clock_tick) * 1000 / HZ);
+        int position = clamp_playhead(play_clock_anchor +
+            (long long)(now - play_clock_tick) * 1000 / HZ);
         if (position != playhead) {
             playhead = position;
             return true;
@@ -2244,6 +2310,7 @@ enum plugin_status plugin_start(const void *parameter)
 #else
     display_locked = false;
 #endif
+    set_storage_performance_mode(!display_locked);
     if (display_locked)
         backlight_use_settings();
     else
