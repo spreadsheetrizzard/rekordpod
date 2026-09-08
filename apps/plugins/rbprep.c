@@ -61,6 +61,9 @@
 #define RBPREP_SEARCH_MAX 8192
 #define RBPREP_SPECTRUM_BANDS 20
 #define RBPREP_PCM_FRAMES 1024
+#define RBPREP_GREEN LCD_RGBPACK(70, 235, 125)
+#define RBPREP_GREEN_DIM LCD_RGBPACK(28, 75, 48)
+#define RBPREP_MENU_TEXT LCD_RGBPACK(188, 205, 193)
 
 enum rbprep_mode {
     MODE_LIBRARY,
@@ -86,6 +89,7 @@ enum rbprep_tool {
     TOOL_GAIN,
     TOOL_HOST_RPM,
     TOOL_PLAY_RPM,
+    TOOL_PITCH_BEND,
     TOOL_TEMPO,
     TOOL_PLAYLIST_MODE,
     TOOL_ADD_PLAYLIST,
@@ -206,6 +210,7 @@ static char confirm_genre[32];
 static int16_t pcm_capture[2][RBPREP_PCM_FRAMES * 2] MEM_ALIGN_ATTR;
 static int16_t pcm_snapshot[RBPREP_PCM_FRAMES * 2] MEM_ALIGN_ATTR;
 static int16_t pcm_mono[RBPREP_PCM_FRAMES] MEM_ALIGN_ATTR;
+static int16_t pcm_pitch[RBPREP_PCM_FRAMES] MEM_ALIGN_ATTR;
 static volatile int pcm_capture_index;
 static volatile int pcm_capture_frames[2];
 static volatile unsigned int pcm_capture_generation;
@@ -214,8 +219,13 @@ static unsigned int spectrum_generation;
 static unsigned char spectrum_levels[RBPREP_SPECTRUM_BANDS];
 static unsigned char spectrum_bass;
 static unsigned char spectrum_bass_hit;
+static int bass_frequency_x10;
+static int bass_note_index = -1;
+static unsigned char bass_pitch_confidence;
+static int32_t bass_filter_state;
 static int host_rpm_index;
 static int played_rpm_index;
+static int pitch_bend_x100;
 static int tempo_x100 = PITCH_SPEED_100;
 static int32_t original_pitch = PITCH_SPEED_100;
 static int32_t original_stretch = PITCH_SPEED_100;
@@ -464,10 +474,16 @@ static const struct configdata rbprep_config[] = {
       { .int_p = &scrub_step_index }, "scrub step", NULL }
 };
 
-static int deck_pitch_x100(void)
+static int rpm_pitch_x100(void)
 {
     return (long long)rpm_values_x3[played_rpm_index] * PITCH_SPEED_100 /
            rpm_values_x3[host_rpm_index];
+}
+
+static int deck_pitch_x100(void)
+{
+    return (long long)rpm_pitch_x100() *
+           (PITCH_SPEED_100 + pitch_bend_x100) / PITCH_SPEED_100;
 }
 
 static int deck_speed_x100(void)
@@ -541,6 +557,10 @@ static void start_spectrum_capture(void)
     pcm_sample_rate = rb->mixer_get_frequency();
     rb->memset(spectrum_levels, 0, sizeof(spectrum_levels));
     spectrum_bass = spectrum_bass_hit = 0;
+    bass_frequency_x10 = 0;
+    bass_note_index = -1;
+    bass_pitch_confidence = 0;
+    bass_filter_state = 0;
     rb->mixer_channel_set_buffer_hook(PCM_MIXER_CHAN_PLAYBACK,
                                       &spectrum_buffer_cbs);
 }
@@ -569,27 +589,72 @@ static const uint16_t micro_hex_glyphs[16] = {
     0x7927, 0x6B6E, 0x79E7, 0x79E4
 };
 
-static void draw_overview_cue_marker(int center_x, int slot, int color)
+static void draw_micro_cue_marker(int center_x, int top, int slot, int color)
 {
-    int x = MAX(RBPREP_OVERVIEW_X + 2,
-                MIN(RBPREP_OVERVIEW_X + RBPREP_OVERVIEW_WIDTH - 3,
-                    center_x));
-    int y = RBPREP_OVERVIEW_Y;
     int row;
     int column;
     /* Cue slots are presented as 1..9, A..F, 0 in the tiny 3px label. */
     uint16_t glyph = micro_hex_glyphs[(slot + 1) & 15];
 
     rb->lcd_set_foreground(color);
-    rb->lcd_fillrect(x - 2, y, 5, 5);
-    rb->lcd_hline(x - 1, x + 1, y + 5);
-    rb->lcd_drawpixel(x, y + 6);
+    rb->lcd_fillrect(center_x - 2, top, 5, 5);
+    rb->lcd_hline(center_x - 1, center_x + 1, top + 5);
+    rb->lcd_drawpixel(center_x, top + 6);
     rb->lcd_set_foreground(LCD_BLACK);
     for (row = 0; row < 5; row++) {
         int bits = (glyph >> ((4 - row) * 3)) & 7;
         for (column = 0; column < 3; column++) {
             if (bits & (4 >> column))
-                rb->lcd_drawpixel(x - 1 + column, y + row);
+                rb->lcd_drawpixel(center_x - 1 + column, top + row);
+        }
+    }
+}
+
+static void draw_overview_cue_marker(int center_x, int slot, int color)
+{
+    int x = MAX(RBPREP_OVERVIEW_X + 2,
+                MIN(RBPREP_OVERVIEW_X + RBPREP_OVERVIEW_WIDTH - 3,
+                    center_x));
+
+    draw_micro_cue_marker(x, RBPREP_OVERVIEW_Y, slot, color);
+}
+
+static void draw_radial_cue_marker(int platter_x, int platter_y,
+                                   int tip_x, int tip_y,
+                                   int slot, int color)
+{
+    uint16_t glyph = micro_hex_glyphs[(slot + 1) & 15];
+    int dx = tip_x - platter_x;
+    int dy = tip_y - platter_y;
+    int body_x;
+    int body_y;
+    int row;
+    int column;
+
+    /* The marker tip is planted on the cue's groove.  Its 5px labeled body
+       always grows away from the spindle, using cardinal shapes so the tiny
+       glyph remains upright and legible while the record rotates. */
+    rb->lcd_set_foreground(color);
+    if (ABS(dx) >= ABS(dy)) {
+        body_x = dx >= 0 ? tip_x + 2 : tip_x - 6;
+        body_y = tip_y - 2;
+        rb->lcd_vline(dx >= 0 ? tip_x + 1 : tip_x - 1,
+                      tip_y - 1, tip_y + 1);
+    } else {
+        body_x = tip_x - 2;
+        body_y = dy >= 0 ? tip_y + 2 : tip_y - 6;
+        rb->lcd_hline(tip_x - 1, tip_x + 1,
+                      dy >= 0 ? tip_y + 1 : tip_y - 1);
+    }
+    rb->lcd_drawpixel(tip_x, tip_y);
+    rb->lcd_fillrect(body_x, body_y, 5, 5);
+
+    rb->lcd_set_foreground(LCD_BLACK);
+    for (row = 0; row < 5; row++) {
+        int bits = (glyph >> ((4 - row) * 3)) & 7;
+        for (column = 0; column < 3; column++) {
+            if (bits & (4 >> column))
+                rb->lcd_drawpixel(body_x + 1 + column, body_y + row);
         }
     }
 }
@@ -619,6 +684,15 @@ static void text(int x, int y, const char *s, int color)
 {
     rb->lcd_set_foreground(color);
     rb->lcd_putsxy(x, y, s);
+}
+
+static void format_percent_delta(char *buffer, size_t size, int delta_x100)
+{
+    char sign = delta_x100 < 0 ? '-' : '+';
+    int magnitude = ABS(delta_x100);
+
+    rb->snprintf(buffer, size, "%c%d.%02d", sign,
+                 magnitude / 100, magnitude % 100);
 }
 
 static void restore_black_canvas(void)
@@ -1445,15 +1519,109 @@ static void rebuild_waveform_columns(int first, int span)
     waveform_columns_valid = true;
 }
 
-static int spectrum_power_level(uint64_t power)
+static int integer_log2(uint64_t value)
 {
     int bits = 0;
 
-    while (power > 1) {
-        power >>= 1;
+    while (value > 1) {
+        value >>= 1;
         bits++;
     }
-    return MAX(0, MIN(255, (bits - 18) * 18));
+    return bits;
+}
+
+/* Convert Goertzel power to a useful -60..0 dBFS display range.  A
+   full-scale sine through our triangular window has approximately
+   (frames * 32)^2 power after the input shift. */
+static int spectrum_power_level(uint64_t power, int frames)
+{
+    uint64_t reference = (uint64_t)frames * frames * 1024;
+    int db;
+
+    if (!power || frames <= 0)
+        return 0;
+    db = (integer_log2(power) - integer_log2(reference)) * 3;
+    db = MAX(-60, MIN(0, db));
+    return (db + 60) * 255 / 60;
+}
+
+static int spectrum_level_db(int level)
+{
+    return -60 + level * 60 / 255;
+}
+
+static void update_bass_pitch(int frames)
+{
+    static const int note_frequency_x10[] = {
+        462, 490, 519, 550, 583, 617, 654, 693, 734,
+        778, 824, 873, 925, 980, 1038, 1100, 1165
+    };
+    int sample_rate = pcm_sample_rate ? pcm_sample_rate : 44100;
+    int min_lag = MAX(1, sample_rate / 120);
+    int max_lag = MIN(frames - 80, sample_rate / 45);
+    uint32_t best_score = 0xffffffffu;
+    uint32_t mean_amplitude = 0;
+    int best_lag = 0;
+    int lag;
+    int i;
+
+    if (max_lag <= min_lag || spectrum_bass < 70) {
+        bass_pitch_confidence = bass_pitch_confidence * 3 / 4;
+        if (bass_pitch_confidence < 20)
+            bass_note_index = -1;
+        return;
+    }
+    for (i = 0; i < frames; i += 4)
+        mean_amplitude += ABS(pcm_pitch[i]);
+    mean_amplitude /= MAX(1, (frames + 3) / 4);
+    if (mean_amplitude < 8) {
+        bass_pitch_confidence = 0;
+        bass_note_index = -1;
+        return;
+    }
+
+    /* Average-magnitude difference is cheap enough for the PortalPlayer and
+       gives the sub display a genuinely observed pitch rather than an EQ-bin
+       label.  A four-sample stride keeps this under the redraw budget. */
+    for (lag = min_lag; lag <= max_lag; lag += 2) {
+        uint32_t difference = 0;
+        int count = 0;
+
+        for (i = lag; i < frames; i += 4) {
+            difference += ABS((int)pcm_pitch[i] - pcm_pitch[i - lag]);
+            count++;
+        }
+        if (count > 0) {
+            uint32_t score = difference / count;
+            if (score < best_score) {
+                best_score = score;
+                best_lag = lag;
+            }
+        }
+    }
+    if (best_lag > 0) {
+        int frequency_x10 = (long long)sample_rate * 10 / best_lag;
+        int best_note = 0;
+        int best_delta = ABS(frequency_x10 - note_frequency_x10[0]);
+
+        bass_pitch_confidence = MAX(0, MIN(255,
+            255 - (long long)best_score * 180 / MAX(1, mean_amplitude)));
+        if (bass_pitch_confidence < 36) {
+            bass_note_index = -1;
+            return;
+        }
+        if (bass_frequency_x10 > 0)
+            frequency_x10 = (bass_frequency_x10 * 3 + frequency_x10) / 4;
+        bass_frequency_x10 = frequency_x10;
+        for (i = 1; i < (int)ARRAYLEN(note_frequency_x10); i++) {
+            int delta = ABS(frequency_x10 - note_frequency_x10[i]);
+            if (delta < best_delta) {
+                best_delta = delta;
+                best_note = i;
+            }
+        }
+        bass_note_index = best_note;
+    }
 }
 
 static void update_spectrum_levels(void)
@@ -1507,6 +1675,10 @@ static void update_spectrum_levels(void)
         int weight = i <= frames / 2 ? i : frames - 1 - i;
         int sample = ((int)pcm_snapshot[i * 2] +
                       (int)pcm_snapshot[i * 2 + 1]) >> 1;
+        /* About a 110 Hz one-pole low pass at 44.1 kHz keeps the pitch
+           detector focused on the woofer range instead of upper harmonics. */
+        bass_filter_state += (sample - bass_filter_state) / 64;
+        pcm_pitch[i] = bass_filter_state >> 4;
         pcm_mono[i] = (sample * weight / MAX(1, frames / 2)) >> 8;
     }
     coefficients = pcm_sample_rate >= 46000
@@ -1528,7 +1700,7 @@ static void update_spectrum_levels(void)
                 (int64_t)s2 * s2 -
                 (((int64_t)coefficient * s1 >> 20) * s2);
             raw = spectrum_power_level(signed_power > 0
-                                     ? signed_power : 0);
+                                     ? signed_power : 0, frames);
         }
         if (raw > spectrum_levels[band])
             spectrum_levels[band] =
@@ -1546,40 +1718,46 @@ static void update_spectrum_levels(void)
     else
         spectrum_bass_hit = spectrum_bass_hit * 3 / 4;
     spectrum_bass = (spectrum_bass * 3 + bass_raw) / 4;
-}
-
-static void draw_demo_overlays(int first, int span)
-{
-    int x;
-
-    draw_beatgrid(first, span);
-    draw_loop_markers(first, span);
-    draw_cues(first, span);
-    rb->lcd_set_foreground(LCD_RGBPACK(255, 45, 45));
-    x = MAX(RBPREP_DECK_X,
-            MIN(RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1,
-                time_to_x(playhead, first, span)));
-    rb->lcd_vline(x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
+    update_bass_pitch(frames);
 }
 
 static void draw_boombox(void)
 {
-    int first;
-    int span;
+    static const int16_t cosine[12] = {
+        256, 222, 128, 0, -128, -222,
+        -256, -222, -128, 0, 128, 222
+    };
+    static const int16_t sine[12] = {
+        0, 128, 222, 256, 222, 128,
+        0, -128, -222, -256, -222, -128
+    };
+    static const char *note_names[] = {
+        "F#1", "G1", "G#1", "A1", "A#1", "B1", "C2", "C#2", "D2",
+        "D#2", "E2", "F2", "F#2", "G2", "G#2", "A2", "A#2"
+    };
     int bass = MIN(255, spectrum_bass + spectrum_bass_hit / 2);
-    int centers[2] = { 78, 222 };
+    bool rattling = spectrum_bass >= 204;
+    int rattle = rattling && ((*rb->current_tick / MAX(1, HZ / 20)) & 1)
+               ? 1 : 0;
+    int centers[2] = { 78 - rattle, 222 + rattle };
     int speaker;
-    int band;
+    int note;
+    char line[32];
 
-    viewport(&first, &span);
-    rb->lcd_set_foreground(LCD_RGBPACK(27, 31, 29));
-    rb->lcd_fillrect(8, RBPREP_WAVE_TOP + 10,
+    rb->lcd_set_foreground(LCD_RGBPACK(8, 12, 10));
+    rb->lcd_fillrect(8 + rattle, RBPREP_WAVE_TOP + 10,
                      RBPREP_DECK_WIDTH - 16, 132);
-    rb->lcd_set_foreground(LCD_RGBPACK(93, 108, 99));
-    rb->lcd_drawrect(8, RBPREP_WAVE_TOP + 10,
+    rb->lcd_set_foreground(rattling ? LCD_WHITE
+                                   : LCD_RGBPACK(93, 108, 99));
+    rb->lcd_drawrect(8 + rattle, RBPREP_WAVE_TOP + 10,
                      RBPREP_DECK_WIDTH - 16, 132);
-    text(116, RBPREP_WAVE_TOP + 15, "SUB  <120Hz",
-         LCD_RGBPACK(255, 145, 40));
+    text(107, RBPREP_WAVE_TOP + 14, "SUB RESONANCE", RBPREP_GREEN);
+    if (rattling) {
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_hline(3, 6, RBPREP_WAVE_TOP + 55 + rattle);
+        rb->lcd_hline(RBPREP_DECK_WIDTH - 6, RBPREP_DECK_WIDTH - 3,
+                      RBPREP_WAVE_TOP + 111 - rattle);
+    }
 
     for (speaker = 0; speaker < 2; speaker++) {
         int cx = centers[speaker];
@@ -1602,52 +1780,82 @@ static void draw_boombox(void)
         xlcd_drawcircle(cx, cy, cone);
         rb->lcd_set_foreground(LCD_RGBPACK(8, 12, 10));
         xlcd_fillcircle(cx, cy, 9 + spectrum_bass_hit / 40);
+
+        /* Two chromatic pitch rings: F#1..B1 inside, C2..A#2 outside. */
+        for (note = 0; note < (int)ARRAYLEN(note_names); note++) {
+            int angle = note % 12;
+            int radius = note < 6 ? 18 : 29;
+            int x = cx + cosine[angle] * radius / 256;
+            int y = cy + sine[angle] * radius / 256;
+            bool active = note == bass_note_index &&
+                          bass_pitch_confidence >= 36;
+
+            rb->lcd_set_foreground(active ? LCD_WHITE
+                                          : LCD_RGBPACK(42, 91, 61));
+            if (active)
+                xlcd_fillcircle(x, y, 2);
+            else
+                rb->lcd_drawpixel(x, y);
+        }
     }
-    for (band = 0; band < 8; band++) {
-        int level = spectrum_levels[band + 6];
-        int height = level * 34 / 255;
-        rb->lcd_set_foreground(level > 205
-                              ? LCD_RGBPACK(255, 80, 55)
-                              : level > 145
-                              ? LCD_RGBPACK(255, 205, 55)
-                              : LCD_RGBPACK(70, 235, 125));
-        rb->lcd_fillrect(123 + band * 7,
-                         RBPREP_WAVE_TOP + 116 - height,
-                         4, MAX(1, height));
+
+    if (bass_note_index >= 0 && bass_pitch_confidence >= 36) {
+        text(137, RBPREP_WAVE_TOP + 51, note_names[bass_note_index],
+             LCD_WHITE);
+        rb->snprintf(line, sizeof(line), "%d.%dHz",
+                     bass_frequency_x10 / 10, bass_frequency_x10 % 10);
+        text(126, RBPREP_WAVE_TOP + 69, line, RBPREP_GREEN);
+    } else {
+        text(138, RBPREP_WAVE_TOP + 51, "--", LCD_LIGHTGRAY);
+        text(126, RBPREP_WAVE_TOP + 69, "LISTEN", RBPREP_GREEN_DIM);
     }
-    draw_demo_overlays(first, span);
+    rb->snprintf(line, sizeof(line), "%ddB", spectrum_level_db(spectrum_bass));
+    text(132, RBPREP_WAVE_TOP + 87, line,
+         rattling ? LCD_WHITE : LCD_RGBPACK(155, 174, 161));
+    if (rattling)
+        text(124, RBPREP_WAVE_TOP + 105, "RATTLE", LCD_WHITE);
 }
 
 static void draw_twenty_band_eq(void)
 {
-    int first;
-    int span;
+    static const char *db_labels[] = {
+        "0", "-12", "-24", "-36", "-48", "-60"
+    };
     int band;
-    const int bottom = RBPREP_WAVE_BOTTOM - 18;
-    const int maximum = bottom - RBPREP_WAVE_TOP - 15;
+    int mark;
+    const int top = RBPREP_WAVE_TOP + 8;
+    const int bottom = RBPREP_WAVE_BOTTOM - 21;
+    const int maximum = bottom - top;
 
-    viewport(&first, &span);
+    for (mark = 0; mark <= 5; mark++) {
+        int y = top + mark * maximum / 5;
+        rb->lcd_set_foreground(mark == 0 ? LCD_RGBPACK(95, 112, 101)
+                                        : LCD_RGBPACK(18, 43, 28));
+        rb->lcd_hline(2, 260, y);
+        text(266, y - 4, db_labels[mark],
+             mark == 0 ? LCD_WHITE : LCD_RGBPACK(105, 125, 112));
+    }
     for (band = 0; band < RBPREP_SPECTRUM_BANDS; band++) {
-        int x = 5 + band * 14;
+        int x = 3 + band * 13;
         int height = spectrum_levels[band] * maximum / 255;
         int y;
 
         for (y = 0; y < maximum; y += 6) {
             bool lit = y < height;
-            int color = y > maximum * 4 / 5
-                      ? LCD_RGBPACK(255, 75, 50)
-                      : y > maximum * 3 / 5
-                      ? LCD_RGBPACK(255, 205, 55)
-                      : LCD_RGBPACK(55, 225, 120);
+            bool zero_cap = y >= maximum - 6 &&
+                            spectrum_levels[band] >= 250;
+            int color = zero_cap ? LCD_WHITE
+                      : y > maximum * 4 / 5
+                      ? LCD_RGBPACK(180, 255, 210)
+                      : RBPREP_GREEN;
             rb->lcd_set_foreground(lit ? color
-                                       : LCD_RGBPACK(13, 27, 20));
-            rb->lcd_fillrect(x, bottom - y - 4, 10, 4);
+                                       : LCD_RGBPACK(9, 27, 16));
+            rb->lcd_fillrect(x, bottom - y - 4, 8, 4);
         }
-        if ((band & 1) == 0)
+        if ((band % 4) == 0)
             text(x - 1, RBPREP_WAVE_BOTTOM - 12,
                  spectrum_labels[band], LCD_RGBPACK(105, 125, 112));
     }
-    draw_demo_overlays(first, span);
 }
 
 static void draw_turntable(void)
@@ -1673,21 +1881,65 @@ static void draw_turntable(void)
     int span;
     int phase;
     int point;
+    int slot;
+    int lamp_phase;
+    int progress_x1000;
+    int groove_radius;
+    int stylus_x;
+    int stylus_y;
+    int arm_mid1_x;
+    int arm_mid1_y;
+    int arm_mid2_x;
+    int arm_mid2_y;
+    int pitch_slider_y;
     int previous_x = cx;
     int previous_y = cy;
     char line[48];
+    char delta[16];
 
     viewport(&first, &span);
     phase = (long long)playhead * target_rpm_x100[played_rpm_index] * 64 /
             6000000 % 64;
-    rb->lcd_set_foreground(LCD_RGBPACK(8, 11, 10));
+
+    /* Black direct-drive chassis, corner screws, and inset control field. */
+    rb->lcd_set_foreground(LCD_RGBPACK(4, 5, 5));
+    rb->lcd_fillrect(2, RBPREP_WAVE_TOP + 3,
+                     RBPREP_DECK_WIDTH - 4,
+                     RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP - 5);
+    rb->lcd_set_foreground(LCD_RGBPACK(60, 67, 63));
+    rb->lcd_drawrect(2, RBPREP_WAVE_TOP + 3,
+                     RBPREP_DECK_WIDTH - 4,
+                     RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP - 5);
+    rb->lcd_drawpixel(7, RBPREP_WAVE_TOP + 8);
+    rb->lcd_drawpixel(RBPREP_DECK_WIDTH - 7, RBPREP_WAVE_TOP + 8);
+    rb->lcd_drawpixel(7, RBPREP_WAVE_BOTTOM - 7);
+    rb->lcd_drawpixel(RBPREP_DECK_WIDTH - 7, RBPREP_WAVE_BOTTOM - 7);
+
+    rb->lcd_set_foreground(LCD_RGBPACK(7, 9, 8));
     xlcd_fillcircle(cx, cy, 69);
-    rb->lcd_set_foreground(LCD_RGBPACK(72, 86, 77));
+    rb->lcd_set_foreground(LCD_RGBPACK(125, 135, 129));
     xlcd_drawcircle(cx, cy, 69);
     xlcd_drawcircle(cx, cy, 61);
-    rb->lcd_set_foreground(LCD_RGBPACK(28, 38, 32));
+    rb->lcd_set_foreground(LCD_RGBPACK(34, 39, 36));
+    xlcd_drawcircle(cx, cy, 55);
     xlcd_drawcircle(cx, cy, 48);
     xlcd_drawcircle(cx, cy, 37);
+    xlcd_drawcircle(cx, cy, 27);
+    xlcd_drawcircle(cx, cy, 18);
+
+    /* Platter strobe dots rotate at the selected played RPM. */
+    for (point = 0; point < 24; point++) {
+        int angle = (point * 64 / 24 + phase) & 63;
+        int x = cx + cosine[angle] * 65 / 256;
+        int y = cy + sine[angle] * 65 / 256;
+
+        rb->lcd_set_foreground((point + (phase >> 1)) % 6 == 0
+                               ? LCD_WHITE : LCD_RGBPACK(48, 66, 55));
+        if ((point + phase) % 6 == 0)
+            xlcd_fillcircle(x, y, 1);
+        else
+            rb->lcd_drawpixel(x, y);
+    }
 
     for (point = 0; point <= 64; point++) {
         int angle = (point + phase) & 63;
@@ -1714,28 +1966,125 @@ static void draw_turntable(void)
         previous_x = x;
         previous_y = y;
     }
+
+    rb->lcd_set_foreground(LCD_WHITE);
+    xlcd_fillcircle(cx, cy, 13);
+
+    /* Cue flags are record-relative: their timeline position chooses a groove
+       angle and the platter phase rotates the whole cue map. */
+    for (slot = 0; slot < 16; slot++) {
+        int angle;
+        int cue_progress_x1000;
+        int cue_radius;
+        int x;
+        int y;
+
+        if (hotcues[slot] < 0 || track_length <= 0)
+            continue;
+        cue_progress_x1000 = MAX(0, MIN(1000,
+            (long long)hotcues[slot] * 1000 / track_length));
+        cue_radius = 56 - cue_progress_x1000 * 22 / 1000;
+        angle = (phase + (long long)hotcues[slot] * 64 / track_length) & 63;
+        x = cx + cosine[angle] * cue_radius / 256;
+        y = cy + sine[angle] * cue_radius / 256;
+        draw_radial_cue_marker(cx, cy, x, y, slot,
+                               cue_palette[hotcue_colors[slot] & 7]);
+    }
+
     rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
     xlcd_fillcircle(cx, cy, 4);
-    rb->lcd_set_foreground(LCD_RGBPACK(150, 165, 154));
-    rb->lcd_drawline(190, RBPREP_WAVE_TOP + 20, 176, cy - 22);
-    rb->lcd_drawline(176, cy - 22, 139, cy + 40);
-    xlcd_fillcircle(190, RBPREP_WAVE_TOP + 20, 6);
 
-    text(171, RBPREP_WAVE_TOP + 31, "VINYL DECK",
-         LCD_RGBPACK(255, 145, 40));
-    rb->snprintf(line, sizeof(line), "RPM  %s > %s",
+    /* A real tonearm moves inward over the full side.  The stylus follows a
+       fixed pickup angle while its groove radius falls from 56 to 34 pixels. */
+    progress_x1000 = track_length > 0
+                   ? MAX(0, MIN(1000,
+                       (long long)playhead * 1000 / track_length)) : 0;
+    groove_radius = 56 - progress_x1000 * 22 / 1000;
+    stylus_x = cx + cosine[7] * groove_radius / 256;
+    stylus_y = cy + sine[7] * groove_radius / 256;
+    arm_mid1_x = (192 * 2 + stylus_x) / 3 + 5;
+    arm_mid1_y = ((RBPREP_WAVE_TOP + 30) * 2 + stylus_y) / 3;
+    arm_mid2_x = (192 + stylus_x * 2) / 3 - 5;
+    arm_mid2_y = (RBPREP_WAVE_TOP + 30 + stylus_y * 2) / 3;
+    rb->lcd_set_foreground(LCD_RGBPACK(178, 186, 181));
+    rb->lcd_drawline(192, RBPREP_WAVE_TOP + 30, arm_mid1_x, arm_mid1_y);
+    rb->lcd_drawline(arm_mid1_x, arm_mid1_y, arm_mid2_x, arm_mid2_y);
+    rb->lcd_drawline(arm_mid2_x, arm_mid2_y, stylus_x, stylus_y);
+    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_drawline(stylus_x - 2, stylus_y - 1,
+                     stylus_x + 2, stylus_y + 2);
+    rb->lcd_drawpixel(stylus_x, stylus_y + 3);
+    rb->lcd_set_foreground(LCD_RGBPACK(115, 124, 119));
+    xlcd_fillcircle(192, RBPREP_WAVE_TOP + 30, 10);
+    rb->lcd_set_foreground(LCD_BLACK);
+    xlcd_fillcircle(192, RBPREP_WAVE_TOP + 30, 4);
+    rb->lcd_set_foreground(LCD_RGBPACK(115, 124, 119));
+    rb->lcd_drawline(198, RBPREP_WAVE_TOP + 22,
+                     209, RBPREP_WAVE_TOP + 10);
+    rb->lcd_fillrect(205, RBPREP_WAVE_TOP + 7, 11, 7);
+
+    lamp_phase = (long long)*rb->current_tick *
+                 target_rpm_x100[played_rpm_index] * 8 /
+                 (HZ * 6000);
+    rb->lcd_set_foreground((rb->audio_status() & AUDIO_STATUS_PLAY) &&
+                           !(rb->audio_status() & AUDIO_STATUS_PAUSE)
+                           ? ((lamp_phase & 1) ? LCD_RGBPACK(255, 60, 45)
+                                               : LCD_RGBPACK(120, 12, 8))
+                           : LCD_RGBPACK(45, 9, 7));
+    rb->lcd_vline(164, RBPREP_WAVE_TOP + 7, RBPREP_WAVE_TOP + 19);
+    xlcd_fillcircle(164, RBPREP_WAVE_TOP + 20, 3);
+    if (lamp_phase & 1)
+        xlcd_drawcircle(164, RBPREP_WAVE_TOP + 20, 5);
+
+    /* Familiar direct-drive transport and three-speed selector. */
+    rb->lcd_set_foreground(LCD_RGBPACK(105, 115, 109));
+    xlcd_drawcircle(180, RBPREP_WAVE_BOTTOM - 36, 9);
+    rb->lcd_set_foreground(RBPREP_GREEN);
+    rb->lcd_drawline(180, RBPREP_WAVE_BOTTOM - 42,
+                     180, RBPREP_WAVE_BOTTOM - 36);
+    text(161, RBPREP_WAVE_BOTTOM - 27, "START", LCD_RGBPACK(125, 139, 130));
+    for (point = 0; point < 3; point++) {
+        int x = 158 + point * 20;
+        bool selected = point == played_rpm_index;
+        rb->lcd_set_foreground(selected ? RBPREP_GREEN
+                                       : LCD_RGBPACK(40, 52, 44));
+        rb->lcd_fillrect(x, RBPREP_WAVE_BOTTOM - 12, 16, 7);
+        text(x + 1, RBPREP_WAVE_BOTTOM - 12, rpm_styles[point],
+             selected ? LCD_BLACK : LCD_RGBPACK(145, 158, 149));
+    }
+
+    /* The pitch-bend tool owns this fader; the white tick is exact zero. */
+    rb->lcd_set_foreground(LCD_RGBPACK(65, 75, 69));
+    rb->lcd_vline(288, RBPREP_WAVE_TOP + 31, RBPREP_WAVE_BOTTOM - 18);
+    rb->lcd_hline(284, 292, RBPREP_WAVE_TOP + 75);
+    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_hline(282, 294, RBPREP_WAVE_TOP + 75);
+    pitch_slider_y = RBPREP_WAVE_TOP + 75 -
+                     pitch_bend_x100 * 42 / 1600;
+    rb->lcd_set_foreground(RBPREP_GREEN);
+    rb->lcd_fillrect(282, pitch_slider_y - 2, 13, 5);
+
+    /* Keep the readout to the right of the tonearm's entire sweep. */
+    text(218, RBPREP_WAVE_TOP + 7, "QUARTZ DD", RBPREP_GREEN);
+    rb->snprintf(line, sizeof(line), "%s>%s RPM",
                  rpm_styles[host_rpm_index], rpm_styles[played_rpm_index]);
-    text(171, RBPREP_WAVE_TOP + 53, line, LCD_WHITE);
-    rb->snprintf(line, sizeof(line), "PITCH %d.%02d%%",
-                 deck_pitch_x100() / 100, deck_pitch_x100() % 100);
-    text(171, RBPREP_WAVE_TOP + 70, line, LCD_RGBPACK(85, 220, 255));
-    rb->snprintf(line, sizeof(line), "TEMPO %d.%02d%%",
-                 tempo_x100 / 100, tempo_x100 % 100);
-    text(171, RBPREP_WAVE_TOP + 87, line, LCD_RGBPACK(70, 235, 125));
-    rb->snprintf(line, sizeof(line), "RATE  %d.%02d%%",
-                 deck_speed_x100() / 100, deck_speed_x100() % 100);
-    text(171, RBPREP_WAVE_TOP + 104, line, LCD_RGBPACK(145, 165, 151));
-    draw_demo_overlays(first, span);
+    text(212, RBPREP_WAVE_TOP + 26, line, LCD_WHITE);
+    format_percent_delta(delta, sizeof(delta),
+                         deck_pitch_x100() - PITCH_SPEED_100);
+    rb->snprintf(line, sizeof(line), "P %s%%", delta);
+    text(212, RBPREP_WAVE_TOP + 45, line, LCD_WHITE);
+    format_percent_delta(delta, sizeof(delta), pitch_bend_x100);
+    rb->snprintf(line, sizeof(line), "B %s%%", delta);
+    text(212, RBPREP_WAVE_TOP + 64, line, RBPREP_GREEN);
+    format_percent_delta(delta, sizeof(delta),
+                         tempo_x100 - PITCH_SPEED_100);
+    rb->snprintf(line, sizeof(line), "T %s%%", delta);
+    text(212, RBPREP_WAVE_TOP + 83, line, RBPREP_GREEN);
+    format_percent_delta(delta, sizeof(delta),
+                         deck_speed_x100() - PITCH_SPEED_100);
+    rb->snprintf(line, sizeof(line), "R %s%%", delta);
+    text(212, RBPREP_WAVE_TOP + 102, line,
+         LCD_RGBPACK(155, 174, 161));
 }
 
 static void draw_waveform(void)
@@ -1939,7 +2288,7 @@ static void draw_vu_meter(void)
                      RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
     for (segment = 0; segment < segments; segment++) {
         int y = RBPREP_SIGNAL_BOTTOM - segment * segment_pitch - 7;
-        int active_color = segment >= 12 ? LCD_RGBPACK(255, 65, 55)
+        int active_color = segment >= 12 ? LCD_WHITE
                          : segment >= 9 ? LCD_RGBPACK(255, 205, 55)
                          : LCD_RGBPACK(55, 225, 105);
         rb->lcd_set_foreground(segment < lit_left
@@ -2495,6 +2844,7 @@ static bool play_track_index(int index, int row,
     struct mp3entry *id3;
     char path[MAX_PATH];
     const char *extension;
+    bool already_loaded;
 
     if (!read_track_record(index, &track) ||
         !read_index_string(track.path_offset, path, sizeof(path)))
@@ -2511,6 +2861,7 @@ static bool play_track_index(int index, int row,
     }
 
     id3 = rb->audio_current_track();
+    already_loaded = id3 && id3->path && !rb->strcmp(id3->path, path);
     if (index == selected_track_index && id3 && id3->path &&
         !rb->strcmp(id3->path, path)) {
         playhead = clamp_playhead(id3->elapsed);
@@ -2523,18 +2874,21 @@ static bool play_track_index(int index, int row,
     }
 
     if (host_rpm_index != 0 || played_rpm_index != 0 ||
-        tempo_x100 != PITCH_SPEED_100) {
+        pitch_bend_x100 != 0 || tempo_x100 != PITCH_SPEED_100) {
         host_rpm_index = played_rpm_index = 0;
+        pitch_bend_x100 = 0;
         tempo_x100 = PITCH_SPEED_100;
         apply_playback_rate();
     }
-    stop_editor_audio();
-    if (rb->playlist_create(NULL, NULL) < 0 ||
-        rb->playlist_insert_track(NULL, path, PLAYLIST_INSERT_LAST,
-                                  false, true) < 0) {
-        rb->splash(HZ * 2, "Could not load track");
-        restore_black_canvas();
-        return false;
+    if (!already_loaded) {
+        stop_editor_audio();
+        if (rb->playlist_create(NULL, NULL) < 0 ||
+            rb->playlist_insert_track(NULL, path, PLAYLIST_INSERT_LAST,
+                                      false, true) < 0) {
+            rb->splash(HZ * 2, "Could not load track");
+            restore_black_canvas();
+            return false;
+        }
     }
 
     selected_track_index = index;
@@ -2562,15 +2916,44 @@ static bool play_track_index(int index, int row,
     load_waveform(track.id);
     load_latest_edit(track.id);
     track_edit_dirty = false;
-    playhead = 0;
-    rb->playlist_start(0, 0, 0);
-    reset_play_clock(0, *rb->current_tick);
+    if (already_loaded && id3) {
+        if (id3->length > 0)
+            track_length = id3->length;
+        playhead = clamp_playhead(id3->elapsed);
+    } else {
+        playhead = 0;
+        rb->playlist_start(0, 0, 0);
+    }
+    reset_play_clock(playhead, *rb->current_tick);
     playing_track_row = row;
     audio_was_running = true;
     deck_return_mode = return_mode;
     mode = MODE_DECK;
     force_full_redraw = true;
     return true;
+}
+
+static bool open_loaded_track(void)
+{
+    struct mp3entry *id3 = rb->audio_current_track();
+    struct rbprep_track_record track;
+    char path[MAX_PATH];
+    unsigned int index;
+
+    if (!id3 || !id3->path || !id3->path[0]) {
+        rb->splash(HZ * 2, "No track is loaded");
+        restore_black_canvas();
+        return false;
+    }
+    for (index = 0; index < library_track_count; index++) {
+        if (read_track_record(index, &track) &&
+            read_index_string(track.path_offset, path, sizeof(path)) &&
+            !rb->strcmp(path, id3->path))
+            return play_track_index(index, -1, MODE_LIBRARY);
+    }
+    rb->splash(HZ * 2, "Loaded track is not in RBPrep index");
+    restore_black_canvas();
+    return false;
 }
 
 static bool play_track_row(int row)
@@ -2581,10 +2964,9 @@ static bool play_track_row(int row)
 static void draw_record_badge(int cx, int cy, int radius, int color,
                               bool selected)
 {
-    rb->lcd_set_foreground(selected ? color : LCD_RGBPACK(36, 48, 41));
+    rb->lcd_set_foreground(selected ? color : LCD_RGBPACK(24, 35, 28));
     xlcd_fillcircle(cx, cy, radius);
-    rb->lcd_set_foreground(selected ? LCD_RGBPACK(12, 18, 15)
-                                    : LCD_RGBPACK(8, 12, 10));
+    rb->lcd_set_foreground(LCD_BLACK);
     xlcd_fillcircle(cx, cy, MAX(1, radius - 2));
     rb->lcd_set_foreground(selected ? LCD_WHITE
                                     : LCD_RGBPACK(100, 120, 107));
@@ -2593,9 +2975,9 @@ static void draw_record_badge(int cx, int cy, int radius, int color,
 
 static void draw_blade_shell(const char *title, int accent)
 {
-    rb->lcd_set_foreground(LCD_RGBPACK(5, 8, 7));
+    rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
-    rb->lcd_set_foreground(LCD_RGBPACK(14, 22, 18));
+    rb->lcd_set_foreground(LCD_RGBPACK(4, 13, 8));
     rb->lcd_fillrect(0, 0, LCD_WIDTH, 22);
     rb->lcd_set_foreground(accent);
     rb->lcd_fillrect(0, 0, 5, LCD_HEIGHT);
@@ -2608,10 +2990,11 @@ static void draw_blade_shell(const char *title, int accent)
 static void draw_blade_selection(int y, int height, int color)
 {
     int radius = height / 2;
-    rb->lcd_set_foreground(color);
+    (void)color;
+    rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
     xlcd_fillcircle(16, y + radius, radius);
     rb->lcd_fillrect(16, y, LCD_WIDTH - 16, height + 1);
-    rb->lcd_set_foreground(LCD_RGBPACK(120, 235, 255));
+    rb->lcd_set_foreground(RBPREP_GREEN);
     rb->lcd_vline(5, y + 2, y + height - 2);
 }
 
@@ -2622,8 +3005,7 @@ static void draw_playlist_browser(void)
     char line[96];
 
     draw_blade_shell(playlist_add_mode ? "ADD TO PLAYLIST" : "PLAYLISTS",
-                     playlist_add_mode ? LCD_RGBPACK(255, 145, 40)
-                                       : LCD_RGBPACK(70, 235, 125));
+                     RBPREP_GREEN);
     if (tree_parent == RBPREP_ROOT_NODE) {
         text(112, 3, "/", LCD_LIGHTGRAY);
     } else {
@@ -2652,8 +3034,7 @@ static void draw_playlist_browser(void)
                                  : LCD_RGBPACK(27, 78, 128));
         }
         draw_record_badge(14, y + 7, 6,
-                          node.kind == 0 ? LCD_RGBPACK(70, 235, 125)
-                                         : LCD_RGBPACK(85, 220, 255),
+                          RBPREP_GREEN,
                           ordinal == tree_selection);
         rb->snprintf(line, sizeof(line), "%s  %s",
                      node.kind == 0 ? "FOLDER" : "SET", name);
@@ -2684,9 +3065,7 @@ static void draw_track_browser(void)
     char line[96];
 
     draw_blade_shell(active_playlist_node < 0 ? "COLLECTION" : "PLAYLIST",
-                     active_playlist_node < 0
-                     ? LCD_RGBPACK(70, 235, 125)
-                     : LCD_RGBPACK(85, 220, 255));
+                     RBPREP_GREEN);
     if (active_playlist_node >= 0) {
         struct rbprep_node_record node;
         if (read_node_record(active_playlist_node, &node) &&
@@ -2743,7 +3122,7 @@ static void draw_track_browser(void)
             rb->snprintf(line, sizeof(line), "CMT");
         else if (track_sort_key == TRACK_SORT_TAGS)
             rb->snprintf(line, sizeof(line), "TAG");
-        text(276, y + 10, line, LCD_RGBPACK(95, 225, 145));
+        text(276, y + 10, line, RBPREP_GREEN);
     }
     rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
     rb->lcd_fillrect(0, 210, LCD_WIDTH, 30);
@@ -2770,11 +3149,11 @@ static void draw_collection_filter(void)
     int row;
 
     draw_blade_shell("COLLECTION SEARCH + SORT",
-                     LCD_RGBPACK(70, 235, 125));
+                     RBPREP_GREEN);
     rb->snprintf(line, sizeof(line), "QUERY  %s",
                  track_search[0] ? track_search : "<ALL TRACKS>");
     text(7, 20, line, track_search[0]
-         ? LCD_RGBPACK(255, 145, 40) : LCD_RGBPACK(105, 125, 112));
+         ? RBPREP_GREEN : LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < (int)ARRAYLEN(items); row++) {
         int y = 43 + row * 21;
         bool selected = row == filter_selection;
@@ -2785,8 +3164,7 @@ static void draw_collection_filter(void)
                                         : LCD_RGBPACK(18, 78, 128));
         }
         draw_record_badge(12, y + 5, 5,
-                          active ? LCD_RGBPACK(70, 235, 125)
-                                 : LCD_RGBPACK(85, 220, 255), selected);
+                          RBPREP_GREEN, selected);
         text(24, y, items[row], selected ? LCD_WHITE
              : active ? LCD_RGBPACK(70, 235, 125)
                       : LCD_RGBPACK(178, 192, 183));
@@ -2813,7 +3191,7 @@ static enum rbprep_tool active_tool(void)
 static int tool_count(void)
 {
     if (mode == MODE_DECK)
-        return 10;
+        return 11;
     if (mode == MODE_GRID || mode == MODE_CUES || mode == MODE_LOOP)
         return 4;
     return 4;
@@ -2867,6 +3245,10 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
             rb->lcd_drawline(cx - 4, cy, cx - 2, cy - 2);
         else
             rb->lcd_drawline(cx, cy - 4, cx + 2, cy - 2);
+    } else if (tool == TOOL_PITCH_BEND) {
+        rb->lcd_vline(cx, y, y + 8);
+        rb->lcd_hline(x, x + 8, cy);
+        rb->lcd_fillrect(cx - 1, cy - 2, 3, 5);
     } else if (tool == TOOL_TEMPO) {
         rb->lcd_drawline(x, y + 7, x + 2, y + 2);
         rb->lcd_drawline(x + 2, y + 2, x + 5, y + 5);
@@ -2967,15 +3349,6 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
     }
 }
 
-static const char *page_label(void)
-{
-    if (mode == MODE_DECK) return "PLAY";
-    if (mode == MODE_GRID) return "GRID";
-    if (mode == MODE_CUES) return "CUE";
-    if (mode == MODE_LOOP) return "LOOP";
-    return "META";
-}
-
 static void draw_beat_phase(void)
 {
     int beat = 1;
@@ -2993,11 +3366,11 @@ static void draw_beat_phase(void)
     }
 
     for (i = 0; i < 4; i++) {
-        int x = 220 + i * 9;
+        int x = 238 + i * 8;
         rb->lcd_set_foreground(i + 1 == beat
                               ? LCD_RGBPACK(70, 235, 125)
                               : LCD_RGBPACK(35, 53, 42));
-        rb->lcd_fillrect(x, 71, 7, 7);
+        rb->lcd_fillrect(x, 71, 6, 7);
     }
 }
 
@@ -3111,18 +3484,19 @@ static void draw_tool_orbs(void)
     int selected = *tool_selection();
     int i;
 
-    text(2, 69, page_label(), LCD_RGBPACK(125, 148, 132));
     for (i = 0; i < count; i++) {
         enum rbprep_tool tool = active_tool() - selected + i;
-        int cx = count > 7 ? 17 + i * 14
+        int cx = count > 7 ? 7 + i * 12
                            : count > 4 ? 38 + i * 17 : 50 + i * 26;
         int color = i == selected
                                   ? (tool_menu_active
-                                     ? LCD_RGBPACK(85, 220, 255)
-                                     : LCD_RGBPACK(255, 145, 40))
+                                     ? LCD_WHITE
+                                     : RBPREP_GREEN)
                                   : LCD_RGBPACK(48, 70, 56);
         rb->lcd_set_foreground(color);
-        xlcd_fillcircle(cx, 74, i == selected ? 7 : 6);
+        xlcd_fillcircle(cx, 74, count > 7
+                               ? (i == selected ? 6 : 5)
+                               : (i == selected ? 7 : 6));
         draw_tool_icon(cx, 74, tool,
                        i == selected ? LCD_BLACK
                                      : LCD_RGBPACK(195, 215, 201));
@@ -3134,8 +3508,8 @@ static void draw_tool_status(void)
     char line[96];
     char fitted[96];
     enum rbprep_tool tool = active_tool();
-    int color = tool_menu_active ? LCD_RGBPACK(85, 220, 255)
-                                 : LCD_RGBPACK(70, 235, 125);
+    int color = tool_menu_active ? LCD_WHITE : RBPREP_GREEN;
+    int status_x = tool_count() > 7 ? 132 : 150;
 
     if (tool == TOOL_SEEK)
         rb->snprintf(line, sizeof(line), "SEEK  %dms/tick", scrub_step_ms());
@@ -3153,9 +3527,13 @@ static void draw_tool_status(void)
                      rpm_styles[host_rpm_index],
                      rpm_styles[played_rpm_index]);
     else if (tool == TOOL_PLAY_RPM)
-        rb->snprintf(line, sizeof(line), "PLAY RPM  %s  PITCH %d.%02d%%",
-                     rpm_styles[played_rpm_index],
-                     deck_pitch_x100() / 100, deck_pitch_x100() % 100);
+        rb->snprintf(line, sizeof(line), "PLAY %s  HOST %s",
+                     rpm_styles[played_rpm_index], rpm_styles[host_rpm_index]);
+    else if (tool == TOOL_PITCH_BEND) {
+        char delta[16];
+        format_percent_delta(delta, sizeof(delta), pitch_bend_x100);
+        rb->snprintf(line, sizeof(line), "BEND %s%%", delta);
+    }
     else if (tool == TOOL_TEMPO)
         rb->snprintf(line, sizeof(line), "TEMPO  %d.%02d%%  RATE %d.%02d%%",
                      tempo_x100 / 100, tempo_x100 % 100,
@@ -3214,8 +3592,8 @@ static void draw_tool_status(void)
         rb->snprintf(line, sizeof(line), "YEAR  %04d", track_year);
     else
         rb->snprintf(line, sizeof(line), "GENRE  %.30s", selected_genre);
-    fit_text(fitted, sizeof(fitted), line, 66);
-    text(150, 69, fitted, color);
+    fit_text(fitted, sizeof(fitted), line, 234 - status_x);
+    text(status_x, 69, fitted, color);
 }
 
 static void draw_tool_indicators(void)
@@ -3224,15 +3602,15 @@ static void draw_tool_indicators(void)
                                    : LCD_RGBPACK(82, 87, 84);
 
     draw_beat_phase();
-    text(260, 69, "Q",
-         quantize ? LCD_RGBPACK(70, 235, 125)
+    text(272, 69, "Q",
+         quantize ? RBPREP_GREEN
                   : LCD_RGBPACK(105, 115, 108));
-    text(278, 69, "CUE", color);
+    text(288, 69, "CUE", color);
 }
 
 static void draw_tool_row(void)
 {
-    rb->lcd_set_foreground(LCD_RGBPACK(8, 15, 11));
+    rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(0, RBPREP_TOOL_TOP, LCD_WIDTH, RBPREP_TOOL_HEIGHT);
     draw_tool_orbs();
     draw_tool_status();
@@ -3261,20 +3639,20 @@ static void draw_settings(void)
         save_on_track_load ? "ON NEXT TRACK" : "IMMEDIATELY"
     };
 
-    text(7, 3, "RBPREP SETTINGS", LCD_RGBPACK(70, 235, 125));
+    text(7, 3, "RBPREP SETTINGS", RBPREP_GREEN);
     text(7, 20, "DECK DISPLAY", LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < 3; row++) {
         int y = 43 + row * 31;
         if (row == settings_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(18, 78, 128));
+            rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
             rb->lcd_fillrect(0, y - 3, LCD_WIDTH, 27);
-            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
+            rb->lcd_set_foreground(RBPREP_GREEN);
             rb->lcd_fillrect(0, y - 3, 3, 27);
         }
         text(10, y + 3, names[row], LCD_WHITE);
         rb->snprintf(line, sizeof(line), "%s", values[row]);
         text(row == 0 ? 184 : row == 1 ? 260 : 215, y + 3, line,
-             LCD_RGBPACK(70, 235, 125));
+             RBPREP_GREEN);
     }
     text(10, 145, settings_selection == 0
          ? "Boombox + EQ analyze live PCM; turntable follows deck rate"
@@ -3317,22 +3695,21 @@ static void draw_usb_mode(void)
         "Mac audio to iPod headphone output; storage hidden"
     };
 
-    text(7, 3, "USB MODE", LCD_RGBPACK(85, 220, 255));
+    text(7, 3, "USB MODE", RBPREP_GREEN);
     text(7, 20, "TAKES EFFECT ON NEXT USB CONNECTION",
          LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < 2; row++) {
         int y = 55 + row * 55;
         if (row == usb_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(18, 78, 128));
+            rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
             rb->lcd_fillrect(0, y - 5, LCD_WIDTH, 45);
-            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
+            rb->lcd_set_foreground(RBPREP_GREEN);
             rb->lcd_fillrect(0, y - 5, 4, 45);
         }
         text(12, y, names[row], LCD_WHITE);
         text(12, y + 18, details[row], LCD_RGBPACK(135, 155, 141));
     }
-    text(7, 183, "USB HID IS KEPT OFF IN BOTH MODES",
-         LCD_RGBPACK(255, 145, 40));
+    text(7, 183, "USB HID IS KEPT OFF IN BOTH MODES", RBPREP_GREEN);
     text(7, 226, "WHEEL: CHOOSE   SELECT: SAVE   MENU: BACK", LCD_WHITE);
 }
 
@@ -3342,7 +3719,7 @@ static void draw_genre_picker(void)
     char name[32];
     char line[48];
 
-    text(7, 3, "GENRE ROLLUP", LCD_RGBPACK(255, 145, 40));
+    text(7, 3, "GENRE ROLLUP", RBPREP_GREEN);
     rb->snprintf(line, sizeof(line), "%d LIBRARY GENRES", genre_count);
     text(205, 3, line, LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < RBPREP_LIST_ROWS; row++) {
@@ -3351,13 +3728,13 @@ static void draw_genre_picker(void)
         if (ordinal > genre_count)
             break;
         if (ordinal == genre_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(18, 78, 128));
+            rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
             rb->lcd_fillrect(0, y - 3, LCD_WIDTH, 20);
-            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
+            rb->lcd_set_foreground(RBPREP_GREEN);
             rb->lcd_fillrect(0, y - 3, 3, 20);
         }
         if (ordinal == 0) {
-            text(10, y, "+ ADD GENRE...", LCD_RGBPACK(70, 235, 125));
+            text(10, y, "+ ADD GENRE...", RBPREP_GREEN);
         } else if (genre_name_at(ordinal - 1, name, sizeof(name))) {
             rb->snprintf(line, sizeof(line), "%s%s",
                          !rb->strcasecmp(name, selected_genre) ? "> " : "  ",
@@ -3371,24 +3748,23 @@ static void draw_genre_picker(void)
 static void draw_main_menu(void)
 {
     static const char *items[] = {
-        "COLLECTION", "PLAYLISTS", "USB MODE", "DECK SETTINGS",
-        "PENDING EDITS", "INDEX STATUS", "EXIT TO ROCKBOX"
+        "COLLECTION", "PLAYLISTS", "PREP DECK", "USB MODE",
+        "DECK SETTINGS", "PENDING EDITS", "INDEX STATUS",
+        "EXIT TO ROCKBOX"
     };
     static const char *codes[] = {
-        "TRK", "PLS", "USB", "DSP", "EDT", "IDX", "EXT"
+        "TRK", "PLS", "DEK", "USB", "DSP", "EDT", "IDX", "EXT"
     };
     static const int accents[] = {
-        LCD_RGBPACK(70, 235, 125), LCD_RGBPACK(85, 220, 255),
-        LCD_RGBPACK(120, 105, 255), LCD_RGBPACK(255, 145, 40),
-        LCD_RGBPACK(255, 195, 55), LCD_RGBPACK(65, 180, 145),
-        LCD_RGBPACK(220, 75, 75)
+        RBPREP_GREEN, RBPREP_GREEN, RBPREP_GREEN, RBPREP_GREEN,
+        RBPREP_GREEN, RBPREP_GREEN, RBPREP_GREEN, RBPREP_GREEN
     };
     char line[80];
     int i;
 
     draw_blade_shell("RBPREP  /  PERFORMANCE LIBRARY",
                      LCD_RGBPACK(70, 235, 125));
-    rb->lcd_set_foreground(LCD_RGBPACK(21, 29, 35));
+    rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(5, 22, LCD_WIDTH - 5, 16);
     if (library_fd >= 0)
         rb->snprintf(line, sizeof(line), "%lu TRACKS  /  DEVICE INDEX ONLINE",
@@ -3399,25 +3775,23 @@ static void draw_main_menu(void)
          ? LCD_RGBPACK(105, 178, 139) : LCD_RGBPACK(255, 90, 70));
 
     for (i = 0; i < (int)ARRAYLEN(items); i++) {
-        int y = 45 + i * 26;
+        int y = 42 + i * 23;
         bool selected = i == selection;
         if (selected) {
-            draw_blade_selection(y - 2, 23, accents[i]);
+            draw_blade_selection(y - 2, 20, accents[i]);
         }
-        draw_record_badge(18, y + 9, 8, accents[i], selected);
+        draw_record_badge(18, y + 7, 7, accents[i], selected);
         text(34, y + 3, codes[i], selected
              ? LCD_WHITE : accents[i]);
-        text(67, y + 3, items[i], selected ? LCD_WHITE
-             : LCD_RGBPACK(178, 192, 183));
-        if (i == 2)
+        text(67, y + 3, items[i], selected ? LCD_WHITE : RBPREP_MENU_TEXT);
+        if (i == 3)
             text(257, y + 3, usb_selection ? "DAC" : "DATA",
-                 usb_selection ? LCD_RGBPACK(255, 145, 40)
-                               : LCD_RGBPACK(70, 235, 125));
-        else if (i == 4 &&
+                 usb_selection ? LCD_WHITE : RBPREP_GREEN);
+        else if (i == 5 &&
                  (pending_snapshot_count || pending_playlist_count)) {
             rb->snprintf(line, sizeof(line), "%d",
                          pending_snapshot_count + pending_playlist_count);
-            text(286, y + 3, line, LCD_RGBPACK(255, 145, 40));
+            text(286, y + 3, line, LCD_WHITE);
         }
     }
     text(7, 229, "WHEEL  NAVIGATE       SELECT  OPEN",
@@ -3429,7 +3803,7 @@ static void draw_pending_edits(void)
     char line[96];
     int row;
 
-    text(7, 3, "PENDING EDITS", LCD_RGBPACK(255, 145, 40));
+    text(7, 3, "PENDING EDITS", RBPREP_GREEN);
     rb->snprintf(line, sizeof(line), "%d SAVED STATES   %d PLAYLIST ADDS",
                  pending_snapshot_count, pending_playlist_count);
     text(7, 20, line, LCD_RGBPACK(145, 165, 151));
@@ -3442,9 +3816,9 @@ static void draw_pending_edits(void)
         if (visible >= pending_snapshot_count + pending_playlist_count)
             break;
         if (visible == pending_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(18, 78, 128));
+            rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
             rb->lcd_fillrect(0, y - 2, LCD_WIDTH, 19);
-            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
+            rb->lcd_set_foreground(RBPREP_GREEN);
             rb->lcd_fillrect(0, y - 2, 3, 19);
         }
         if (visible < pending_snapshot_count) {
@@ -3467,7 +3841,7 @@ static void draw_pending_edits(void)
             struct rbprep_pending_playlist *entry =
                 &pending_playlists[ordinal];
 
-            rb->lcd_set_foreground(LCD_RGBPACK(255, 145, 40));
+            rb->lcd_set_foreground(RBPREP_GREEN);
             xlcd_fillcircle(10, y + 5, 4);
             rb->lcd_set_foreground(LCD_BLACK);
             xlcd_fillcircle(10, y + 5, 1);
@@ -3476,7 +3850,7 @@ static void draw_pending_edits(void)
             rb->snprintf(line, sizeof(line), "TRACK %lu   PLAYLIST %lu",
                          (unsigned long)entry->track_id,
                          (unsigned long)entry->playlist_id);
-            text(19, y + 10, line, LCD_RGBPACK(255, 185, 80));
+            text(19, y + 10, line, RBPREP_GREEN);
         }
     }
     if (pending_visible_count == 0 && pending_playlist_count == 0)
@@ -3711,15 +4085,15 @@ static void draw_confirmation(void)
     rb->lcd_fillrect(x, y, width, height);
     rb->lcd_set_foreground(LCD_RGBPACK(105, 115, 108));
     rb->lcd_drawrect(x, y, width, height);
-    text(x + 10, y + 9, "CONFIRM", LCD_RGBPACK(255, 135, 35));
+    text(x + 10, y + 9, "CONFIRM", RBPREP_GREEN);
     text(x + 10, y + 29, confirm_message, LCD_WHITE);
 
-    rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(30, 34, 31)
-                                      : LCD_RGBPACK(25, 105, 175));
+    rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(20, 26, 22)
+                                      : LCD_RGBPACK(12, 49, 29));
     rb->lcd_fillrect(x + 12, y + 51, 72, 18);
     text(x + 29, y + 55, "CANCEL", LCD_WHITE);
-    rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(255, 125, 30)
-                                      : LCD_RGBPACK(30, 34, 31));
+    rb->lcd_set_foreground(confirm_ok ? RBPREP_GREEN
+                                      : LCD_RGBPACK(20, 26, 22));
     rb->lcd_fillrect(x + width - 66, y + 51, 54, 18);
     text(x + width - 48, y + 55, "OK", confirm_ok ? LCD_BLACK : LCD_WHITE);
 }
@@ -3799,14 +4173,14 @@ static void draw_screen(void)
         hud_scroll_deadline = *rb->current_tick +
                               RBPREP_HUD_SCROLL_TICKS;
     } else {
-        rb->lcd_set_foreground(LCD_RGBPACK(8, 15, 11));
-        rb->lcd_fillrect(218, RBPREP_TOOL_TOP,
-                         LCD_WIDTH - 218, RBPREP_TOOL_HEIGHT);
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_fillrect(236, RBPREP_TOOL_TOP,
+                         LCD_WIDTH - 236, RBPREP_TOOL_HEIGHT);
         draw_tool_indicators();
         rb->lcd_update_rect(0, RBPREP_WAVE_TOP, LCD_WIDTH,
                             RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
-        rb->lcd_update_rect(218, RBPREP_TOOL_TOP,
-                            LCD_WIDTH - 218, RBPREP_TOOL_HEIGHT);
+        rb->lcd_update_rect(236, RBPREP_TOOL_TOP,
+                            LCD_WIDTH - 236, RBPREP_TOOL_HEIGHT);
     }
 }
 
@@ -4232,14 +4606,21 @@ static void short_select(void)
             mode = MODE_PLAYLISTS;
             force_full_redraw = true;
         } else if (selection == 2) {
+            if (library_fd >= 0)
+                open_loaded_track();
+            else {
+                rb->splash(HZ * 2, "RBPrep index is offline");
+                restore_black_canvas();
+            }
+        } else if (selection == 3) {
             usb_selection = rb->global_settings->usb_audio != 0;
             mode = MODE_USB;
             force_full_redraw = true;
-        } else if (selection == 3) {
+        } else if (selection == 4) {
             settings_selection = 0;
             mode = MODE_SETTINGS;
             force_full_redraw = true;
-        } else if (selection == 4) {
+        } else if (selection == 5) {
             if (!flush_deferred_edit()) {
                 rb->splash(HZ * 2, "Could not save deferred edits");
                 restore_black_canvas();
@@ -4248,11 +4629,11 @@ static void short_select(void)
             refresh_pending_summary();
             mode = MODE_PENDING;
             force_full_redraw = true;
-        } else if (selection == 5) {
+        } else if (selection == 6) {
             refresh_pending_summary();
             mode = MODE_INDEX;
             force_full_redraw = true;
-        } else if (selection == 6) {
+        } else if (selection == 7) {
             rb->snprintf(confirm_message, sizeof(confirm_message),
                          "EXIT TO ROCKBOX?");
             begin_confirmation(CONFIRM_EXIT);
@@ -4350,6 +4731,9 @@ static void short_select(void)
             apply_playback_rate();
         } else if (tool == TOOL_PLAY_RPM) {
             played_rpm_index = 0;
+            apply_playback_rate();
+        } else if (tool == TOOL_PITCH_BEND) {
+            pitch_bend_x100 = 0;
             apply_playback_rate();
         } else if (tool == TOOL_TEMPO) {
             tempo_x100 = PITCH_SPEED_100;
@@ -4568,6 +4952,12 @@ static void adjust_active_tool(int direction)
         apply_playback_rate();
         force_full_redraw = true;
     }
+    else if (tool == TOOL_PITCH_BEND) {
+        pitch_bend_x100 = MAX(-1600, MIN(1600,
+                                pitch_bend_x100 + direction * 10));
+        apply_playback_rate();
+        force_full_redraw = true;
+    }
     else if (tool == TOOL_TEMPO) {
         tempo_x100 = MAX(5000, MIN(20000,
                                    tempo_x100 + direction * 10));
@@ -4655,6 +5045,11 @@ static void adjust_active_tool_coarse(int direction)
         played_rpm_index = (played_rpm_index +
             (direction > 0 ? 1 : ARRAYLEN(rpm_styles) - 1)) %
             ARRAYLEN(rpm_styles);
+        apply_playback_rate();
+        force_full_redraw = true;
+    } else if (tool == TOOL_PITCH_BEND) {
+        pitch_bend_x100 = MAX(-1600, MIN(1600,
+                                pitch_bend_x100 + direction * 100));
         apply_playback_rate();
         force_full_redraw = true;
     } else if (tool == TOOL_TEMPO) {
@@ -4857,6 +5252,7 @@ enum plugin_status plugin_start(const void *parameter)
     track_edit_dirty = false;
     usb_selection = rb->global_settings->usb_audio != 0;
     host_rpm_index = played_rpm_index = 0;
+    pitch_bend_x100 = 0;
     tempo_x100 = PITCH_SPEED_100;
     original_pitch = rb->sound_get_pitch();
     original_stretch = rb->dsp_get_timestretch();
@@ -5114,7 +5510,7 @@ enum plugin_status plugin_start(const void *parameter)
             if (tool_menu_active && mode >= MODE_DECK)
                 browse_tool_menu(1);
             else if (mode == MODE_LIBRARY)
-                selection = MIN(6, selection + 1);
+                selection = MIN(7, selection + 1);
             else if (mode == MODE_PLAYLISTS && tree_child_count > 0) {
                 tree_selection = MIN(tree_child_count - 1,
                                      tree_selection + 1);

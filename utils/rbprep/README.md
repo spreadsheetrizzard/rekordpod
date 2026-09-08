@@ -49,14 +49,24 @@ keeps persistent `.rbprep-bak` originals, resolves old node-based playlist
 journals by stable ID or unique name, and reports the exact PDB/ANLZ transaction
 stage if it must roll back.
 
-The deck offers four signal-oriented views: the detailed RGB waveform, a
-boombox whose woofers follow the live sub-120 Hz envelope, a live 20-band
-spectrum, and a turntable whose circular micro-waveform rolls with the platter.
-The playback page has independent host and played RPM selectors (33, 45, or 78;
-33→33 by default) plus a 0.1%-resolution tempo control. RPM changes pitch and
-speed together; tempo is applied through Rockbox timestretch as a temporary
-pitch-lock experiment. All rate settings reset for a newly loaded song and the
-pre-plugin Rockbox pitch/timestretch state is restored on exit.
+The deck offers four signal-oriented views: the detailed RGB waveform; a
+boombox whose woofers follow the live sub-120 Hz envelope and whose chromatic
+cone rings show a confidence-gated observed bass note; a live 20-band,
+-60-to-0 dBFS spectrum; and a turntable whose circular micro-waveform, numbered
+cue flags, and strobe dots roll with the selected platter speed while its
+tonearm travels inward over the full track duration. Cue time selects a groove
+radius between the outer playable edge and half-radius; each labeled flag grows
+outward from a tip planted on that groove. At -12 dB the boombox adds a subtle
+cabinet-rattle cue. The non-waveform analyzers intentionally omit edit overlays;
+beatgrid, loop, and cue detail stays on the RGB waveform.
+
+The playback tools have independent host and played RPM selectors (33, 45, or
+78; 33→33 by default), a +/-16% pitch-bend control, and a 0.1%-resolution tempo
+control. RPM and pitch bend change pitch and speed together; tempo is applied
+through Rockbox timestretch as a temporary pitch-lock experiment. All rate
+settings reset for a newly loaded song and the pre-plugin Rockbox
+pitch/timestretch state is restored on exit. The main menu's Prep Deck item can
+attach to the current indexed Rockbox track without restarting it.
 
 `apply_device_edits.py` is the explicit write-back step. It keeps only the
 newest full snapshot per track, diffs that state against the current DeviceSQL
