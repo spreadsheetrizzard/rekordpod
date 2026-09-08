@@ -41,16 +41,22 @@ of records on the iPod.
 
 The RBPrep plugin journals confirmed changes immediately by default. Its
 `Save Edits` setting can instead coalesce changes into one snapshot when the
-next track loads. Pending Edits is scrollable: SELECT opens the chosen track,
-hold SELECT confirms deletion of its unburned snapshots, and PLAY opens the
-local-burn confirmation. Local burn stops playback to reserve a transaction
-workspace, keeps persistent `.rbprep-bak` originals, and reports the exact
-PDB/ANLZ transaction stage if it must roll back.
+next track loads. Pending Edits is scrollable and shows both coalesced track
+snapshots and playlist-add requests: SELECT opens the referenced track, hold
+SELECT confirms deletion of the selected request, and PLAY opens the local-burn
+confirmation. Local burn stops playback to reserve a transaction workspace,
+keeps persistent `.rbprep-bak` originals, resolves old node-based playlist
+journals by stable ID or unique name, and reports the exact PDB/ANLZ transaction
+stage if it must roll back.
 
-The deck retains its RGB waveform and adds three audio-, waveform-, and
-beat-reactive demoscene views: Plasma Tunnel, Scope Fire, and Hyperspace. These
-use integer effects and coarse tiles/streaks so decoding and input polling stay
-higher priority than display work.
+The deck offers four signal-oriented views: the detailed RGB waveform, a
+boombox whose woofers follow the live sub-120 Hz envelope, a live 20-band
+spectrum, and a turntable whose circular micro-waveform rolls with the platter.
+The playback page has independent host and played RPM selectors (33, 45, or 78;
+33→33 by default) plus a 0.1%-resolution tempo control. RPM changes pitch and
+speed together; tempo is applied through Rockbox timestretch as a temporary
+pitch-lock experiment. All rate settings reset for a newly loaded song and the
+pre-plugin Rockbox pitch/timestretch state is restored on exit.
 
 `apply_device_edits.py` is the explicit write-back step. It keeps only the
 newest full snapshot per track, diffs that state against the current DeviceSQL

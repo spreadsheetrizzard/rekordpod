@@ -59,6 +59,8 @@
 #define RBPREP_PENDING_ROWS 8
 #define RBPREP_PENDING_MAX 512
 #define RBPREP_SEARCH_MAX 8192
+#define RBPREP_SPECTRUM_BANDS 20
+#define RBPREP_PCM_FRAMES 1024
 
 enum rbprep_mode {
     MODE_LIBRARY,
@@ -82,6 +84,9 @@ enum rbprep_tool {
     TOOL_SCRUB_STEP,
     TOOL_ZOOM,
     TOOL_GAIN,
+    TOOL_HOST_RPM,
+    TOOL_PLAY_RPM,
+    TOOL_TEMPO,
     TOOL_PLAYLIST_MODE,
     TOOL_ADD_PLAYLIST,
     TOOL_WAVEFORM_STYLE,
@@ -115,7 +120,8 @@ enum rbprep_confirm_action {
     CONFIRM_ADD_PLAYLIST,
     CONFIRM_GENRE,
     CONFIRM_BURN,
-    CONFIRM_DELETE_PENDING
+    CONFIRM_DELETE_PENDING,
+    CONFIRM_DELETE_PLAYLIST
 };
 
 struct rbprep_wave_column {
@@ -133,6 +139,12 @@ struct rbprep_pending_entry {
     int rating;
     int color;
     char title[64];
+};
+
+struct rbprep_pending_playlist {
+    uint32_t track_id;
+    uint32_t playlist_id;
+    char name[64];
 };
 
 static enum rbprep_mode mode;
@@ -191,9 +203,24 @@ static int custom_genre_count;
 #define RBPREP_CUSTOM_GENRE_MAX 32
 static char custom_genres[RBPREP_CUSTOM_GENRE_MAX][32];
 static char confirm_genre[32];
-static unsigned char meter_history_left[RBPREP_DECK_WIDTH];
-static unsigned char meter_history_right[RBPREP_DECK_WIDTH];
-static int meter_history_head;
+static int16_t pcm_capture[2][RBPREP_PCM_FRAMES * 2] MEM_ALIGN_ATTR;
+static int16_t pcm_snapshot[RBPREP_PCM_FRAMES * 2] MEM_ALIGN_ATTR;
+static int16_t pcm_mono[RBPREP_PCM_FRAMES] MEM_ALIGN_ATTR;
+static volatile int pcm_capture_index;
+static volatile int pcm_capture_frames[2];
+static volatile unsigned int pcm_capture_generation;
+static volatile unsigned long pcm_sample_rate = 44100;
+static unsigned int spectrum_generation;
+static unsigned char spectrum_levels[RBPREP_SPECTRUM_BANDS];
+static unsigned char spectrum_bass;
+static unsigned char spectrum_bass_hit;
+static int host_rpm_index;
+static int played_rpm_index;
+static int tempo_x100 = PITCH_SPEED_100;
+static int32_t original_pitch = PITCH_SPEED_100;
+static int32_t original_stretch = PITCH_SPEED_100;
+static bool original_timestretch_enabled;
+static bool playback_rate_changed;
 static bool playlist_playback;
 static bool playlist_add_mode;
 static int playing_track_row = -1;
@@ -214,6 +241,8 @@ static int pending_snapshot_count;
 static int pending_playlist_count;
 static int pending_visible_count;
 static struct rbprep_pending_entry pending_entries[RBPREP_PENDING_MAX];
+static struct rbprep_pending_playlist
+    pending_playlists[RBPREP_PENDING_MAX];
 static int pending_selection;
 static int pending_top;
 static bool track_edit_dirty;
@@ -337,6 +366,8 @@ static void stop_editor_audio(void);
 static void reset_play_clock(int anchor, long tick);
 static void jump_to_time(int target);
 static bool flush_deferred_edit(void);
+static void stop_spectrum_capture(void);
+static void restore_playback_rate(void);
 
 static void set_storage_performance_mode(bool enabled)
 {
@@ -354,6 +385,8 @@ static void set_storage_performance_mode(bool enabled)
 static void rbprep_cleanup(void)
 {
     flush_deferred_edit();
+    stop_spectrum_capture();
+    restore_playback_rate();
     set_storage_performance_mode(false);
     backlight_use_settings();
 }
@@ -401,7 +434,15 @@ static const char *mode_names[] = {
 
 static char *waveform_styles[] = { "full", "half" };
 static char *visualizer_styles[] = {
-    "rgb waveform", "plasma tunnel", "scope fire", "hyperspace"
+    "rgb waveform", "boombox bass", "20-band EQ", "turntable"
+};
+static char *rpm_styles[] = { "33", "45", "78" };
+/* All values share a denominator of three: 33 1/3, 45 and 78 RPM. */
+static const int rpm_values_x3[] = { 100, 135, 234 };
+static const char *spectrum_labels[] = {
+    "45", "63", "90", "125", "180", "250", "355", "500", "710",
+    "1K", "1.4", "2K", "2.8", "4K", "5.6", "8K", "11K", "15K",
+    "18K", "21K"
 };
 static char *save_on_load_styles[] = { "immediate", "next track" };
 static const char *track_sort_names[] = {
@@ -422,6 +463,92 @@ static const struct configdata rbprep_config[] = {
     { TYPE_INT, 0, ARRAYLEN(scrub_steps) - 1,
       { .int_p = &scrub_step_index }, "scrub step", NULL }
 };
+
+static int deck_pitch_x100(void)
+{
+    return (long long)rpm_values_x3[played_rpm_index] * PITCH_SPEED_100 /
+           rpm_values_x3[host_rpm_index];
+}
+
+static int deck_speed_x100(void)
+{
+    return (long long)deck_pitch_x100() * tempo_x100 /
+           PITCH_SPEED_100;
+}
+
+static void apply_playback_rate(void)
+{
+    int32_t pitch = deck_pitch_x100();
+
+    rb->dsp_timestretch_enable(true);
+    if (rb->dsp_timestretch_available()) {
+        rb->sound_set_pitch(pitch);
+        rb->dsp_set_timestretch(tempo_x100);
+    } else {
+        /* A codec without timestretch still gets the requested total rate;
+           like a physical deck, its pitch follows the speed. */
+        rb->sound_set_pitch(deck_speed_x100());
+    }
+    playback_rate_changed = true;
+    reset_play_clock(playhead, *rb->current_tick);
+}
+
+static void restore_playback_rate(void)
+{
+    if (!playback_rate_changed)
+        return;
+    rb->sound_set_pitch(original_pitch);
+    rb->dsp_set_timestretch(original_stretch);
+    rb->dsp_timestretch_enable(original_timestretch_enabled);
+    playback_rate_changed = false;
+}
+
+static void spectrum_sample_rate_changed(uint32_t samplerate)
+{
+    pcm_sample_rate = samplerate ? samplerate : 44100;
+}
+
+static void spectrum_buffer_callback(const void *start, size_t size)
+{
+    const int16_t *samples = start;
+    int frames = size / (2 * sizeof(int16_t));
+    int index;
+
+    if (frames <= 0)
+        return;
+    if (frames > RBPREP_PCM_FRAMES) {
+        samples += (frames - RBPREP_PCM_FRAMES) * 2;
+        frames = RBPREP_PCM_FRAMES;
+    }
+    index = pcm_capture_index ^ 1;
+    memcpy(pcm_capture[index], samples,
+           frames * 2 * sizeof(int16_t));
+    pcm_capture_frames[index] = frames;
+    pcm_capture_index = index;
+    pcm_capture_generation++;
+}
+
+static const struct mixer_buffer_cbs spectrum_buffer_cbs = {
+    .next_buffer = spectrum_buffer_callback,
+    .sampr_changed = spectrum_sample_rate_changed,
+};
+
+static void start_spectrum_capture(void)
+{
+    pcm_capture_index = 0;
+    pcm_capture_frames[0] = pcm_capture_frames[1] = 0;
+    pcm_capture_generation = spectrum_generation = 0;
+    pcm_sample_rate = rb->mixer_get_frequency();
+    rb->memset(spectrum_levels, 0, sizeof(spectrum_levels));
+    spectrum_bass = spectrum_bass_hit = 0;
+    rb->mixer_channel_set_buffer_hook(PCM_MIXER_CHAN_PLAYBACK,
+                                      &spectrum_buffer_cbs);
+}
+
+static void stop_spectrum_capture(void)
+{
+    rb->mixer_channel_set_buffer_hook(PCM_MIXER_CHAN_PLAYBACK, NULL);
+}
 
 static const int cue_palette[] = {
     LCD_RGBPACK(255, 70, 70),
@@ -1318,81 +1445,107 @@ static void rebuild_waveform_columns(int first, int span)
     waveform_columns_valid = true;
 }
 
-static int meter_trace_color(int level)
+static int spectrum_power_level(uint64_t power)
 {
-    if (level > 214)
-        return LCD_RGBPACK(255, 70, 55);
-    if (level > 170)
-        return LCD_RGBPACK(255, 200, 55);
-    if (level > 92)
-        return LCD_RGBPACK(65, 225, 125);
-    return LCD_RGBPACK(35, 132, 92);
-}
+    int bits = 0;
 
-static int demo_tri8(int value)
-{
-    value &= 255;
-    return value < 128 ? value * 2 : (255 - value) * 2;
-}
-
-static int demo_audio_energy(void)
-{
-    return MIN(255, (int)((vu_left + vu_right) * 255 / 65536));
-}
-
-static int demo_wave_energy(void)
-{
-    int index;
-
-    if (waveform_points <= 0 || waveform_duration_ms <= 0)
-        return 0;
-    index = (long long)playhead * waveform_points / waveform_duration_ms;
-    index = MAX(0, MIN(waveform_points - 1, index));
-    return waveform[index][0];
-}
-
-static int demo_beat_pulse(void)
-{
-    int index = current_beat_index(playhead);
-    int period = beat_period_ms();
-    int delta;
-
-    if (index < 0)
-        return 0;
-    delta = MAX(0, playhead - adjusted_beat_time(index));
-    return MAX(0, 255 - delta * 255 / MAX(1, period));
-}
-
-static int demo_palette(int hue, int brightness)
-{
-    int sector;
-    int ramp;
-    int red;
-    int green;
-    int blue;
-
-    hue %= 768;
-    if (hue < 0)
-        hue += 768;
-    sector = hue >> 8;
-    ramp = hue & 255;
-    if (sector == 0) {
-        red = 255 - ramp;
-        green = ramp;
-        blue = 255;
-    } else if (sector == 1) {
-        red = ramp;
-        green = 255;
-        blue = 255 - ramp;
-    } else {
-        red = 255;
-        green = 255 - ramp;
-        blue = ramp;
+    while (power > 1) {
+        power >>= 1;
+        bits++;
     }
-    brightness = MAX(0, MIN(255, brightness));
-    return LCD_RGBPACK(red * brightness / 255,
-                       green * brightness / 255,
-                       blue * brightness / 255);
+    return MAX(0, MIN(255, (bits - 18) * 18));
+}
+
+static void update_spectrum_levels(void)
+{
+    static const int32_t coefficients_44100[RBPREP_SPECTRUM_BANDS] = {
+        2097109, 2097068, 2096980, 2096819, 2096462, 2095822,
+        2094470, 2091833, 2086431, 2075903, 2055571, 2012585,
+        1932476, 1765704, 1464309, 876127, 7470, -1125224,
+        -1757598, -2073729
+    };
+    static const int32_t coefficients_48000[RBPREP_SPECTRUM_BANDS] = {
+        2097116, 2097081, 2097006, 2096871, 2096570, 2096029,
+        2094888, 2092662, 2088101, 2079211, 2062035, 2025693,
+        1957860, 1816187, 1558488, 1048576, 273733, -802545,
+        -1482910, -1937516
+    };
+    const int32_t *coefficients;
+    unsigned int generation;
+    int capture;
+    int frames;
+    int i;
+    int band;
+    int bass_raw;
+
+    generation = pcm_capture_generation;
+    if (generation == spectrum_generation) {
+        if (!(rb->audio_status() & AUDIO_STATUS_PLAY) ||
+            (rb->audio_status() & AUDIO_STATUS_PAUSE)) {
+            for (band = 0; band < RBPREP_SPECTRUM_BANDS; band++)
+                spectrum_levels[band] = spectrum_levels[band] * 7 / 8;
+            spectrum_bass = spectrum_bass * 7 / 8;
+            spectrum_bass_hit = spectrum_bass_hit * 3 / 4;
+        }
+        return;
+    }
+
+    rb->pcm_play_lock();
+    capture = pcm_capture_index;
+    frames = pcm_capture_frames[capture];
+    frames = MAX(0, MIN(RBPREP_PCM_FRAMES, frames));
+    if (frames > 0)
+        rb->memcpy(pcm_snapshot, pcm_capture[capture],
+                   frames * 2 * sizeof(int16_t));
+    generation = pcm_capture_generation;
+    rb->pcm_play_unlock();
+    spectrum_generation = generation;
+    if (frames < 64)
+        return;
+
+    for (i = 0; i < frames; i++) {
+        int weight = i <= frames / 2 ? i : frames - 1 - i;
+        int sample = ((int)pcm_snapshot[i * 2] +
+                      (int)pcm_snapshot[i * 2 + 1]) >> 1;
+        pcm_mono[i] = (sample * weight / MAX(1, frames / 2)) >> 8;
+    }
+    coefficients = pcm_sample_rate >= 46000
+                 ? coefficients_48000 : coefficients_44100;
+    for (band = 0; band < RBPREP_SPECTRUM_BANDS; band++) {
+        int32_t s1 = 0;
+        int32_t s2 = 0;
+        int coefficient = coefficients[band];
+        int raw;
+
+        for (i = 0; i < frames; i++) {
+            int32_t s0 = pcm_mono[i] +
+                (int32_t)(((int64_t)coefficient * s1) >> 20) - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        {
+            int64_t signed_power = (int64_t)s1 * s1 +
+                (int64_t)s2 * s2 -
+                (((int64_t)coefficient * s1 >> 20) * s2);
+            raw = spectrum_power_level(signed_power > 0
+                                     ? signed_power : 0);
+        }
+        if (raw > spectrum_levels[band])
+            spectrum_levels[band] =
+                (spectrum_levels[band] + raw * 3) / 4;
+        else
+            spectrum_levels[band] =
+                (spectrum_levels[band] * 7 + raw) / 8;
+    }
+
+    bass_raw = (spectrum_levels[0] + spectrum_levels[1] +
+                spectrum_levels[2]) / 3;
+    if (bass_raw > spectrum_bass + 8)
+        spectrum_bass_hit = MIN(255, spectrum_bass_hit +
+                                (bass_raw - spectrum_bass) * 3);
+    else
+        spectrum_bass_hit = spectrum_bass_hit * 3 / 4;
+    spectrum_bass = (spectrum_bass * 3 + bass_raw) / 4;
 }
 
 static void draw_demo_overlays(int first, int span)
@@ -1409,146 +1562,179 @@ static void draw_demo_overlays(int first, int span)
     rb->lcd_vline(x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
 }
 
-static void draw_plasma_tunnel(void)
+static void draw_boombox(void)
 {
-    const int tile_x = 6;
-    const int tile_y = 6;
     int first;
     int span;
-    int audio = demo_audio_energy();
-    int pulse = demo_beat_pulse();
-    int phase = playhead / 7 + *rb->current_tick * (2 + audio / 64);
-    int center_x = RBPREP_DECK_WIDTH / 2;
-    int center_y = (RBPREP_WAVE_TOP + RBPREP_WAVE_BOTTOM) / 2;
-    int y;
+    int bass = MIN(255, spectrum_bass + spectrum_bass_hit / 2);
+    int centers[2] = { 78, 222 };
+    int speaker;
+    int band;
 
     viewport(&first, &span);
-    if (waveform_points > 0)
-        rebuild_waveform_columns(first, span);
-    for (y = RBPREP_WAVE_TOP; y <= RBPREP_WAVE_BOTTOM; y += tile_y) {
-        int x;
-        int dy = y - center_y;
-        for (x = 0; x < RBPREP_DECK_WIDTH; x += tile_x) {
-            int dx = x - center_x;
-            int distance = MAX(ABS(dx), ABS(dy)) +
-                           MIN(ABS(dx), ABS(dy)) / 2;
-            int wave = waveform_points > 0 && waveform_columns[x].valid
-                     ? waveform_columns[x].amplitude : 0;
-            int plasma = demo_tri8(distance * 9 - phase +
-                         demo_tri8(dx * 3 + dy * 5 + phase / 2));
-            int brightness = 28 + plasma / 2 + wave / 5 +
-                             audio / 4 + pulse / 7;
-            rb->lcd_set_foreground(demo_palette(
-                phase + distance * 7 + plasma + wave, brightness));
-            rb->lcd_fillrect(x, y,
-                MIN(tile_x, RBPREP_DECK_WIDTH - x),
-                MIN(tile_y, RBPREP_WAVE_BOTTOM - y + 1));
+    rb->lcd_set_foreground(LCD_RGBPACK(27, 31, 29));
+    rb->lcd_fillrect(8, RBPREP_WAVE_TOP + 10,
+                     RBPREP_DECK_WIDTH - 16, 132);
+    rb->lcd_set_foreground(LCD_RGBPACK(93, 108, 99));
+    rb->lcd_drawrect(8, RBPREP_WAVE_TOP + 10,
+                     RBPREP_DECK_WIDTH - 16, 132);
+    text(116, RBPREP_WAVE_TOP + 15, "SUB  <120Hz",
+         LCD_RGBPACK(255, 145, 40));
+
+    for (speaker = 0; speaker < 2; speaker++) {
+        int cx = centers[speaker];
+        int cy = RBPREP_WAVE_TOP + 78;
+        int channel = speaker ? vu_right : vu_left;
+        int cone = 25 + bass / 18 + MIN(5, channel / 6554);
+
+        rb->lcd_set_foreground(LCD_RGBPACK(4, 7, 6));
+        xlcd_fillcircle(cx, cy, 49);
+        rb->lcd_set_foreground(LCD_RGBPACK(60, 72, 64));
+        xlcd_drawcircle(cx, cy, 48);
+        xlcd_drawcircle(cx, cy, 43);
+        rb->lcd_set_foreground(LCD_RGBPACK(16 + bass / 12,
+                                           30 + bass / 7,
+                                           24 + bass / 16));
+        xlcd_fillcircle(cx, cy, cone);
+        rb->lcd_set_foreground(LCD_RGBPACK(74 + bass / 3,
+                                           88 + bass / 5,
+                                           79 + bass / 7));
+        xlcd_drawcircle(cx, cy, cone);
+        rb->lcd_set_foreground(LCD_RGBPACK(8, 12, 10));
+        xlcd_fillcircle(cx, cy, 9 + spectrum_bass_hit / 40);
+    }
+    for (band = 0; band < 8; band++) {
+        int level = spectrum_levels[band + 6];
+        int height = level * 34 / 255;
+        rb->lcd_set_foreground(level > 205
+                              ? LCD_RGBPACK(255, 80, 55)
+                              : level > 145
+                              ? LCD_RGBPACK(255, 205, 55)
+                              : LCD_RGBPACK(70, 235, 125));
+        rb->lcd_fillrect(123 + band * 7,
+                         RBPREP_WAVE_TOP + 116 - height,
+                         4, MAX(1, height));
+    }
+    draw_demo_overlays(first, span);
+}
+
+static void draw_twenty_band_eq(void)
+{
+    int first;
+    int span;
+    int band;
+    const int bottom = RBPREP_WAVE_BOTTOM - 18;
+    const int maximum = bottom - RBPREP_WAVE_TOP - 15;
+
+    viewport(&first, &span);
+    for (band = 0; band < RBPREP_SPECTRUM_BANDS; band++) {
+        int x = 5 + band * 14;
+        int height = spectrum_levels[band] * maximum / 255;
+        int y;
+
+        for (y = 0; y < maximum; y += 6) {
+            bool lit = y < height;
+            int color = y > maximum * 4 / 5
+                      ? LCD_RGBPACK(255, 75, 50)
+                      : y > maximum * 3 / 5
+                      ? LCD_RGBPACK(255, 205, 55)
+                      : LCD_RGBPACK(55, 225, 120);
+            rb->lcd_set_foreground(lit ? color
+                                       : LCD_RGBPACK(13, 27, 20));
+            rb->lcd_fillrect(x, bottom - y - 4, 10, 4);
         }
+        if ((band & 1) == 0)
+            text(x - 1, RBPREP_WAVE_BOTTOM - 12,
+                 spectrum_labels[band], LCD_RGBPACK(105, 125, 112));
     }
     draw_demo_overlays(first, span);
 }
 
-static void draw_scope_fire(void)
+static void draw_turntable(void)
 {
-    const int bar_width = 4;
+    static const int16_t cosine[64] = {
+        256,255,251,245,237,226,213,198,181,162,142,121,98,74,50,25,
+        0,-25,-50,-74,-98,-121,-142,-162,-181,-198,-213,-226,-237,
+        -245,-251,-255,-256,-255,-251,-245,-237,-226,-213,-198,-181,
+        -162,-142,-121,-98,-74,-50,-25,0,25,50,74,98,121,142,162,
+        181,198,213,226,237,245,251,255
+    };
+    static const int16_t sine[64] = {
+        0,25,50,74,98,121,142,162,181,198,213,226,237,245,251,255,
+        256,255,251,245,237,226,213,198,181,162,142,121,98,74,50,25,
+        0,-25,-50,-74,-98,-121,-142,-162,-181,-198,-213,-226,-237,
+        -245,-251,-255,-256,-255,-251,-245,-237,-226,-213,-198,-181,
+        -162,-142,-121,-98,-74,-50,-25
+    };
+    static const int target_rpm_x100[] = { 3333, 4500, 7800 };
+    const int cx = 86;
+    const int cy = (RBPREP_WAVE_TOP + RBPREP_WAVE_BOTTOM) / 2;
     int first;
     int span;
-    int audio = demo_audio_energy();
-    int pulse = demo_beat_pulse();
-    int mid = (RBPREP_WAVE_TOP + RBPREP_WAVE_BOTTOM) / 2;
-    int x;
+    int phase;
+    int point;
+    int previous_x = cx;
+    int previous_y = cy;
+    char line[48];
 
     viewport(&first, &span);
-    if (waveform_points > 0)
-        rebuild_waveform_columns(first, span);
-    meter_history_left[meter_history_head] =
-        MIN(255, (int)(vu_left * 255 / 32768));
-    meter_history_right[meter_history_head] =
-        MIN(255, (int)(vu_right * 255 / 32768));
-    meter_history_head = (meter_history_head + 1) % RBPREP_DECK_WIDTH;
+    phase = (long long)playhead * target_rpm_x100[played_rpm_index] * 64 /
+            6000000 % 64;
+    rb->lcd_set_foreground(LCD_RGBPACK(8, 11, 10));
+    xlcd_fillcircle(cx, cy, 69);
+    rb->lcd_set_foreground(LCD_RGBPACK(72, 86, 77));
+    xlcd_drawcircle(cx, cy, 69);
+    xlcd_drawcircle(cx, cy, 61);
+    rb->lcd_set_foreground(LCD_RGBPACK(28, 38, 32));
+    xlcd_drawcircle(cx, cy, 48);
+    xlcd_drawcircle(cx, cy, 37);
 
-    for (x = 0; x < RBPREP_DECK_WIDTH; x += bar_width) {
-        int history = (meter_history_head + x) % RBPREP_DECK_WIDTH;
-        int peak = MAX(meter_history_left[history],
-                       meter_history_right[history]);
-        int wave = waveform_points > 0 && waveform_columns[x].valid
-                 ? waveform_columns[x].amplitude : 0;
-        int noise = demo_tri8(x * 37 + playhead / 3) / 12;
-        int height = MIN(RBPREP_WAVE_BOTTOM - mid,
-                         4 + (peak * 42 + wave * 20) / 255 / 2 +
-                         noise + pulse / 18);
-        int bottom = RBPREP_WAVE_BOTTOM;
-        int red_height = MAX(2, height / 4);
-        int yellow_height = MAX(2, height / 3);
+    for (point = 0; point <= 64; point++) {
+        int angle = (point + phase) & 63;
+        int index = first + (long long)(point & 63) * span / 64;
+        int amplitude = 0;
+        int radius;
+        int x;
+        int y;
+        int color = LCD_RGBPACK(55, 190, 125);
 
-        rb->lcd_set_foreground(LCD_RGBPACK(90 + audio / 3, 5, 20));
-        rb->lcd_fillrect(x, bottom - height + 1, bar_width - 1,
-                         MAX(1, height - yellow_height - red_height));
-        rb->lcd_set_foreground(LCD_RGBPACK(255, 55 + pulse / 5, 8));
-        rb->lcd_fillrect(x, bottom - yellow_height - red_height + 1,
-                         bar_width - 1, yellow_height);
-        rb->lcd_set_foreground(LCD_RGBPACK(255, 210 + pulse / 6, 65));
-        rb->lcd_fillrect(x, bottom - red_height + 1,
-                         bar_width - 1, red_height);
-
-        rb->lcd_set_foreground(meter_trace_color(MAX(peak, wave)));
-        rb->lcd_vline(x, mid - MAX(2, peak * 35 / 255),
-                      mid + MAX(2, peak * 35 / 255));
+        if (waveform_points > 0) {
+            index = MAX(0, MIN(waveform_points - 1, index));
+            amplitude = waveform[index][0];
+            color = LCD_RGBPACK(waveform[index][1], waveform[index][2],
+                                waveform[index][3]);
+        }
+        radius = 34 + amplitude * 23 / 255;
+        x = cx + cosine[angle] * radius / 256;
+        y = cy + sine[angle] * radius / 256;
+        if (point > 0) {
+            rb->lcd_set_foreground(color);
+            rb->lcd_drawline(previous_x, previous_y, x, y);
+        }
+        previous_x = x;
+        previous_y = y;
     }
-    draw_demo_overlays(first, span);
-}
+    rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
+    xlcd_fillcircle(cx, cy, 4);
+    rb->lcd_set_foreground(LCD_RGBPACK(150, 165, 154));
+    rb->lcd_drawline(190, RBPREP_WAVE_TOP + 20, 176, cy - 22);
+    rb->lcd_drawline(176, cy - 22, 139, cy + 40);
+    xlcd_fillcircle(190, RBPREP_WAVE_TOP + 20, 6);
 
-static uint32_t demo_hash(uint32_t value)
-{
-    value ^= value >> 16;
-    value *= 0x7feb352d;
-    value ^= value >> 15;
-    value *= 0x846ca68b;
-    return value ^ (value >> 16);
-}
-
-static void draw_hyperspace(void)
-{
-    int first;
-    int span;
-    int audio = demo_audio_energy();
-    int wave = demo_wave_energy();
-    int pulse = demo_beat_pulse();
-    int phase = playhead / 5 +
-                *rb->current_tick * (3 + audio / 48 + wave / 64);
-    int center_x = RBPREP_DECK_WIDTH / 2;
-    int center_y = (RBPREP_WAVE_TOP + RBPREP_WAVE_BOTTOM) / 2;
-    int star;
-
-    viewport(&first, &span);
-    for (star = 0; star < 96; star++) {
-        uint32_t seed = demo_hash(star + 0x524250u);
-        int source_x = ((seed >> 8) & 255) - 128;
-        int source_y = ((seed >> 18) & 127) - 64;
-        int depth = (seed + phase) & 255;
-        int previous_depth = MIN(255, depth + 10 + audio / 12 + wave / 16);
-        int x = center_x + source_x * 150 / MAX(20, 270 - depth);
-        int y = center_y + source_y * 130 / MAX(20, 270 - depth);
-        int old_x = center_x + source_x * 150 /
-                    MAX(20, 270 - previous_depth);
-        int old_y = center_y + source_y * 130 /
-                    MAX(20, 270 - previous_depth);
-        int brightness = MIN(255, 55 + depth / 2 + audio / 3 +
-                             wave / 3 + pulse / 5);
-
-        if (x < 0 || x >= RBPREP_DECK_WIDTH ||
-            y < RBPREP_WAVE_TOP || y > RBPREP_WAVE_BOTTOM)
-            continue;
-        rb->lcd_set_foreground(demo_palette(star * 41 + phase,
-                                             brightness));
-        rb->lcd_drawline(old_x, old_y, x, y);
-    }
-    if (pulse > 80) {
-        int radius = 5 + (255 - pulse) / 6;
-        rb->lcd_set_foreground(demo_palette(phase + pulse, pulse));
-        rb->lcd_drawrect(center_x - radius, center_y - radius / 2,
-                         radius * 2, radius);
-    }
+    text(171, RBPREP_WAVE_TOP + 31, "VINYL DECK",
+         LCD_RGBPACK(255, 145, 40));
+    rb->snprintf(line, sizeof(line), "RPM  %s > %s",
+                 rpm_styles[host_rpm_index], rpm_styles[played_rpm_index]);
+    text(171, RBPREP_WAVE_TOP + 53, line, LCD_WHITE);
+    rb->snprintf(line, sizeof(line), "PITCH %d.%02d%%",
+                 deck_pitch_x100() / 100, deck_pitch_x100() % 100);
+    text(171, RBPREP_WAVE_TOP + 70, line, LCD_RGBPACK(85, 220, 255));
+    rb->snprintf(line, sizeof(line), "TEMPO %d.%02d%%",
+                 tempo_x100 / 100, tempo_x100 % 100);
+    text(171, RBPREP_WAVE_TOP + 87, line, LCD_RGBPACK(70, 235, 125));
+    rb->snprintf(line, sizeof(line), "RATE  %d.%02d%%",
+                 deck_speed_x100() / 100, deck_speed_x100() % 100);
+    text(171, RBPREP_WAVE_TOP + 104, line, LCD_RGBPACK(145, 165, 151));
     draw_demo_overlays(first, span);
 }
 
@@ -1559,14 +1745,16 @@ static void draw_waveform(void)
     int x;
     int mid = (RBPREP_SIGNAL_TOP + RBPREP_SIGNAL_BOTTOM) / 2;
 
+    if (visualizer_mode == 1 || visualizer_mode == 2)
+        update_spectrum_levels();
     if (visualizer_mode == 1) {
-        draw_plasma_tunnel();
+        draw_boombox();
         return;
     } else if (visualizer_mode == 2) {
-        draw_scope_fire();
+        draw_twenty_band_eq();
         return;
     } else if (visualizer_mode == 3) {
-        draw_hyperspace();
+        draw_turntable();
         return;
     }
     viewport(&first, &span);
@@ -1781,9 +1969,6 @@ static void clear_analysis(void)
     loop_active = false;
     cue_audition_active = false;
     cue_audition_latched = false;
-    rb->memset(meter_history_left, 0, sizeof(meter_history_left));
-    rb->memset(meter_history_right, 0, sizeof(meter_history_right));
-    meter_history_head = 0;
     for (i = 0; i < 16; i++) {
         hotcues[i] = -1;
         hotcue_colors[i] = 3;
@@ -1944,10 +2129,10 @@ static bool write_burn_offsets(uint32_t edit_offset,
 static void refresh_pending_summary(void)
 {
     unsigned char data[RBPREP_EDIT_RECORD_SIZE];
-    unsigned char text_buffer[128];
+    char line[160];
     int fd;
-    int bytes;
     int i;
+    int length;
     uint32_t edit_offset;
     uint32_t playlist_offset;
 
@@ -1997,23 +2182,69 @@ static void refresh_pending_summary(void)
         }
         rb->close(fd);
     }
-    pending_visible_count = MIN(pending_snapshot_count, RBPREP_PENDING_ROWS);
-    pending_selection = MAX(0, MIN(pending_snapshot_count - 1,
-                                   pending_selection));
-    pending_top = MAX(0, MIN(MAX(0, pending_snapshot_count -
-                                RBPREP_PENDING_ROWS), pending_top));
-
     fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
     if (fd >= 0) {
-        if (playlist_offset <= (uint32_t)rb->filesize(fd))
+        if (playlist_offset <= (uint32_t)rb->filesize(fd)) {
             rb->lseek(fd, playlist_offset, SEEK_SET);
-        while ((bytes = rb->read(fd, text_buffer, sizeof(text_buffer))) > 0) {
-            for (i = 0; i < bytes; i++)
-                if (text_buffer[i] == '\n')
-                    pending_playlist_count++;
+        } else {
+            playlist_offset = 0;
+        }
+        length = 0;
+        while (true) {
+            unsigned char value;
+            int got = rb->read(fd, &value, 1);
+            if (got != 1 && length == 0)
+                break;
+            if (got != 1 || value == '\n') {
+                char *first;
+                char *second;
+                uint32_t track;
+                uint32_t playlist;
+                int slot = -1;
+
+                line[length] = '\0';
+                first = rb->strchr(line, '\t');
+                second = first ? rb->strchr(first + 1, '\t') : NULL;
+                if (first && second) {
+                    *first = *second = '\0';
+                    track = rb->strtoul(line, NULL, 10);
+                    playlist = rb->strtoul(first + 1, NULL, 10);
+                    for (i = 0; i < pending_playlist_count; i++) {
+                        if (pending_playlists[i].track_id == track &&
+                            pending_playlists[i].playlist_id == playlist) {
+                            slot = i;
+                            break;
+                        }
+                    }
+                    if (slot < 0 &&
+                        pending_playlist_count < RBPREP_PENDING_MAX)
+                        slot = pending_playlist_count++;
+                    if (slot >= 0) {
+                        pending_playlists[slot].track_id = track;
+                        pending_playlists[slot].playlist_id = playlist;
+                        rb->strlcpy(pending_playlists[slot].name, second + 1,
+                                    sizeof(pending_playlists[slot].name));
+                    }
+                }
+                length = 0;
+                if (got != 1)
+                    break;
+            } else if (value != '\r' &&
+                       length + 1 < (int)sizeof(line)) {
+                line[length++] = value;
+            }
         }
         rb->close(fd);
     }
+    pending_visible_count = MIN(pending_snapshot_count +
+                                pending_playlist_count,
+                                RBPREP_PENDING_ROWS);
+    pending_selection = MAX(0, MIN(pending_snapshot_count +
+                                   pending_playlist_count - 1,
+                                   pending_selection));
+    pending_top = MAX(0, MIN(MAX(0, pending_snapshot_count +
+                                pending_playlist_count -
+                                RBPREP_PENDING_ROWS), pending_top));
 }
 
 static bool delete_pending_edit(uint32_t track_id)
@@ -2065,6 +2296,93 @@ static bool delete_pending_edit(uint32_t track_id)
     }
     rb->remove(previous);
     return true;
+}
+
+static bool delete_pending_playlist(uint32_t track_id, uint32_t playlist_id)
+{
+    const char *temporary = RBPREP_PLAYLIST_JOURNAL ".rbprep-new";
+    const char *previous = RBPREP_PLAYLIST_JOURNAL ".rbprep-prev";
+    char line[160];
+    uint32_t edit_offset;
+    uint32_t playlist_offset;
+    uint32_t position = 0;
+    int input;
+    int output;
+    int length = 0;
+
+    read_burn_offsets(&edit_offset, &playlist_offset);
+    (void)edit_offset;
+    input = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
+    if (input < 0)
+        return false;
+    if (playlist_offset > (uint32_t)rb->filesize(input))
+        playlist_offset = 0;
+    rb->remove(temporary);
+    output = rb->open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (output < 0) {
+        rb->close(input);
+        return false;
+    }
+    while (true) {
+        unsigned char value;
+        int got = rb->read(input, &value, 1);
+
+        if (got != 1 && length == 0)
+            break;
+        if (position < playlist_offset && got == 1) {
+            if (rb->write(output, &value, 1) != 1)
+                goto playlist_delete_failed;
+            position++;
+            continue;
+        }
+        if (got != 1 || value == '\n') {
+            char parse[160];
+            char *first;
+            char *second;
+            bool remove = false;
+
+            line[length] = '\0';
+            rb->strlcpy(parse, line, sizeof(parse));
+            first = rb->strchr(parse, '\t');
+            second = first ? rb->strchr(first + 1, '\t') : NULL;
+            if (first && second) {
+                *first = *second = '\0';
+                remove = rb->strtoul(parse, NULL, 10) == track_id &&
+                         rb->strtoul(first + 1, NULL, 10) == playlist_id;
+            }
+            if (!remove) {
+                if ((length > 0 &&
+                     rb->write(output, line, length) != length) ||
+                    rb->write(output, "\n", 1) != 1)
+                    goto playlist_delete_failed;
+            }
+            length = 0;
+            if (got != 1)
+                break;
+        } else if (value != '\r' &&
+                   length + 1 < (int)sizeof(line)) {
+            line[length++] = value;
+        }
+        if (got == 1)
+            position++;
+    }
+    rb->close(input);
+    rb->close(output);
+    rb->remove(previous);
+    if (rb->rename(RBPREP_PLAYLIST_JOURNAL, previous) < 0)
+        return false;
+    if (rb->rename(temporary, RBPREP_PLAYLIST_JOURNAL) < 0) {
+        rb->rename(previous, RBPREP_PLAYLIST_JOURNAL);
+        return false;
+    }
+    rb->remove(previous);
+    return true;
+
+playlist_delete_failed:
+    rb->close(input);
+    rb->close(output);
+    rb->remove(temporary);
+    return false;
 }
 
 #include "rbprep_burn.h"
@@ -2135,6 +2453,17 @@ static bool load_waveform(int track_id)
         beat_times[i] = read_u32(beat);
         beat_numbers[i] = MAX(1, MIN(4, beat[4]));
     }
+    /* Some exports contain an occasional missing or malformed beat number.
+       Preserve the first known phase, then advance by the number of elapsed
+       beat periods so the HUD cannot jump directly from 2 to 4. */
+    for (i = 1; i < beat_count; i++) {
+        int source_period = grid_source_bpm_x100 > 0
+                          ? MAX(1, 6000000 / grid_source_bpm_x100) : 500;
+        int delta = MAX(1, beat_times[i] - beat_times[i - 1]);
+        int steps = MAX(1, MIN(8,
+            (delta + source_period / 2) / source_period));
+        beat_numbers[i] = ((beat_numbers[i - 1] - 1 + steps) & 3) + 1;
+    }
     rb->close(fd);
     overview_dirty = true;
     return true;
@@ -2193,6 +2522,12 @@ static bool play_track_index(int index, int row,
         return true;
     }
 
+    if (host_rpm_index != 0 || played_rpm_index != 0 ||
+        tempo_x100 != PITCH_SPEED_100) {
+        host_rpm_index = played_rpm_index = 0;
+        tempo_x100 = PITCH_SPEED_100;
+        apply_playback_rate();
+    }
     stop_editor_audio();
     if (rb->playlist_create(NULL, NULL) < 0 ||
         rb->playlist_insert_track(NULL, path, PLAYLIST_INSERT_LAST,
@@ -2243,22 +2578,59 @@ static bool play_track_row(int row)
     return play_track_index(track_index_at_row(row), row, MODE_TRACKS);
 }
 
+static void draw_record_badge(int cx, int cy, int radius, int color,
+                              bool selected)
+{
+    rb->lcd_set_foreground(selected ? color : LCD_RGBPACK(36, 48, 41));
+    xlcd_fillcircle(cx, cy, radius);
+    rb->lcd_set_foreground(selected ? LCD_RGBPACK(12, 18, 15)
+                                    : LCD_RGBPACK(8, 12, 10));
+    xlcd_fillcircle(cx, cy, MAX(1, radius - 2));
+    rb->lcd_set_foreground(selected ? LCD_WHITE
+                                    : LCD_RGBPACK(100, 120, 107));
+    xlcd_fillcircle(cx, cy, 1);
+}
+
+static void draw_blade_shell(const char *title, int accent)
+{
+    rb->lcd_set_foreground(LCD_RGBPACK(5, 8, 7));
+    rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+    rb->lcd_set_foreground(LCD_RGBPACK(14, 22, 18));
+    rb->lcd_fillrect(0, 0, LCD_WIDTH, 22);
+    rb->lcd_set_foreground(accent);
+    rb->lcd_fillrect(0, 0, 5, LCD_HEIGHT);
+    xlcd_drawcircle(LCD_WIDTH - 10, 9, 27);
+    xlcd_drawcircle(LCD_WIDTH - 10, 9, 20);
+    xlcd_fillcircle(LCD_WIDTH - 10, 9, 3);
+    text(10, 4, title, LCD_WHITE);
+}
+
+static void draw_blade_selection(int y, int height, int color)
+{
+    int radius = height / 2;
+    rb->lcd_set_foreground(color);
+    xlcd_fillcircle(16, y + radius, radius);
+    rb->lcd_fillrect(16, y, LCD_WIDTH - 16, height + 1);
+    rb->lcd_set_foreground(LCD_RGBPACK(120, 235, 255));
+    rb->lcd_vline(5, y + 2, y + height - 2);
+}
+
 static void draw_playlist_browser(void)
 {
     int row;
     char name[80];
     char line[96];
 
-    text(7, 3, playlist_add_mode ? "ADD TO PLAYLIST" : "PLAYLIST TREE",
-         playlist_add_mode ? LCD_RGBPACK(255, 145, 40)
-                           : LCD_RGBPACK(70, 235, 125));
+    draw_blade_shell(playlist_add_mode ? "ADD TO PLAYLIST" : "PLAYLISTS",
+                     playlist_add_mode ? LCD_RGBPACK(255, 145, 40)
+                                       : LCD_RGBPACK(70, 235, 125));
     if (tree_parent == RBPREP_ROOT_NODE) {
         text(112, 3, "/", LCD_LIGHTGRAY);
     } else {
         struct rbprep_node_record parent;
         if (read_node_record(tree_parent, &parent) &&
             read_index_string(parent.name_offset, name, sizeof(name)))
-            text(112, 3, name, LCD_LIGHTGRAY);
+            text(112, 4, name, LCD_LIGHTGRAY);
     }
 
     for (row = 0; row < RBPREP_LIST_ROWS; row++) {
@@ -2274,12 +2646,18 @@ static void draw_playlist_browser(void)
             !read_index_string(node.name_offset, name, sizeof(name)))
             continue;
         if (ordinal == tree_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(29, 102, 65));
-            rb->lcd_fillrect(0, y - 2, LCD_WIDTH, 19);
+            draw_blade_selection(y - 2, 19,
+                                 node.kind == 0
+                                 ? LCD_RGBPACK(34, 105, 73)
+                                 : LCD_RGBPACK(27, 78, 128));
         }
-        rb->snprintf(line, sizeof(line), "%s %s",
-                     node.kind == 0 ? "+" : ">", name);
-        text(8, y + 2, line, LCD_WHITE);
+        draw_record_badge(14, y + 7, 6,
+                          node.kind == 0 ? LCD_RGBPACK(70, 235, 125)
+                                         : LCD_RGBPACK(85, 220, 255),
+                          ordinal == tree_selection);
+        rb->snprintf(line, sizeof(line), "%s  %s",
+                     node.kind == 0 ? "FOLDER" : "SET", name);
+        text(26, y + 2, line, LCD_WHITE);
         if (node.kind != 0) {
             rb->snprintf(line, sizeof(line), "%lu",
                          (unsigned long)node.member_count);
@@ -2305,19 +2683,21 @@ static void draw_track_browser(void)
     char name[80];
     char line[96];
 
-    text(7, 3, active_playlist_node < 0 ? "COLLECTION" : "PLAYLIST",
-         LCD_RGBPACK(70, 235, 125));
+    draw_blade_shell(active_playlist_node < 0 ? "COLLECTION" : "PLAYLIST",
+                     active_playlist_node < 0
+                     ? LCD_RGBPACK(70, 235, 125)
+                     : LCD_RGBPACK(85, 220, 255));
     if (active_playlist_node >= 0) {
         struct rbprep_node_record node;
         if (read_node_record(active_playlist_node, &node) &&
             read_index_string(node.name_offset, name, sizeof(name)))
-            text(75, 3, name, LCD_LIGHTGRAY);
+            text(75, 4, name, LCD_LIGHTGRAY);
     } else {
         rb->snprintf(line, sizeof(line), "%s %s%s",
                      track_sort_names[track_sort_key],
                      track_sort_descending ? "v" : "^",
                      search_active ? "  FILTERED" : "");
-        text(184, 3, line, search_active
+        text(184, 4, line, search_active
              ? LCD_RGBPACK(255, 145, 40) : LCD_RGBPACK(105, 125, 112));
     }
 
@@ -2343,13 +2723,16 @@ static void draw_track_browser(void)
             read_index_string(track.tags_offset, artist_buffer,
                               sizeof(artist_buffer));
         if (ordinal == track_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(25, 91, 148));
-            rb->lcd_fillrect(0, y - 1, LCD_WIDTH, 20);
+            draw_blade_selection(y - 1, 20,
+                                 LCD_RGBPACK(25, 91, 148));
         }
-        rb->snprintf(line, sizeof(line), "%.41s", title_buffer);
-        text(7, y, line, LCD_WHITE);
+        draw_record_badge(12, y + 8, 5,
+                          cue_palette[track.color & 7],
+                          ordinal == track_selection);
+        rb->snprintf(line, sizeof(line), "%.38s", title_buffer);
+        text(22, y, line, LCD_WHITE);
         rb->snprintf(line, sizeof(line), "%.38s", artist_buffer);
-        text(14, y + 10, line, LCD_RGBPACK(145, 165, 151));
+        text(28, y + 10, line, LCD_RGBPACK(145, 165, 151));
         rb->snprintf(line, sizeof(line), "%d.%02d",
                      track.bpm_x100 / 100, track.bpm_x100 % 100);
         if (track_sort_key == TRACK_SORT_YEAR)
@@ -2386,7 +2769,8 @@ static void draw_collection_filter(void)
     char line[80];
     int row;
 
-    text(7, 3, "COLLECTION SEARCH + SORT", LCD_RGBPACK(70, 235, 125));
+    draw_blade_shell("COLLECTION SEARCH + SORT",
+                     LCD_RGBPACK(70, 235, 125));
     rb->snprintf(line, sizeof(line), "QUERY  %s",
                  track_search[0] ? track_search : "<ALL TRACKS>");
     text(7, 20, line, track_search[0]
@@ -2396,12 +2780,14 @@ static void draw_collection_filter(void)
         bool selected = row == filter_selection;
         bool active = row >= 2 && row - 2 == track_sort_key;
         if (selected) {
-            rb->lcd_set_foreground(LCD_RGBPACK(18, 78, 128));
-            rb->lcd_fillrect(0, y - 3, LCD_WIDTH, 20);
-            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
-            rb->lcd_fillrect(0, y - 3, 3, 20);
+            draw_blade_selection(y - 3, 20,
+                                 active ? LCD_RGBPACK(31, 108, 72)
+                                        : LCD_RGBPACK(18, 78, 128));
         }
-        text(10, y, items[row], selected ? LCD_WHITE
+        draw_record_badge(12, y + 5, 5,
+                          active ? LCD_RGBPACK(70, 235, 125)
+                                 : LCD_RGBPACK(85, 220, 255), selected);
+        text(24, y, items[row], selected ? LCD_WHITE
              : active ? LCD_RGBPACK(70, 235, 125)
                       : LCD_RGBPACK(178, 192, 183));
         if (active)
@@ -2427,7 +2813,7 @@ static enum rbprep_tool active_tool(void)
 static int tool_count(void)
 {
     if (mode == MODE_DECK)
-        return 7;
+        return 10;
     if (mode == MODE_GRID || mode == MODE_CUES || mode == MODE_LOOP)
         return 4;
     return 4;
@@ -2474,6 +2860,18 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
         rb->lcd_fillrect(x, y + 2, 3, 2);
         rb->lcd_fillrect(x + 3, y + 5, 3, 2);
         rb->lcd_fillrect(x + 6, y + 3, 3, 2);
+    } else if (tool == TOOL_HOST_RPM || tool == TOOL_PLAY_RPM) {
+        xlcd_drawcircle(cx, cy, 4);
+        xlcd_fillcircle(cx, cy, 1);
+        if (tool == TOOL_HOST_RPM)
+            rb->lcd_drawline(cx - 4, cy, cx - 2, cy - 2);
+        else
+            rb->lcd_drawline(cx, cy - 4, cx + 2, cy - 2);
+    } else if (tool == TOOL_TEMPO) {
+        rb->lcd_drawline(x, y + 7, x + 2, y + 2);
+        rb->lcd_drawline(x + 2, y + 2, x + 5, y + 5);
+        rb->lcd_drawline(x + 5, y + 5, x + 8, y);
+        rb->lcd_hline(x, x + 8, y + 8);
     } else if (tool == TOOL_PLAYLIST_MODE) {
         rb->lcd_hline(x, x + 5, y + 1);
         rb->lcd_hline(x, x + 5, y + 4);
@@ -2716,7 +3114,8 @@ static void draw_tool_orbs(void)
     text(2, 69, page_label(), LCD_RGBPACK(125, 148, 132));
     for (i = 0; i < count; i++) {
         enum rbprep_tool tool = active_tool() - selected + i;
-        int cx = count > 4 ? 38 + i * 17 : 50 + i * 26;
+        int cx = count > 7 ? 17 + i * 14
+                           : count > 4 ? 38 + i * 17 : 50 + i * 26;
         int color = i == selected
                                   ? (tool_menu_active
                                      ? LCD_RGBPACK(85, 220, 255)
@@ -2749,6 +3148,18 @@ static void draw_tool_status(void)
                      rb->sound_val2phys(SOUND_VOLUME,
                                         rb->global_status->volume),
                      rb->sound_unit(SOUND_VOLUME));
+    else if (tool == TOOL_HOST_RPM)
+        rb->snprintf(line, sizeof(line), "HOST RPM  %s  PLAY %s",
+                     rpm_styles[host_rpm_index],
+                     rpm_styles[played_rpm_index]);
+    else if (tool == TOOL_PLAY_RPM)
+        rb->snprintf(line, sizeof(line), "PLAY RPM  %s  PITCH %d.%02d%%",
+                     rpm_styles[played_rpm_index],
+                     deck_pitch_x100() / 100, deck_pitch_x100() % 100);
+    else if (tool == TOOL_TEMPO)
+        rb->snprintf(line, sizeof(line), "TEMPO  %d.%02d%%  RATE %d.%02d%%",
+                     tempo_x100 / 100, tempo_x100 % 100,
+                     deck_speed_x100() / 100, deck_speed_x100() % 100);
     else if (tool == TOOL_PLAYLIST_MODE)
         rb->snprintf(line, sizeof(line), "AUTO-NEXT  %s",
                      playlist_playback ? "ON" : "OFF");
@@ -2866,7 +3277,7 @@ static void draw_settings(void)
              LCD_RGBPACK(70, 235, 125));
     }
     text(10, 145, settings_selection == 0
-         ? "All demo modes react to PCM energy, waveform and beat phase"
+         ? "Boombox + EQ analyze live PCM; turntable follows deck rate"
          : settings_selection == 1
          ? (waveform_half ? "One-sided RGB waveform" : "Mirrored RGB waveform")
          : (save_on_track_load
@@ -2966,15 +3377,19 @@ static void draw_main_menu(void)
     static const char *codes[] = {
         "TRK", "PLS", "USB", "DSP", "EDT", "IDX", "EXT"
     };
+    static const int accents[] = {
+        LCD_RGBPACK(70, 235, 125), LCD_RGBPACK(85, 220, 255),
+        LCD_RGBPACK(120, 105, 255), LCD_RGBPACK(255, 145, 40),
+        LCD_RGBPACK(255, 195, 55), LCD_RGBPACK(65, 180, 145),
+        LCD_RGBPACK(220, 75, 75)
+    };
     char line[80];
     int i;
 
-    rb->lcd_set_foreground(LCD_RGBPACK(10, 13, 16));
-    rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+    draw_blade_shell("RBPREP  /  PERFORMANCE LIBRARY",
+                     LCD_RGBPACK(70, 235, 125));
     rb->lcd_set_foreground(LCD_RGBPACK(21, 29, 35));
-    rb->lcd_fillrect(0, 0, LCD_WIDTH, 38);
-    text(7, 4, "RBPREP", LCD_RGBPACK(70, 235, 125));
-    text(59, 4, "EXPORT PERFORMANCE SYSTEM", LCD_WHITE);
+    rb->lcd_fillrect(5, 22, LCD_WIDTH - 5, 16);
     if (library_fd >= 0)
         rb->snprintf(line, sizeof(line), "%lu TRACKS  /  DEVICE INDEX ONLINE",
                      (unsigned long)library_track_count);
@@ -2987,14 +3402,12 @@ static void draw_main_menu(void)
         int y = 45 + i * 26;
         bool selected = i == selection;
         if (selected) {
-            rb->lcd_set_foreground(LCD_RGBPACK(17, 73, 119));
-            rb->lcd_fillrect(0, y - 2, LCD_WIDTH, 23);
-            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
-            rb->lcd_fillrect(0, y - 2, 4, 23);
+            draw_blade_selection(y - 2, 23, accents[i]);
         }
-        text(10, y + 3, codes[i], selected
-             ? LCD_RGBPACK(85, 220, 255) : LCD_RGBPACK(82, 105, 94));
-        text(50, y + 3, items[i], selected ? LCD_WHITE
+        draw_record_badge(18, y + 9, 8, accents[i], selected);
+        text(34, y + 3, codes[i], selected
+             ? LCD_WHITE : accents[i]);
+        text(67, y + 3, items[i], selected ? LCD_WHITE
              : LCD_RGBPACK(178, 192, 183));
         if (i == 2)
             text(257, y + 3, usb_selection ? "DAC" : "DATA",
@@ -3024,29 +3437,47 @@ static void draw_pending_edits(void)
     rb->lcd_hline(7, LCD_WIDTH - 8, 36);
     for (row = 0; row < RBPREP_PENDING_ROWS; row++) {
         int visible = pending_top + row;
-        int ordinal = pending_snapshot_count - 1 - visible;
-        struct rbprep_pending_entry *entry;
         int y = 45 + row * 20;
 
-        if (ordinal < 0)
+        if (visible >= pending_snapshot_count + pending_playlist_count)
             break;
-        entry = &pending_entries[ordinal];
         if (visible == pending_selection) {
             rb->lcd_set_foreground(LCD_RGBPACK(18, 78, 128));
             rb->lcd_fillrect(0, y - 2, LCD_WIDTH, 19);
             rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
             rb->lcd_fillrect(0, y - 2, 3, 19);
         }
-        rb->lcd_set_foreground(cue_palette[entry->color]);
-        rb->lcd_fillrect(7, y + 2, 6, 6);
-        rb->snprintf(line, sizeof(line), "%.29s", entry->title[0]
-                     ? entry->title : "Untitled track");
-        text(19, y, line, LCD_WHITE);
-        rb->snprintf(line, sizeof(line), "ID %lu   %d.%02d BPM   %d STAR",
-                     (unsigned long)entry->track_id,
-                     entry->bpm_x100 / 100, entry->bpm_x100 % 100,
-                     entry->rating);
-        text(19, y + 10, line, LCD_RGBPACK(105, 125, 112));
+        if (visible < pending_snapshot_count) {
+            int ordinal = pending_snapshot_count - 1 - visible;
+            struct rbprep_pending_entry *entry = &pending_entries[ordinal];
+
+            rb->lcd_set_foreground(cue_palette[entry->color]);
+            rb->lcd_fillrect(7, y + 2, 6, 6);
+            rb->snprintf(line, sizeof(line), "%.29s", entry->title[0]
+                         ? entry->title : "Untitled track");
+            text(19, y, line, LCD_WHITE);
+            rb->snprintf(line, sizeof(line),
+                         "EDIT  ID %lu   %d.%02d BPM   %d STAR",
+                         (unsigned long)entry->track_id,
+                         entry->bpm_x100 / 100, entry->bpm_x100 % 100,
+                         entry->rating);
+            text(19, y + 10, line, LCD_RGBPACK(105, 125, 112));
+        } else {
+            int ordinal = visible - pending_snapshot_count;
+            struct rbprep_pending_playlist *entry =
+                &pending_playlists[ordinal];
+
+            rb->lcd_set_foreground(LCD_RGBPACK(255, 145, 40));
+            xlcd_fillcircle(10, y + 5, 4);
+            rb->lcd_set_foreground(LCD_BLACK);
+            xlcd_fillcircle(10, y + 5, 1);
+            rb->snprintf(line, sizeof(line), "ADD TO  %.27s", entry->name);
+            text(19, y, line, LCD_WHITE);
+            rb->snprintf(line, sizeof(line), "TRACK %lu   PLAYLIST %lu",
+                         (unsigned long)entry->track_id,
+                         (unsigned long)entry->playlist_id);
+            text(19, y + 10, line, LCD_RGBPACK(255, 185, 80));
+        }
     }
     if (pending_visible_count == 0 && pending_playlist_count == 0)
         text(7, 62, "NO CONFIRMED DEVICE EDITS YET", LCD_DARKGRAY);
@@ -3145,19 +3576,25 @@ static bool append_playlist_journal(int node_index)
     char line[160];
     int fd;
     int length;
+    int i;
+    uint32_t playlist_id;
 
     if (!read_node_record(node_index, &node) ||
         !read_index_string(node.name_offset, name, sizeof(name)))
         return false;
+    playlist_id = node.source_id ? node.source_id : (uint32_t)node_index;
+    for (i = 0; i < pending_playlist_count; i++) {
+        if (pending_playlists[i].track_id == (uint32_t)selected_track_id &&
+            pending_playlists[i].playlist_id == playlist_id)
+            return true;
+    }
     fd = rb->open(RBPREP_PLAYLIST_JOURNAL,
                   O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0)
         return false;
     length = rb->snprintf(line, sizeof(line), "%d\t%lu\t%s\n",
                           selected_track_id,
-                          (unsigned long)(node.source_id
-                                          ? node.source_id
-                                          : (uint32_t)node_index),
+                          (unsigned long)playlist_id,
                           name);
     if (rb->write(fd, line, length) != length) {
         rb->close(fd);
@@ -3227,6 +3664,7 @@ static void finish_confirmation(bool apply)
         if (append_playlist_journal(confirm_playlist_node)) {
             playlist_add_mode = false;
             mode = MODE_DECK;
+            refresh_pending_summary();
             rb->splash(HZ, "Playlist add queued");
         } else {
             rb->splash(HZ * 2, "Could not queue playlist add");
@@ -3244,6 +3682,15 @@ static void finish_confirmation(bool apply)
         uint32_t track_id = pending_entries[confirm_slot].track_id;
         if (!delete_pending_edit(track_id)) {
             rb->splash(HZ * 2, "Could not delete pending edit");
+            restore_black_canvas();
+        }
+        refresh_pending_summary();
+    } else if (action == CONFIRM_DELETE_PLAYLIST) {
+        struct rbprep_pending_playlist *entry =
+            &pending_playlists[confirm_slot];
+        if (!delete_pending_playlist(entry->track_id,
+                                     entry->playlist_id)) {
+            rb->splash(HZ * 2, "Could not delete playlist add");
             restore_black_canvas();
         }
         refresh_pending_summary();
@@ -3352,8 +3799,14 @@ static void draw_screen(void)
         hud_scroll_deadline = *rb->current_tick +
                               RBPREP_HUD_SCROLL_TICKS;
     } else {
+        rb->lcd_set_foreground(LCD_RGBPACK(8, 15, 11));
+        rb->lcd_fillrect(218, RBPREP_TOOL_TOP,
+                         LCD_WIDTH - 218, RBPREP_TOOL_HEIGHT);
+        draw_tool_indicators();
         rb->lcd_update_rect(0, RBPREP_WAVE_TOP, LCD_WIDTH,
                             RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
+        rb->lcd_update_rect(218, RBPREP_TOOL_TOP,
+                            LCD_WIDTH - 218, RBPREP_TOOL_HEIGHT);
     }
 }
 
@@ -3376,7 +3829,8 @@ static bool update_play_clock(void)
         (status & AUDIO_STATUS_PAUSE))
         return false;
     position = clamp_playhead(play_clock_anchor +
-        (long long)(now - play_clock_tick) * 1000 / HZ);
+        (long long)(now - play_clock_tick) * 1000 * deck_speed_x100() /
+        (HZ * PITCH_SPEED_100));
     id3 = rb->audio_current_track();
     if (id3 && !TIME_BEFORE(now, audio_sync_after)) {
         int observed = clamp_playhead(id3->elapsed);
@@ -3473,7 +3927,8 @@ static bool service_audio_seek(void)
 
     if (seek_state == SEEK_CUE_HOLD) {
         int position = clamp_playhead(play_clock_anchor +
-            (long long)(now - play_clock_tick) * 1000 / HZ);
+            (long long)(now - play_clock_tick) * 1000 * deck_speed_x100() /
+            (HZ * PITCH_SPEED_100));
         if (position != playhead) {
             playhead = position;
             return true;
@@ -3644,7 +4099,8 @@ static void toggle_playback(void)
     }
     if (seek_state == SEEK_PREVIEW) {
         playhead = clamp_playhead(seek_applied_target +
-            (long long)(*rb->current_tick - seek_applied_tick) * 1000 / HZ);
+            (long long)(*rb->current_tick - seek_applied_tick) * 1000 *
+            deck_speed_x100() / (HZ * PITCH_SPEED_100));
         seek_state = SEEK_IDLE;
         rb->pcmbuf_fade(false, true);
         reset_play_clock(playhead, *rb->current_tick);
@@ -3854,16 +4310,22 @@ static void short_select(void)
                         ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
         force_full_redraw = true;
     } else if (mode == MODE_PENDING) {
-        if (pending_snapshot_count > 0) {
+        int index = -1;
+        if (pending_selection < pending_snapshot_count) {
             int ordinal = pending_snapshot_count - 1 - pending_selection;
-            int index = find_track_index_by_id(pending_entries[ordinal].track_id);
-            if (index >= 0) {
-                playlist_playback = false;
-                play_track_index(index, -1, MODE_PENDING);
-            } else {
-                rb->splash(HZ * 2, "Track is missing from device index");
-                restore_black_canvas();
-            }
+            index = find_track_index_by_id(pending_entries[ordinal].track_id);
+        } else if (pending_selection < pending_snapshot_count +
+                                            pending_playlist_count) {
+            int ordinal = pending_selection - pending_snapshot_count;
+            index = find_track_index_by_id(
+                pending_playlists[ordinal].track_id);
+        }
+        if (index >= 0) {
+            playlist_playback = false;
+            play_track_index(index, -1, MODE_PENDING);
+        } else if (pending_snapshot_count + pending_playlist_count > 0) {
+            rb->splash(HZ * 2, "Track is missing from device index");
+            restore_black_canvas();
         }
     } else if (mode == MODE_GENRES) {
         char name[32];
@@ -3883,6 +4345,17 @@ static void short_select(void)
                             ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
         } else if (tool == TOOL_ZOOM) {
             zoom = 1;
+        } else if (tool == TOOL_HOST_RPM) {
+            host_rpm_index = 0;
+            apply_playback_rate();
+        } else if (tool == TOOL_PLAY_RPM) {
+            played_rpm_index = 0;
+            apply_playback_rate();
+        } else if (tool == TOOL_TEMPO) {
+            tempo_x100 = PITCH_SPEED_100;
+            apply_playback_rate();
+            configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
+                            ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
         } else if (tool == TOOL_PLAYLIST_MODE) {
             playlist_playback = !playlist_playback;
         } else if (tool == TOOL_ADD_PLAYLIST) {
@@ -3966,13 +4439,23 @@ static void short_select(void)
 
 static void long_select(void)
 {
-    if (mode == MODE_PENDING && pending_snapshot_count > 0) {
-        int ordinal = pending_snapshot_count - 1 - pending_selection;
-        confirm_slot = ordinal;
-        rb->snprintf(confirm_message, sizeof(confirm_message),
-                     "DELETE EDIT %.24s?",
-                     pending_entries[ordinal].title);
-        begin_confirmation(CONFIRM_DELETE_PENDING);
+    if (mode == MODE_PENDING &&
+        pending_snapshot_count + pending_playlist_count > 0) {
+        if (pending_selection < pending_snapshot_count) {
+            int ordinal = pending_snapshot_count - 1 - pending_selection;
+            confirm_slot = ordinal;
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "DELETE EDIT %.24s?",
+                         pending_entries[ordinal].title);
+            begin_confirmation(CONFIRM_DELETE_PENDING);
+        } else {
+            int ordinal = pending_selection - pending_snapshot_count;
+            confirm_slot = ordinal;
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "DELETE ADD TO %.22s?",
+                         pending_playlists[ordinal].name);
+            begin_confirmation(CONFIRM_DELETE_PLAYLIST);
+        }
     } else if (mode == MODE_DECK) {
         if (active_tool() == TOOL_SEEK) {
             confirm_time = quantized_time(playhead);
@@ -4071,6 +4554,26 @@ static void adjust_active_tool(int direction)
         change_zoom(direction > 0);
     else if (tool == TOOL_GAIN)
         change_volume(direction);
+    else if (tool == TOOL_HOST_RPM) {
+        host_rpm_index = (host_rpm_index +
+            (direction > 0 ? 1 : ARRAYLEN(rpm_styles) - 1)) %
+            ARRAYLEN(rpm_styles);
+        apply_playback_rate();
+        force_full_redraw = true;
+    }
+    else if (tool == TOOL_PLAY_RPM) {
+        played_rpm_index = (played_rpm_index +
+            (direction > 0 ? 1 : ARRAYLEN(rpm_styles) - 1)) %
+            ARRAYLEN(rpm_styles);
+        apply_playback_rate();
+        force_full_redraw = true;
+    }
+    else if (tool == TOOL_TEMPO) {
+        tempo_x100 = MAX(5000, MIN(20000,
+                                   tempo_x100 + direction * 10));
+        apply_playback_rate();
+        force_full_redraw = true;
+    }
     else if (tool == TOOL_PLAYLIST_MODE)
         playlist_playback = direction > 0;
     else if (tool == TOOL_WAVEFORM_STYLE) {
@@ -4142,6 +4645,23 @@ static void adjust_active_tool_coarse(int direction)
         int i;
         for (i = 0; i < 5; i++)
             change_volume(direction);
+    } else if (tool == TOOL_HOST_RPM) {
+        host_rpm_index = (host_rpm_index +
+            (direction > 0 ? 1 : ARRAYLEN(rpm_styles) - 1)) %
+            ARRAYLEN(rpm_styles);
+        apply_playback_rate();
+        force_full_redraw = true;
+    } else if (tool == TOOL_PLAY_RPM) {
+        played_rpm_index = (played_rpm_index +
+            (direction > 0 ? 1 : ARRAYLEN(rpm_styles) - 1)) %
+            ARRAYLEN(rpm_styles);
+        apply_playback_rate();
+        force_full_redraw = true;
+    } else if (tool == TOOL_TEMPO) {
+        tempo_x100 = MAX(5000, MIN(20000,
+                                   tempo_x100 + direction * 100));
+        apply_playback_rate();
+        force_full_redraw = true;
     } else if (tool == TOOL_GRID_NUDGE) {
         stage_active_edit();
         grid_offset += direction * 10;
@@ -4336,6 +4856,13 @@ enum plugin_status plugin_start(const void *parameter)
     pending_selection = pending_top = 0;
     track_edit_dirty = false;
     usb_selection = rb->global_settings->usb_audio != 0;
+    host_rpm_index = played_rpm_index = 0;
+    tempo_x100 = PITCH_SPEED_100;
+    original_pitch = rb->sound_get_pitch();
+    original_stretch = rb->dsp_get_timestretch();
+    original_timestretch_enabled =
+        rb->global_settings->timestretch_enabled;
+    playback_rate_changed = false;
     configfile_load(RBPREP_CONFIG_FILE, rbprep_config,
                     ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
     waveform_half = !!waveform_half;
@@ -4344,6 +4871,13 @@ enum plugin_status plugin_start(const void *parameter)
     save_on_track_load = !!save_on_track_load;
     scrub_step_index = MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1,
                                   scrub_step_index));
+    host_rpm_index = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1,
+                                host_rpm_index));
+    played_rpm_index = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1,
+                                  played_rpm_index));
+    tempo_x100 = MAX(5000, MIN(20000, tempo_x100));
+    apply_playback_rate();
+    start_spectrum_capture();
     rebuild_waveform_height_lut();
     clear_analysis();
     open_library_index();
@@ -4593,8 +5127,10 @@ enum plugin_status plugin_start(const void *parameter)
                     track_top = track_selection - RBPREP_LIST_ROWS + 1;
             } else if (mode == MODE_FILTER) {
                 filter_selection = MIN(7, filter_selection + 1);
-            } else if (mode == MODE_PENDING && pending_snapshot_count > 0) {
-                pending_selection = MIN(pending_snapshot_count - 1,
+            } else if (mode == MODE_PENDING &&
+                       pending_snapshot_count + pending_playlist_count > 0) {
+                pending_selection = MIN(pending_snapshot_count +
+                                        pending_playlist_count - 1,
                                         pending_selection + 1);
                 if (pending_selection >= pending_top + RBPREP_PENDING_ROWS)
                     pending_top = pending_selection - RBPREP_PENDING_ROWS + 1;

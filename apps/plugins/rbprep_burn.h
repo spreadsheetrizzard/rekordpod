@@ -748,6 +748,88 @@ static bool pdb_playlist_exists(struct rbprep_pdb *pdb, uint32_t playlist,
     return false;
 }
 
+static uint32_t pdb_playlist_by_name(struct rbprep_pdb *pdb,
+                                     const char *name)
+{
+    uint32_t entry;
+    unsigned char table[16];
+    uint32_t page;
+    uint32_t last;
+    uint32_t match = 0;
+    int guard = 0;
+
+    if (!name || !name[0] || !pdb_table_entry(pdb, 7, &entry) ||
+        !burn_read_at(pdb->fd, entry, table, sizeof(table)))
+        return 0;
+    page = read_u32(table + 8);
+    last = read_u32(table + 12);
+    while (guard++ < 100000) {
+        int slots;
+        int slot;
+        if (!burn_read_at(pdb->fd, page * pdb->page_size,
+                          rbprep_burn_page, pdb->page_size))
+            return 0;
+        slots = pdb_slot_count(rbprep_burn_page);
+        if (!(rbprep_burn_page[0x1b] & 0x40)) {
+            for (slot = 0; slot < slots; slot++) {
+                uint32_t row;
+                unsigned char fixed[20];
+                char existing[64];
+                uint32_t id;
+                if (!pdb_row_present(rbprep_burn_page, pdb->page_size, slot))
+                    continue;
+                row = page * pdb->page_size + 0x28 +
+                      pdb_row_heap_offset(rbprep_burn_page,
+                                          pdb->page_size, slot);
+                if (!burn_read_at(pdb->fd, row, fixed, sizeof(fixed)))
+                    return 0;
+                if (read_u32(fixed + 16) != 0 ||
+                    !pdb_decode_string(pdb, row + 20, existing,
+                                       sizeof(existing)) ||
+                    rb->strcasecmp(existing, name))
+                    continue;
+                id = read_u32(fixed + 12);
+                if (match && match != id)
+                    return 0;
+                match = id;
+            }
+        }
+        if (page == last)
+            break;
+        if (!pdb_next_page(pdb, page, &page))
+            return 0;
+    }
+    return match;
+}
+
+static bool pdb_resolve_playlist(struct rbprep_pdb *pdb,
+                                 uint32_t journal_id, const char *name,
+                                 uint32_t *resolved)
+{
+    struct rbprep_node_record node;
+    bool folder;
+    uint32_t by_name;
+
+    if (pdb_playlist_exists(pdb, journal_id, &folder) && !folder) {
+        *resolved = journal_id;
+        return true;
+    }
+    /* RBI1 journals stored the node ordinal. Translate those requests using
+       the current device index before falling back to an unambiguous name. */
+    if (journal_id < library_node_count &&
+        read_node_record(journal_id, &node) && node.source_id &&
+        pdb_playlist_exists(pdb, node.source_id, &folder) && !folder) {
+        *resolved = node.source_id;
+        return true;
+    }
+    by_name = pdb_playlist_by_name(pdb, name);
+    if (by_name) {
+        *resolved = by_name;
+        return true;
+    }
+    return false;
+}
+
 static int pdb_playlist_entry_index(struct rbprep_pdb *pdb, uint32_t track,
                                     uint32_t playlist, bool *present)
 {
@@ -1163,7 +1245,9 @@ static bool burn_playlist_journal(struct rbprep_pdb *pdb)
                 *first = *second = '\0';
                 track = rb->strtoul(line, NULL, 10);
                 playlist = rb->strtoul(first + 1, NULL, 10);
-                if (!pdb_add_playlist_entry(pdb, track, playlist)) {
+                if (!pdb_resolve_playlist(pdb, playlist, second + 1,
+                                          &playlist) ||
+                    !pdb_add_playlist_entry(pdb, track, playlist)) {
                     rb->close(fd);
                     return false;
                 }
