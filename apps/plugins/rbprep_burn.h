@@ -1187,22 +1187,40 @@ static bool rbprep_burn_all(void)
     int completed = 0;
     int total = MAX(1, pending_snapshot_count);
     bool success = false;
+    const char *failure = "initialization";
 
     stop_editor_audio();
+    /* The analysis transaction needs two simultaneous copies of the largest
+       ANLZ file. Explicitly release playback's codec/buffering allocation
+       before asking buflib for its maximum block. */
+    rb->audio_stop();
+    rb->yield();
+    audio_was_running = false;
+    playlist_playback = false;
     memory = rb->plugin_get_audio_buffer(&memory_size);
     if (!memory || memory_size < 65536) {
-        rb->splash(HZ * 2, "Not enough memory to burn");
-        return false;
+        failure = "audio workspace";
+        goto done;
     }
     if (!rb->file_exists(RBPREP_PDB) && rb->file_exists(RBPREP_PDB_PREV))
         rb->rename(RBPREP_PDB_PREV, RBPREP_PDB);
-    if (!rb->file_exists(RBPREP_PDB) ||
-        !burn_backup_once(RBPREP_PDB, RBPREP_PDB_BAK))
+    if (!rb->file_exists(RBPREP_PDB)) {
+        failure = "export.pdb missing";
         goto done;
+    }
+    if (!burn_backup_once(RBPREP_PDB, RBPREP_PDB_BAK)) {
+        failure = "PDB backup";
+        goto done;
+    }
     rb->remove(RBPREP_PDB_NEW);
-    if (!burn_copy_file(RBPREP_PDB, RBPREP_PDB_NEW) ||
-        !pdb_open(&pdb, RBPREP_PDB_NEW))
+    if (!burn_copy_file(RBPREP_PDB, RBPREP_PDB_NEW)) {
+        failure = "PDB working copy";
         goto done;
+    }
+    if (!pdb_open(&pdb, RBPREP_PDB_NEW)) {
+        failure = "PDB open";
+        goto done;
+    }
 
     fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
     if (fd >= 0) {
@@ -1218,9 +1236,16 @@ static bool rbprep_burn_all(void)
             rb->splash_progress(MIN(completed, total), total,
                                 "Burning track %lu",
                                 (unsigned long)track_id);
-            if (!pdb_patch_snapshot(&pdb, record, &track) ||
-                !burn_analysis_for_track(&track, track_id, record,
+            if (!pdb_patch_snapshot(&pdb, record, &track)) {
+                failure = "track lookup/PDB";
+                rb->close(fd);
+                burn_finish_analysis_files(&pdb, true);
+                rb->close(pdb.fd);
+                goto done;
+            }
+            if (!burn_analysis_for_track(&track, track_id, record,
                                          memory, memory_size)) {
+                failure = "ANLZ rewrite";
                 rb->close(fd);
                 burn_finish_analysis_files(&pdb, true);
                 rb->close(pdb.fd);
@@ -1231,6 +1256,7 @@ static bool rbprep_burn_all(void)
         rb->close(fd);
     }
     if (!burn_playlist_journal(&pdb)) {
+        failure = "playlist table";
         burn_finish_analysis_files(&pdb, true);
         rb->close(pdb.fd);
         goto done;
@@ -1238,12 +1264,14 @@ static bool rbprep_burn_all(void)
     if (pdb.structural) {
         unsigned char raw[4];
         if (!burn_read_at(pdb.fd, 0x14, raw, 4)) {
+            failure = "PDB sequence read";
             burn_finish_analysis_files(&pdb, true);
             rb->close(pdb.fd);
             goto done;
         }
         write_u32(raw, read_u32(raw) + 1);
         if (!burn_write_at(pdb.fd, 0x14, raw, 4)) {
+            failure = "PDB sequence write";
             burn_finish_analysis_files(&pdb, true);
             rb->close(pdb.fd);
             goto done;
@@ -1251,6 +1279,7 @@ static bool rbprep_burn_all(void)
     }
     rb->close(pdb.fd);
     if (!pdb_open(&pdb, RBPREP_PDB_NEW)) {
+        failure = "PDB validation";
         struct rbprep_pdb original;
         if (pdb_open(&original, RBPREP_PDB)) {
             burn_finish_analysis_files(&original, true);
@@ -1261,6 +1290,7 @@ static bool rbprep_burn_all(void)
     rb->close(pdb.fd);
     if (!burn_swap_keep_previous(RBPREP_PDB, RBPREP_PDB_NEW,
                                  RBPREP_PDB_PREV)) {
+        failure = "PDB commit";
         struct rbprep_pdb original;
         if (pdb_open(&original, RBPREP_PDB)) {
             burn_finish_analysis_files(&original, true);
@@ -1269,6 +1299,7 @@ static bool rbprep_burn_all(void)
         goto done;
     }
     if (!pdb_open(&pdb, RBPREP_PDB)) {
+        failure = "PDB reopen";
         struct rbprep_pdb original;
         if (pdb_open(&original, RBPREP_PDB_PREV)) {
             burn_finish_analysis_files(&original, true);
@@ -1302,6 +1333,7 @@ done:
     rb->remove(RBPREP_PDB_NEW);
     rb->plugin_release_audio_buffer();
     if (!success)
-        rb->splash(HZ * 2, "Burn failed; originals restored");
+        rb->splashf(HZ * 3, "BURN FAILED: %s", failure);
+    restore_black_canvas();
     return success;
 }

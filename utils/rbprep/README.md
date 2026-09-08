@@ -9,7 +9,8 @@ database and produces two inputs:
   Drag'n'Dunk (`rb:<TrackID>`).
 
 The SQLite cache includes title, artist, album, genre, BPM, key, year, rating,
-play count, comments, date added, color, playlist membership, and ordinal. When
+play count, comments, comment hashtags, date added, color, playlist membership,
+and ordinal. When
 `--analysis-root` is supplied, it also joins ANLZ files to tracks by their exact
 `PPTH` audio paths and imports every beat-grid point and memory/hot cue.
 The compact `waveforms` table preserves Rekordbox's native `PWV4` RGB overview
@@ -31,8 +32,25 @@ The importer builds the SQLite cache under a temporary name and atomically
 replaces the completed cache. It never changes `export.pdb`.
 
 `build_device_cache.py` combines that SQLite library with a Rockbox ZIP. Its
-RBI2 index remains readable by the plugin's RBI1 compatibility path and adds
-musical key strings plus stable Rekordbox playlist IDs.
+RBI3 index remains readable by the plugin's RBI1 compatibility path and adds a
+single-read search string per track, year/comments/tags metadata, five compact
+precomputed sort maps, musical keys, and stable Rekordbox playlist IDs. The
+device Collection can therefore search title/artist/genre/key/comments/tags
+and sort by title, BPM, year, key, comments, or tags without sorting thousands
+of records on the iPod.
+
+The RBPrep plugin journals confirmed changes immediately by default. Its
+`Save Edits` setting can instead coalesce changes into one snapshot when the
+next track loads. Pending Edits is scrollable: SELECT opens the chosen track,
+hold SELECT confirms deletion of its unburned snapshots, and PLAY opens the
+local-burn confirmation. Local burn stops playback to reserve a transaction
+workspace, keeps persistent `.rbprep-bak` originals, and reports the exact
+PDB/ANLZ transaction stage if it must roll back.
+
+The deck retains its RGB waveform and adds three audio-, waveform-, and
+beat-reactive demoscene views: Plasma Tunnel, Scope Fire, and Hyperspace. These
+use integer effects and coarse tiles/streaks so decoding and input polling stay
+higher priority than display work.
 
 `apply_device_edits.py` is the explicit write-back step. It keeps only the
 newest full snapshot per track, diffs that state against the current DeviceSQL

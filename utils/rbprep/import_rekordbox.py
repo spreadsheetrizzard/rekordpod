@@ -115,6 +115,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
             rating INTEGER,
             play_count INTEGER,
             comments TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '',
             date_added TEXT NOT NULL DEFAULT '',
             color TEXT NOT NULL DEFAULT '',
             cue_count INTEGER NOT NULL DEFAULT 0,
@@ -324,19 +325,24 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
             )
             cue_count = len(analysis["cues"])
             beat_grid_count = len(analysis["beats"])
+            tags = " ".join(
+                token for token in str(track.comment or "").split()
+                if token.startswith("#")
+            )
             values = [
                 track_id, track.file_path, track.title, artist, album, genre,
                 "" if bpm is None else str(bpm), musical_key,
                 str(track.year or ""), str(track.rating or ""),
-                str(track.play_count or ""), track.comment, track.date_added,
+                str(track.play_count or ""), track.comment, tags,
+                track.date_added,
                 color, str(cue_count), str(beat_grid_count),
             ]
             connection.execute(
-                "INSERT INTO tracks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO tracks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (stable_key, track_id, track.file_path, track.title, artist, album,
                  genre, bpm, musical_key, track.year or None, track.rating or None,
-                 track.play_count or None, track.comment, track.date_added, color,
-                 cue_count, beat_grid_count, digest(values)),
+                 track.play_count or None, track.comment, tags, track.date_added,
+                 color, cue_count, beat_grid_count, digest(values)),
             )
             connection.executemany(
                 "INSERT INTO beat_grid_points VALUES (?,?,?,?,?)",
