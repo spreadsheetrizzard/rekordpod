@@ -68,6 +68,14 @@ settings reset for a newly loaded song and the pre-plugin Rockbox
 pitch/timestretch state is restored on exit. The main menu's Prep Deck item can
 attach to the current indexed Rockbox track without restarting it.
 
+This iPod 6G fork launches RBPrep once during Rockbox startup when
+`/.rockbox/rocks/apps/rbprep.rock` is present. The `autoboot` launch draws an
+animated `rekordpod` wordmark using the bundled Adobe Helvetica font. Holding
+MENU during boot bypasses RBPrep, and RBPrep's Exit to Rockbox item returns to
+the ordinary root menu without relaunching it. Main and browser selections use
+rounded capsule geometry; the main menu is icon-first and the playlist tree has
+separate folder and playlist glyphs.
+
 `apply_device_edits.py` is the explicit write-back step. It keeps only the
 newest full snapshot per track, diffs that state against the current DeviceSQL
 database and ANLZ data, and applies only the net metadata, beat-grid, hot-cue,

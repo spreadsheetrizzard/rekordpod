@@ -686,6 +686,15 @@ static void text(int x, int y, const char *s, int color)
     rb->lcd_putsxy(x, y, s);
 }
 
+static void centered_text(int left, int width, int y,
+                          const char *s, int color)
+{
+    int text_width;
+
+    rb->lcd_getstringsize(s, &text_width, NULL);
+    text(left + MAX(0, (width - text_width) / 2), y, s, color);
+}
+
 static void format_percent_delta(char *buffer, size_t size, int delta_x100)
 {
     char sign = delta_x100 < 0 ? '-' : '+';
@@ -1751,7 +1760,8 @@ static void draw_boombox(void)
                                    : LCD_RGBPACK(93, 108, 99));
     rb->lcd_drawrect(8 + rattle, RBPREP_WAVE_TOP + 10,
                      RBPREP_DECK_WIDTH - 16, 132);
-    text(107, RBPREP_WAVE_TOP + 14, "SUB RESONANCE", RBPREP_GREEN);
+    centered_text(0, RBPREP_DECK_WIDTH, RBPREP_WAVE_TOP + 14,
+                  "SUB RESONANCE", RBPREP_GREEN);
     if (rattling) {
         rb->lcd_set_foreground(LCD_WHITE);
         rb->lcd_hline(3, 6, RBPREP_WAVE_TOP + 55 + rattle);
@@ -1800,20 +1810,22 @@ static void draw_boombox(void)
     }
 
     if (bass_note_index >= 0 && bass_pitch_confidence >= 36) {
-        text(137, RBPREP_WAVE_TOP + 51, note_names[bass_note_index],
-             LCD_WHITE);
+        centered_text(118, 64, RBPREP_WAVE_TOP + 51,
+                      note_names[bass_note_index], LCD_WHITE);
         rb->snprintf(line, sizeof(line), "%d.%dHz",
                      bass_frequency_x10 / 10, bass_frequency_x10 % 10);
-        text(126, RBPREP_WAVE_TOP + 69, line, RBPREP_GREEN);
+        centered_text(118, 64, RBPREP_WAVE_TOP + 69, line, RBPREP_GREEN);
     } else {
-        text(138, RBPREP_WAVE_TOP + 51, "--", LCD_LIGHTGRAY);
-        text(126, RBPREP_WAVE_TOP + 69, "LISTEN", RBPREP_GREEN_DIM);
+        centered_text(118, 64, RBPREP_WAVE_TOP + 51, "--", LCD_LIGHTGRAY);
+        centered_text(118, 64, RBPREP_WAVE_TOP + 69,
+                      "LISTEN", RBPREP_GREEN_DIM);
     }
     rb->snprintf(line, sizeof(line), "%ddB", spectrum_level_db(spectrum_bass));
-    text(132, RBPREP_WAVE_TOP + 87, line,
-         rattling ? LCD_WHITE : LCD_RGBPACK(155, 174, 161));
+    centered_text(118, 64, RBPREP_WAVE_TOP + 87, line,
+                  rattling ? LCD_WHITE : LCD_RGBPACK(155, 174, 161));
     if (rattling)
-        text(124, RBPREP_WAVE_TOP + 105, "RATTLE", LCD_WHITE);
+        centered_text(118, 64, RBPREP_WAVE_TOP + 105,
+                      "RATTLE", LCD_WHITE);
 }
 
 static void draw_twenty_band_eq(void)
@@ -2036,13 +2048,30 @@ static void draw_turntable(void)
     if (lamp_phase & 1)
         xlcd_drawcircle(164, RBPREP_WAVE_TOP + 20, 5);
 
-    /* Familiar direct-drive transport and three-speed selector. */
-    rb->lcd_set_foreground(LCD_RGBPACK(105, 115, 109));
-    xlcd_drawcircle(180, RBPREP_WAVE_BOTTOM - 36, 9);
-    rb->lcd_set_foreground(RBPREP_GREEN);
-    rb->lcd_drawline(180, RBPREP_WAVE_BOTTOM - 42,
-                     180, RBPREP_WAVE_BOTTOM - 36);
-    text(161, RBPREP_WAVE_BOTTOM - 27, "START", LCD_RGBPACK(125, 139, 130));
+    /* Rectangular transport in the lower-left deck corner. */
+    {
+        bool playing = (rb->audio_status() & AUDIO_STATUS_PLAY) &&
+                       !(rb->audio_status() & AUDIO_STATUS_PAUSE);
+        int button_y = RBPREP_WAVE_BOTTOM - 22;
+
+        rb->lcd_set_foreground(playing ? LCD_RGBPACK(12, 49, 29)
+                                      : LCD_RGBPACK(11, 14, 12));
+        rb->lcd_fillrect(8, button_y, 42, 17);
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        rb->lcd_drawrect(8, button_y, 42, 17);
+        rb->lcd_fillrect(8, button_y, 4, 17);
+        rb->lcd_set_foreground(LCD_WHITE);
+        if (playing) {
+            rb->lcd_fillrect(26, button_y + 4, 3, 9);
+            rb->lcd_fillrect(33, button_y + 4, 3, 9);
+        } else {
+            xlcd_filltriangle(25, button_y + 3,
+                              25, button_y + 13,
+                              36, button_y + 8);
+        }
+    }
+
+    /* Familiar three-speed selector. */
     for (point = 0; point < 3; point++) {
         int x = 158 + point * 20;
         bool selected = point == played_rpm_index;
@@ -2989,13 +3018,92 @@ static void draw_blade_shell(const char *title, int accent)
 
 static void draw_blade_selection(int y, int height, int color)
 {
+    const int left = 7;
+    const int right = LCD_WIDTH - 7;
     int radius = height / 2;
+    int center_y = y + radius;
     (void)color;
+
     rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
-    xlcd_fillcircle(16, y + radius, radius);
-    rb->lcd_fillrect(16, y, LCD_WIDTH - 16, height + 1);
+    xlcd_fillcircle(left + radius, center_y, radius);
+    xlcd_fillcircle(right - radius, center_y, radius);
+    rb->lcd_fillrect(left + radius, y,
+                     right - left - radius * 2 + 1, height + 1);
     rb->lcd_set_foreground(RBPREP_GREEN);
-    rb->lcd_vline(5, y + 2, y + height - 2);
+    rb->lcd_hline(left + radius, right - radius, y + 1);
+    rb->lcd_drawpixel(left + 2, center_y);
+    rb->lcd_drawpixel(right - 2, center_y);
+}
+
+static void draw_playlist_node_glyph(int cx, int cy, bool folder,
+                                     bool selected)
+{
+    int color = selected ? LCD_WHITE : RBPREP_GREEN;
+
+    rb->lcd_set_foreground(color);
+    if (folder) {
+        rb->lcd_fillrect(cx - 6, cy - 3, 13, 8);
+        rb->lcd_fillrect(cx - 4, cy - 5, 6, 3);
+        rb->lcd_set_foreground(selected ? LCD_RGBPACK(12, 49, 29)
+                                        : LCD_BLACK);
+        rb->lcd_hline(cx - 4, cx + 5, cy + 2);
+    } else {
+        rb->lcd_hline(cx - 6, cx - 1, cy - 4);
+        rb->lcd_hline(cx - 6, cx - 2, cy - 1);
+        rb->lcd_hline(cx - 6, cx - 3, cy + 2);
+        rb->lcd_vline(cx + 4, cy - 5, cy + 3);
+        rb->lcd_hline(cx + 1, cx + 6, cy - 5);
+        xlcd_fillcircle(cx + 1, cy + 4, 2);
+    }
+}
+
+static void draw_main_glyph(int cx, int cy, int item, bool selected)
+{
+    int color = selected ? LCD_WHITE : RBPREP_GREEN;
+
+    rb->lcd_set_foreground(color);
+    xlcd_drawcircle(cx, cy, 7);
+    if (item == 0) {
+        xlcd_drawcircle(cx, cy, 4);
+        xlcd_fillcircle(cx, cy, 1);
+    } else if (item == 1) {
+        draw_playlist_node_glyph(cx, cy, true, selected);
+    } else if (item == 2) {
+        xlcd_drawcircle(cx - 1, cy, 4);
+        xlcd_fillcircle(cx - 1, cy, 1);
+        rb->lcd_drawline(cx + 5, cy - 5, cx + 2, cy + 3);
+    } else if (item == 3) {
+        rb->lcd_vline(cx, cy - 5, cy + 4);
+        rb->lcd_drawline(cx, cy - 3, cx - 4, cy - 1);
+        rb->lcd_drawline(cx, cy, cx + 4, cy - 2);
+        rb->lcd_fillrect(cx - 5, cy - 2, 2, 2);
+        xlcd_fillcircle(cx + 4, cy - 2, 1);
+        xlcd_fillcircle(cx, cy + 5, 1);
+    } else if (item == 4) {
+        rb->lcd_vline(cx - 4, cy - 5, cy + 5);
+        rb->lcd_vline(cx, cy - 5, cy + 5);
+        rb->lcd_vline(cx + 4, cy - 5, cy + 5);
+        rb->lcd_fillrect(cx - 5, cy - 2, 3, 3);
+        rb->lcd_fillrect(cx - 1, cy + 1, 3, 3);
+        rb->lcd_fillrect(cx + 3, cy - 4, 3, 3);
+    } else if (item == 5) {
+        rb->lcd_drawline(cx - 5, cy, cx - 1, cy + 4);
+        rb->lcd_drawline(cx - 1, cy + 4, cx + 5, cy - 5);
+    } else if (item == 6) {
+        rb->lcd_hline(cx - 4, cx + 4, cy - 4);
+        rb->lcd_hline(cx - 4, cx + 4, cy);
+        rb->lcd_hline(cx - 4, cx + 4, cy + 4);
+        rb->lcd_drawpixel(cx - 6, cy - 4);
+        rb->lcd_drawpixel(cx - 6, cy);
+        rb->lcd_drawpixel(cx - 6, cy + 4);
+    } else {
+        rb->lcd_vline(cx - 4, cy - 5, cy + 5);
+        rb->lcd_hline(cx - 4, cx + 1, cy - 5);
+        rb->lcd_hline(cx - 4, cx + 1, cy + 5);
+        rb->lcd_drawline(cx - 1, cy, cx + 5, cy);
+        rb->lcd_drawline(cx + 5, cy, cx + 2, cy - 3);
+        rb->lcd_drawline(cx + 5, cy, cx + 2, cy + 3);
+    }
 }
 
 static void draw_playlist_browser(void)
@@ -3033,12 +3141,10 @@ static void draw_playlist_browser(void)
                                  ? LCD_RGBPACK(34, 105, 73)
                                  : LCD_RGBPACK(27, 78, 128));
         }
-        draw_record_badge(14, y + 7, 6,
-                          RBPREP_GREEN,
-                          ordinal == tree_selection);
-        rb->snprintf(line, sizeof(line), "%s  %s",
-                     node.kind == 0 ? "FOLDER" : "SET", name);
-        text(26, y + 2, line, LCD_WHITE);
+        draw_playlist_node_glyph(16, y + 7, node.kind == 0,
+                                 ordinal == tree_selection);
+        rb->snprintf(line, sizeof(line), "%.38s", name);
+        text(30, y + 2, line, LCD_WHITE);
         if (node.kind != 0) {
             rb->snprintf(line, sizeof(line), "%lu",
                          (unsigned long)node.member_count);
@@ -3643,12 +3749,8 @@ static void draw_settings(void)
     text(7, 20, "DECK DISPLAY", LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < 3; row++) {
         int y = 43 + row * 31;
-        if (row == settings_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
-            rb->lcd_fillrect(0, y - 3, LCD_WIDTH, 27);
-            rb->lcd_set_foreground(RBPREP_GREEN);
-            rb->lcd_fillrect(0, y - 3, 3, 27);
-        }
+        if (row == settings_selection)
+            draw_blade_selection(y - 3, 27, RBPREP_GREEN);
         text(10, y + 3, names[row], LCD_WHITE);
         rb->snprintf(line, sizeof(line), "%s", values[row]);
         text(row == 0 ? 184 : row == 1 ? 260 : 215, y + 3, line,
@@ -3700,12 +3802,8 @@ static void draw_usb_mode(void)
          LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < 2; row++) {
         int y = 55 + row * 55;
-        if (row == usb_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
-            rb->lcd_fillrect(0, y - 5, LCD_WIDTH, 45);
-            rb->lcd_set_foreground(RBPREP_GREEN);
-            rb->lcd_fillrect(0, y - 5, 4, 45);
-        }
+        if (row == usb_selection)
+            draw_blade_selection(y - 5, 45, RBPREP_GREEN);
         text(12, y, names[row], LCD_WHITE);
         text(12, y + 18, details[row], LCD_RGBPACK(135, 155, 141));
     }
@@ -3727,12 +3825,8 @@ static void draw_genre_picker(void)
         int y = 27 + row * 21;
         if (ordinal > genre_count)
             break;
-        if (ordinal == genre_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
-            rb->lcd_fillrect(0, y - 3, LCD_WIDTH, 20);
-            rb->lcd_set_foreground(RBPREP_GREEN);
-            rb->lcd_fillrect(0, y - 3, 3, 20);
-        }
+        if (ordinal == genre_selection)
+            draw_blade_selection(y - 3, 20, RBPREP_GREEN);
         if (ordinal == 0) {
             text(10, y, "+ ADD GENRE...", RBPREP_GREEN);
         } else if (genre_name_at(ordinal - 1, name, sizeof(name))) {
@@ -3751,13 +3845,6 @@ static void draw_main_menu(void)
         "COLLECTION", "PLAYLISTS", "PREP DECK", "USB MODE",
         "DECK SETTINGS", "PENDING EDITS", "INDEX STATUS",
         "EXIT TO ROCKBOX"
-    };
-    static const char *codes[] = {
-        "TRK", "PLS", "DEK", "USB", "DSP", "EDT", "IDX", "EXT"
-    };
-    static const int accents[] = {
-        RBPREP_GREEN, RBPREP_GREEN, RBPREP_GREEN, RBPREP_GREEN,
-        RBPREP_GREEN, RBPREP_GREEN, RBPREP_GREEN, RBPREP_GREEN
     };
     char line[80];
     int i;
@@ -3778,12 +3865,10 @@ static void draw_main_menu(void)
         int y = 42 + i * 23;
         bool selected = i == selection;
         if (selected) {
-            draw_blade_selection(y - 2, 20, accents[i]);
+            draw_blade_selection(y - 2, 20, RBPREP_GREEN);
         }
-        draw_record_badge(18, y + 7, 7, accents[i], selected);
-        text(34, y + 3, codes[i], selected
-             ? LCD_WHITE : accents[i]);
-        text(67, y + 3, items[i], selected ? LCD_WHITE : RBPREP_MENU_TEXT);
+        draw_main_glyph(20, y + 7, i, selected);
+        text(42, y + 3, items[i], selected ? LCD_WHITE : RBPREP_MENU_TEXT);
         if (i == 3)
             text(257, y + 3, usb_selection ? "DAC" : "DATA",
                  usb_selection ? LCD_WHITE : RBPREP_GREEN);
@@ -3815,12 +3900,8 @@ static void draw_pending_edits(void)
 
         if (visible >= pending_snapshot_count + pending_playlist_count)
             break;
-        if (visible == pending_selection) {
-            rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
-            rb->lcd_fillrect(0, y - 2, LCD_WIDTH, 19);
-            rb->lcd_set_foreground(RBPREP_GREEN);
-            rb->lcd_fillrect(0, y - 2, 3, 19);
-        }
+        if (visible == pending_selection)
+            draw_blade_selection(y - 2, 19, RBPREP_GREEN);
         if (visible < pending_snapshot_count) {
             int ordinal = pending_snapshot_count - 1 - visible;
             struct rbprep_pending_entry *entry = &pending_entries[ordinal];
@@ -5184,6 +5265,68 @@ static void handle_escape_once(void)
     force_full_redraw = true;
 }
 
+static void draw_rekordpod_boot_splash(void)
+{
+    static const int8_t dot_x[12] = {
+        18, 16, 9, 0, -9, -16, -18, -16, -9, 0, 9, 16
+    };
+    static const int8_t dot_y[12] = {
+        0, 9, 16, 18, 16, 9, 0, -9, -16, -18, -16, -9
+    };
+    const char *left_word = "rekord";
+    const char *right_word = "pod";
+    int font_id = rb->font_load("/.rockbox/fonts/15-Adobe-Helvetica.fnt");
+    int left_width;
+    int right_width;
+    int word_x;
+    int frame;
+
+    rb->lcd_set_background(LCD_BLACK);
+    rb->lcd_setfont(font_id >= 0 ? font_id : FONT_UI);
+    rb->lcd_getstringsize(left_word, &left_width, NULL);
+    rb->lcd_getstringsize(right_word, &right_width, NULL);
+    word_x = (LCD_WIDTH - left_width - right_width) / 2;
+
+    for (frame = 0; frame < 12; frame++) {
+        int progress_right = 82 + frame * 156 / 11;
+
+        rb->lcd_clear_display();
+        rb->lcd_set_foreground(LCD_RGBPACK(20, 25, 22));
+        xlcd_fillcircle(LCD_WIDTH / 2, 71, 22);
+        rb->lcd_set_foreground(LCD_RGBPACK(115, 125, 119));
+        xlcd_drawcircle(LCD_WIDTH / 2, 71, 22);
+        xlcd_drawcircle(LCD_WIDTH / 2, 71, 17);
+        xlcd_drawcircle(LCD_WIDTH / 2, 71, 12);
+        rb->lcd_set_foreground(LCD_WHITE);
+        xlcd_fillcircle(LCD_WIDTH / 2, 71, 7);
+        rb->lcd_set_foreground(LCD_RGBPACK(205, 215, 209));
+        xlcd_fillcircle(LCD_WIDTH / 2, 71, 2);
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        xlcd_fillcircle(LCD_WIDTH / 2 + dot_x[frame],
+                        71 + dot_y[frame], 2);
+
+        text(word_x, 108, left_word, LCD_WHITE);
+        text(word_x + left_width, 108, right_word, RBPREP_GREEN);
+        centered_text(0, LCD_WIDTH, 132,
+                      "DEVICE LIBRARY / PREP DECK",
+                      LCD_RGBPACK(145, 160, 150));
+
+        rb->lcd_set_foreground(LCD_RGBPACK(16, 38, 25));
+        rb->lcd_fillrect(82, 155, 156, 4);
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        rb->lcd_fillrect(82, 155, MAX(1, progress_right - 82), 4);
+        xlcd_fillcircle(82, 156, 2);
+        xlcd_fillcircle(progress_right, 156, 2);
+        rb->lcd_update();
+        rb->sleep(MAX(1, HZ / 20));
+    }
+    rb->lcd_setfont(FONT_SYSFIXED);
+    if (font_id >= 0)
+        rb->font_unload(font_id);
+    rb->lcd_clear_display();
+    rb->lcd_update();
+}
+
 enum plugin_status plugin_start(const void *parameter)
 {
     int button;
@@ -5192,7 +5335,6 @@ enum plugin_status plugin_start(const void *parameter)
     bool redraw = true;
     long frame_deadline;
 
-    (void)parameter;
     atexit(rbprep_cleanup);
 #ifdef HAS_BUTTON_HOLD
     display_locked = rb->button_hold();
@@ -5209,6 +5351,8 @@ enum plugin_status plugin_start(const void *parameter)
         rb->backlight_on();
 #endif
     rb->lcd_setfont(FONT_SYSFIXED);
+    if (parameter && !rb->strcmp((const char *)parameter, "autoboot"))
+        draw_rekordpod_boot_splash();
     mode = MODE_LIBRARY;
     selection = 0;
     playhead = 0;

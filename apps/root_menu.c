@@ -930,6 +930,24 @@ static int root_menu_setup_screens(void)
     return new_screen;
 }
 
+#if defined(IPOD_6G) && !defined(SIMULATOR)
+static void rbprep_autostart(void)
+{
+    static bool attempted;
+    const char *path = ROCKBOX_DIR "/rocks/apps/rbprep.rock";
+
+    if (attempted)
+        return;
+    attempted = true;
+
+    /* MENU is a deliberately simple recovery bypass.  Returning from RBPrep
+       continues into the normal Rockbox root menu and cannot relaunch it. */
+    if ((button_status() & BUTTON_MENU) || !file_exists(path))
+        return;
+    plugin_load(path, "autoboot");
+}
+#endif
+
 
 void root_menu(void)
 {
@@ -939,6 +957,9 @@ void root_menu(void)
 
     push_current_activity(ACTIVITY_MAINMENU);
     next_screen = root_menu_setup_screens();
+#if defined(IPOD_6G) && !defined(SIMULATOR)
+    rbprep_autostart();
+#endif
 
     while (true)
     {
