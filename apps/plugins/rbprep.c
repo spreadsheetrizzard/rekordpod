@@ -31,11 +31,12 @@
 #define RBPREP_MAX_ZOOM 128
 #define RBPREP_SEEK_DEBOUNCE MAX(1, HZ / 20)
 #define RBPREP_SEEK_SETTLE MAX(1, HZ / 10)
-#define RBPREP_PREVIEW_TICKS MAX(1, HZ / 5)
+#define RBPREP_PREVIEW_TICKS MAX(1, HZ * 4 / 25)
 #define RBPREP_OVERVIEW_TICKS MAX(1, HZ / 2)
 #define RBPREP_FRAME_TICKS MAX(1, HZ / 25)
 #define RBPREP_CONFIG_VERSION 1
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
+#define RBPREP_PLAYLIST_JOURNAL "/.rockbox/rbprep/playlist-adds.rba"
 
 enum rbprep_mode {
     MODE_LIBRARY,
@@ -50,8 +51,12 @@ enum rbprep_mode {
 
 enum rbprep_tool {
     TOOL_SEEK,
+    TOOL_SCRUB_STEP,
     TOOL_ZOOM,
     TOOL_GAIN,
+    TOOL_PLAYLIST_MODE,
+    TOOL_ADD_PLAYLIST,
+    TOOL_WAVEFORM_STYLE,
     TOOL_CUE_SLOT,
     TOOL_CUE_MOVE,
     TOOL_CUE_COLOR,
@@ -64,6 +69,16 @@ enum rbprep_tool {
     TOOL_META_COLOR,
     TOOL_META_YEAR,
     TOOL_META_GENRE
+};
+
+enum rbprep_confirm_action {
+    CONFIRM_NONE,
+    CONFIRM_EXIT,
+    CONFIRM_CUE_SET,
+    CONFIRM_CUE_DELETE,
+    CONFIRM_GRID_ORIGIN,
+    CONFIRM_KEEP_EDIT,
+    CONFIRM_ADD_PLAYLIST
 };
 
 static enum rbprep_mode mode;
@@ -99,9 +114,26 @@ static int cue_tool;
 static int grid_tool;
 static int metadata_tool;
 static int waveform_half;
-static int deleted_cue_slot = -1;
-static int deleted_cue_time;
-static unsigned char deleted_cue_color;
+static int scrub_step_index = 4;
+static bool playlist_playback;
+static bool playlist_add_mode;
+static int playing_track_row = -1;
+static bool audio_was_running;
+static bool confirm_active;
+static bool confirm_ok;
+static bool confirm_wait_release;
+static bool exit_requested;
+static enum rbprep_confirm_action confirm_action;
+static char confirm_message[64];
+static int confirm_slot;
+static int confirm_time;
+static unsigned char confirm_color;
+static int confirm_playlist_node;
+static int staged_tool = -1;
+static int staged_original;
+static bool cue_audition_active;
+static bool cue_audition_latched;
+static int cue_audition_position;
 static uint32_t vu_left;
 static uint32_t vu_right;
 static bool suppress_menu;
@@ -113,7 +145,8 @@ enum rbprep_seek_state {
     SEEK_IDLE,
     SEEK_DEBOUNCE,
     SEEK_SETTLE,
-    SEEK_PREVIEW
+    SEEK_PREVIEW,
+    SEEK_CUE_HOLD
 };
 
 static enum rbprep_seek_state seek_state;
@@ -215,10 +248,15 @@ static const char *mode_names[] = {
 };
 
 static char *waveform_styles[] = { "full", "half" };
+static const int scrub_steps[] = {
+    1, 2, 5, 10, 20, 50, 100, 250, 500, 1000
+};
 
 static const struct configdata rbprep_config[] = {
     { TYPE_ENUM, 0, 1, { .int_p = &waveform_half },
-      "waveform style", waveform_styles }
+      "waveform style", waveform_styles },
+    { TYPE_INT, 0, ARRAYLEN(scrub_steps) - 1,
+      { .int_p = &scrub_step_index }, "scrub step", NULL }
 };
 
 static const int cue_palette[] = {
@@ -484,14 +522,8 @@ static int quantized_time(int time_ms)
 
 static int scrub_step_ms(void)
 {
-    if (zoom >= 128) return 1;
-    if (zoom >= 64) return 2;
-    if (zoom >= 32) return 5;
-    if (zoom >= 16) return 10;
-    if (zoom >= 8) return 20;
-    if (zoom >= 4) return 50;
-    if (zoom >= 2) return 100;
-    return 250;
+    return scrub_steps[MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1,
+                                  scrub_step_index))];
 }
 
 static void viewport(int *first, int *span)
@@ -788,31 +820,35 @@ static void update_vu_levels(void)
 static void draw_vu_meter(void)
 {
     const int segments = 14;
-    const int gap = 2;
-    int segment_height =
-        (RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1 -
-         (segments - 1) * gap) / segments;
+    const int segment_pitch = 11;
     int lit_left = MIN(segments, (int)(vu_left * segments / 32768));
     int lit_right = MIN(segments, (int)(vu_right * segments / 32768));
     int segment;
-    int x = RBPREP_DECK_X + RBPREP_DECK_WIDTH + 2;
+    int x = RBPREP_DECK_X + RBPREP_DECK_WIDTH + 5;
 
     rb->lcd_set_foreground(LCD_RGBPACK(6, 13, 9));
     rb->lcd_fillrect(RBPREP_DECK_X + RBPREP_DECK_WIDTH + 1,
                      RBPREP_WAVE_TOP, RBPREP_VU_WIDTH,
                      RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
     for (segment = 0; segment < segments; segment++) {
-        int y = RBPREP_WAVE_BOTTOM -
-                (segment + 1) * segment_height - segment * gap + 1;
+        int y = RBPREP_WAVE_BOTTOM - segment * segment_pitch - 7;
         int active_color = segment >= 12 ? LCD_RGBPACK(255, 65, 55)
                          : segment >= 9 ? LCD_RGBPACK(255, 205, 55)
                          : LCD_RGBPACK(55, 225, 105);
         rb->lcd_set_foreground(segment < lit_left
                               ? active_color : LCD_RGBPACK(28, 39, 31));
-        rb->lcd_fillrect(x, y, 7, segment_height);
+        rb->lcd_hline(x + 2, x + 4, y);
+        rb->lcd_hline(x + 1, x + 5, y + 1);
+        rb->lcd_hline(x, x + 6, y + 2);
+        rb->lcd_hline(x + 1, x + 5, y + 3);
+        rb->lcd_hline(x + 2, x + 4, y + 4);
         rb->lcd_set_foreground(segment < lit_right
                               ? active_color : LCD_RGBPACK(28, 39, 31));
-        rb->lcd_fillrect(x + 9, y, 7, segment_height);
+        rb->lcd_hline(x + 11, x + 13, y);
+        rb->lcd_hline(x + 10, x + 14, y + 1);
+        rb->lcd_hline(x + 9, x + 15, y + 2);
+        rb->lcd_hline(x + 10, x + 14, y + 3);
+        rb->lcd_hline(x + 11, x + 13, y + 4);
     }
 }
 
@@ -827,7 +863,8 @@ static void clear_analysis(void)
     grid_offset = 0;
     grid_beat_shift = 0;
     deck_cue = -1;
-    deleted_cue_slot = -1;
+    cue_audition_active = false;
+    cue_audition_latched = false;
     for (i = 0; i < 16; i++) {
         hotcues[i] = -1;
         hotcue_colors[i] = 3;
@@ -927,6 +964,7 @@ static bool play_track_row(int row)
 {
     int index = track_index_at_row(row);
     struct rbprep_track_record track;
+    struct mp3entry *id3;
     char path[MAX_PATH];
 
     if (!read_track_record(index, &track) ||
@@ -936,6 +974,18 @@ static bool play_track_row(int row)
         rb->splashf(HZ * 2, "Missing: %s", path);
         force_full_redraw = true;
         return false;
+    }
+
+    id3 = rb->audio_current_track();
+    if (index == selected_track_index && id3 && id3->path &&
+        !rb->strcmp(id3->path, path)) {
+        playhead = clamp_playhead(id3->elapsed);
+        playing_track_row = row;
+        deck_return_mode = MODE_TRACKS;
+        mode = MODE_DECK;
+        reset_play_clock(playhead, *rb->current_tick);
+        force_full_redraw = true;
+        return true;
     }
 
     stop_editor_audio();
@@ -963,6 +1013,8 @@ static bool play_track_row(int row)
     playhead = 0;
     rb->playlist_start(0, 0, 0);
     reset_play_clock(0, *rb->current_tick);
+    playing_track_row = row;
+    audio_was_running = true;
     deck_return_mode = MODE_TRACKS;
     mode = MODE_DECK;
     force_full_redraw = true;
@@ -975,7 +1027,9 @@ static void draw_playlist_browser(void)
     char name[80];
     char line[96];
 
-    text(7, 3, "PLAYLIST TREE", LCD_RGBPACK(70, 235, 125));
+    text(7, 3, playlist_add_mode ? "ADD TO PLAYLIST" : "PLAYLIST TREE",
+         playlist_add_mode ? LCD_RGBPACK(255, 145, 40)
+                           : LCD_RGBPACK(70, 235, 125));
     if (tree_parent == RBPREP_ROOT_NODE) {
         text(112, 3, "/", LCD_LIGHTGRAY);
     } else {
@@ -1016,7 +1070,9 @@ static void draw_playlist_browser(void)
                  tree_child_count);
     text(7, 213, line, LCD_RGBPACK(70, 235, 125));
     text(70, 213, "WHEEL: BROWSE", LCD_LIGHTGRAY);
-    text(7, 226, "SELECT: OPEN     MENU: BACK", LCD_WHITE);
+    text(7, 226, playlist_add_mode
+         ? "SELECT: CHOOSE DESTINATION     MENU: CANCEL"
+         : "SELECT: OPEN     MENU: BACK", LCD_WHITE);
 }
 
 static void draw_track_browser(void)
@@ -1086,7 +1142,7 @@ static enum rbprep_tool active_tool(void)
 static int tool_count(void)
 {
     if (mode == MODE_DECK)
-        return 3;
+        return 7;
     if (mode == MODE_CUES || mode == MODE_GRID)
         return 4;
     return 4;
@@ -1106,10 +1162,33 @@ static int *tool_selection(void)
 static const char *tool_icon(enum rbprep_tool tool)
 {
     static const char *icons[] = {
-        "<>", "+", "G", "#", "M", "C", "X", "N", "B", "1",
-        "Q", "*", "C", "Y", "T"
+        "<>", "ms", "+", "G", "P", "A", "H", "#", "M", "C",
+        "X", "N", "B", "1", "Q", "*", "C", "Y", "T"
     };
     return icons[tool];
+}
+
+static const char *tool_hint(enum rbprep_tool tool)
+{
+    if (tool == TOOL_SEEK) return "WHEEL: SEEK";
+    if (tool == TOOL_SCRUB_STEP) return "WHEEL: PRECISION";
+    if (tool == TOOL_ZOOM) return "WHEEL: ZOOM";
+    if (tool == TOOL_GAIN) return "WHEEL: LEVEL";
+    if (tool == TOOL_PLAYLIST_MODE) return "SELECT: AUTO NEXT";
+    if (tool == TOOL_ADD_PLAYLIST) return "SELECT: CHOOSE LIST";
+    if (tool == TOOL_WAVEFORM_STYLE) return "SELECT: FULL/HALF";
+    if (tool == TOOL_CUE_SLOT) return "HOLD: CUE PLAY";
+    if (tool == TOOL_CUE_MOVE) return "WHEEL + HOLD: SET";
+    if (tool == TOOL_CUE_COLOR) return "WHEEL: COLOR";
+    if (tool == TOOL_CUE_DELETE) return "HOLD: DELETE";
+    if (tool == TOOL_GRID_NUDGE) return "WHEEL: NUDGE";
+    if (tool == TOOL_GRID_BPM) return "WHEEL: BPM";
+    if (tool == TOOL_GRID_ORIGIN) return "HOLD: DOWNBEAT";
+    if (tool == TOOL_GRID_QUANTIZE) return "SELECT: QUANTIZE";
+    if (tool == TOOL_META_RATING) return "WHEEL: STARS";
+    if (tool == TOOL_META_COLOR) return "WHEEL: COLOR";
+    if (tool == TOOL_META_YEAR) return "WHEEL: YEAR";
+    return "SELECT: KEYBOARD";
 }
 
 static const char *page_label(void)
@@ -1140,21 +1219,21 @@ static void draw_beat_phase(void)
         }
     }
 
-    rb->lcd_set_foreground(LCD_RGBPACK(12, 20, 15));
-    rb->lcd_fillrect(172, 1, 45, 22);
+    rb->lcd_set_foreground(LCD_RGBPACK(8, 11, 9));
+    rb->lcd_fillrect(153, 24, 130, 13);
     for (i = 0; i < 4; i++) {
-        int x = 173 + i * 11;
+        int x = 155 + i * 10;
         rb->lcd_set_foreground(i + 1 == beat
                               ? LCD_RGBPACK(70, 235, 125)
                               : LCD_RGBPACK(35, 53, 42));
-        rb->lcd_fillrect(x, 4, 9, 9);
+        rb->lcd_fillrect(x, 27, 8, 7);
         if (i + 1 == beat) {
             char number[2] = { '1' + i, '\0' };
-            text(x + 2, 3, number, LCD_BLACK);
+            text(x + 1, 25, number, LCD_BLACK);
         }
     }
     rb->snprintf(counter, sizeof(counter), "%03d.%d", bar, beat);
-    text(178, 14, counter, LCD_RGBPACK(135, 158, 142));
+    text(198, 25, counter, LCD_RGBPACK(135, 158, 142));
 }
 
 static void draw_rating_stars(int x, int y)
@@ -1180,7 +1259,7 @@ static void draw_metadata_line(void)
 {
     char line[96];
 
-    rb->lcd_set_foreground(LCD_RGBPACK(12, 20, 15));
+    rb->lcd_set_foreground(LCD_RGBPACK(8, 11, 9));
     rb->lcd_fillrect(0, 24, LCD_WIDTH, 13);
     rb->snprintf(line, sizeof(line), "%02d:%02d.%03d",
                  playhead / 60000, (playhead / 1000) % 60,
@@ -1189,11 +1268,20 @@ static void draw_metadata_line(void)
     rb->snprintf(line, sizeof(line), "%d.%02d BPM",
                  grid_bpm_x100 / 100, grid_bpm_x100 % 100);
     text(79, 25, line, LCD_RGBPACK(85, 220, 255));
-    draw_rating_stars(155, 27);
-    rb->snprintf(line, sizeof(line), "%.9s", color_labels[color_index]);
-    text(199, 25, line, cue_palette[color_index & 7]);
+    draw_beat_phase();
     text(286, 25, quantize ? "Q ON" : "Q --",
          quantize ? LCD_RGBPACK(70, 235, 125) : LCD_RGBPACK(105, 115, 108));
+}
+
+static void draw_rating_color_card(void)
+{
+    char line[16];
+
+    rb->lcd_set_foreground(LCD_RGBPACK(8, 8, 8));
+    rb->lcd_fillrect(171, 0, 48, 24);
+    draw_rating_stars(174, 4);
+    rb->snprintf(line, sizeof(line), "%.7s", color_labels[color_index]);
+    text(173, 14, line, cue_palette[color_index & 7]);
 }
 
 static void draw_tool_orbs(void)
@@ -1206,18 +1294,17 @@ static void draw_tool_orbs(void)
     rb->lcd_fillrect(0, 37, LCD_WIDTH, 21);
     text(3, 42, page_label(), LCD_RGBPACK(125, 148, 132));
     for (i = 0; i < count; i++) {
-        int cx = 52 + i * 25;
+        int cx = count > 4 ? 45 + i * 21 : 52 + i * 25;
         int color = i == selected ? LCD_RGBPACK(70, 235, 125)
                                   : LCD_RGBPACK(48, 70, 56);
         rb->lcd_set_foreground(color);
-        xlcd_fillcircle(cx, 47, i == selected ? 9 : 8);
+        xlcd_fillcircle(cx, 47, i == selected ? 8 : 7);
         text(cx - (rb->strlen(tool_icon(active_tool() - selected + i)) > 1
                    ? 6 : 3), 42,
              tool_icon(active_tool() - selected + i),
              i == selected ? LCD_BLACK : LCD_RGBPACK(195, 215, 201));
     }
-    text(180, 42, "SEL+<> TOOL", LCD_RGBPACK(82, 103, 89));
-    text(252, 42, "SEL+UD PAGE", LCD_RGBPACK(82, 103, 89));
+    text(198, 42, tool_hint(active_tool()), LCD_RGBPACK(118, 142, 125));
 }
 
 static void draw_tool_status(void)
@@ -1227,10 +1314,12 @@ static void draw_tool_status(void)
     int color = LCD_RGBPACK(70, 235, 125);
 
     rb->lcd_set_foreground(LCD_RGBPACK(10, 17, 13));
-    rb->lcd_fillrect(0, 58, LCD_WIDTH, 12);
+    rb->lcd_fillrect(0, 58, LCD_WIDTH - 25, 12);
     if (tool == TOOL_SEEK)
         rb->snprintf(line, sizeof(line), "SEEK  %dms/tick   SELECT: AUDITION",
                      scrub_step_ms());
+    else if (tool == TOOL_SCRUB_STEP)
+        rb->snprintf(line, sizeof(line), "SCRUB STEP  %dms/tick", scrub_step_ms());
     else if (tool == TOOL_ZOOM)
         rb->snprintf(line, sizeof(line), "ZOOM  %dx   WHEEL: WRAP 1-128x", zoom);
     else if (tool == TOOL_GAIN)
@@ -1238,25 +1327,31 @@ static void draw_tool_status(void)
                      rb->sound_val2phys(SOUND_VOLUME,
                                         rb->global_status->volume),
                      rb->sound_unit(SOUND_VOLUME));
-    else if (tool == TOOL_CUE_SLOT)
-        rb->snprintf(line, sizeof(line),
-                     "CUE %02d %s  SEL:AUDITION  HOLD:%s",
-                     cue_slot + 1,
-                     hotcues[cue_slot] >= 0 ? "SET" : "EMPTY",
-                     hotcues[cue_slot] >= 0 ? "REPLACE" : "CREATE");
-    else if (tool == TOOL_CUE_MOVE)
+    else if (tool == TOOL_PLAYLIST_MODE)
+        rb->snprintf(line, sizeof(line), "PLAYLIST AUTO-NEXT  %s",
+                     playlist_playback ? "ON" : "OFF");
+    else if (tool == TOOL_ADD_PLAYLIST)
+        rb->snprintf(line, sizeof(line), "ADD TRACK TO PLAYLIST");
+    else if (tool == TOOL_WAVEFORM_STYLE)
+        rb->snprintf(line, sizeof(line), "WAVEFORM  %s",
+                     waveform_half ? "HALF" : "FULL");
+    else if (tool == TOOL_CUE_SLOT) {
+        if (hotcues[cue_slot] >= 0)
+            rb->snprintf(line, sizeof(line),
+                         "CUE %02d SET  HOLD:PLAY  +PLAY:LATCH",
+                         cue_slot + 1);
+        else
+            rb->snprintf(line, sizeof(line),
+                         "CUE %02d EMPTY  HOLD:CREATE", cue_slot + 1);
+    } else if (tool == TOOL_CUE_MOVE)
         rb->snprintf(line, sizeof(line), "MOVE CUE %02d   HOLD SELECT: SET",
                      cue_slot + 1);
     else if (tool == TOOL_CUE_COLOR)
         rb->snprintf(line, sizeof(line), "CUE COLOR  %s",
                      color_labels[hotcue_colors[cue_slot] & 7]);
     else if (tool == TOOL_CUE_DELETE) {
-        if (deleted_cue_slot >= 0)
-            rb->snprintf(line, sizeof(line), "CUE %02d DELETED   SELECT: UNDO",
-                         deleted_cue_slot + 1);
-        else
-            rb->snprintf(line, sizeof(line), "DELETE CUE %02d   HOLD SELECT",
-                         cue_slot + 1);
+        rb->snprintf(line, sizeof(line), "DELETE CUE %02d   HOLD SELECT",
+                     cue_slot + 1);
         color = LCD_RGBPACK(255, 90, 70);
     } else if (tool == TOOL_GRID_NUDGE)
         rb->snprintf(line, sizeof(line), "GRID NUDGE  %+dms", grid_offset);
@@ -1279,12 +1374,33 @@ static void draw_tool_status(void)
     text(3, 59, line, color);
 }
 
+static bool cue_audio_active(void)
+{
+    return seek_state == SEEK_PREVIEW || seek_state == SEEK_CUE_HOLD;
+}
+
+static void draw_cue_lamp(void)
+{
+    int color = cue_audio_active() ? LCD_RGBPACK(255, 135, 35)
+                                   : LCD_RGBPACK(82, 87, 84);
+
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(LCD_WIDTH - 25, 58, 25, 12);
+    text(LCD_WIDTH - 23, 59, "CUE", color);
+}
+
 static void draw_top_hud(void)
 {
     char line[64];
 
-    rb->lcd_set_foreground(LCD_RGBPACK(12, 20, 15));
+    rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(0, 0, LCD_WIDTH, RBPREP_WAVE_TOP);
+    rb->lcd_set_foreground(LCD_RGBPACK(18, 18, 18));
+    rb->lcd_fillrect(0, 0, RBPREP_OVERVIEW_X, 6);
+    rb->lcd_set_foreground(LCD_RGBPACK(13, 13, 13));
+    rb->lcd_fillrect(0, 6, RBPREP_OVERVIEW_X, 7);
+    rb->lcd_set_foreground(LCD_RGBPACK(8, 8, 8));
+    rb->lcd_fillrect(0, 13, RBPREP_OVERVIEW_X, 11);
     rb->snprintf(line, sizeof(line), "%.21s", selected_title[0]
                  ? selected_title : "RBPREP");
     text(2, 2, line, LCD_WHITE);
@@ -1295,11 +1411,12 @@ static void draw_top_hud(void)
         rb->snprintf(line, sizeof(line), "%04d", track_year);
         text(145, 13, line, LCD_LIGHTGRAY);
     }
-    draw_beat_phase();
+    draw_rating_color_card();
     draw_overview_waveform();
     draw_metadata_line();
     draw_tool_orbs();
     draw_tool_status();
+    draw_cue_lamp();
 }
 
 static void draw_settings(void)
@@ -1319,11 +1436,170 @@ static void draw_settings(void)
     text(10, 216, "WHEEL/SELECT: CHANGE     MENU: BACK", LCD_WHITE);
 }
 
+static void discard_staged_edit(void)
+{
+    if (staged_tool == TOOL_CUE_COLOR) {
+        hotcue_colors[cue_slot] = staged_original;
+        overview_dirty = true;
+    } else if (staged_tool == TOOL_GRID_NUDGE) {
+        grid_offset = staged_original;
+    } else if (staged_tool == TOOL_GRID_BPM) {
+        grid_bpm_x100 = staged_original;
+    } else if (staged_tool == TOOL_GRID_QUANTIZE) {
+        quantize = staged_original;
+    } else if (staged_tool == TOOL_META_RATING) {
+        rating = staged_original;
+    } else if (staged_tool == TOOL_META_COLOR) {
+        color_index = staged_original;
+    } else if (staged_tool == TOOL_META_YEAR) {
+        track_year = staged_original;
+    }
+    staged_tool = -1;
+}
+
+static void stage_active_edit(void)
+{
+    enum rbprep_tool tool = active_tool();
+
+    if (staged_tool == tool)
+        return;
+    discard_staged_edit();
+    staged_tool = tool;
+    if (tool == TOOL_CUE_COLOR)
+        staged_original = hotcue_colors[cue_slot];
+    else if (tool == TOOL_GRID_NUDGE)
+        staged_original = grid_offset;
+    else if (tool == TOOL_GRID_BPM)
+        staged_original = grid_bpm_x100;
+    else if (tool == TOOL_GRID_QUANTIZE)
+        staged_original = quantize;
+    else if (tool == TOOL_META_RATING)
+        staged_original = rating;
+    else if (tool == TOOL_META_COLOR)
+        staged_original = color_index;
+    else if (tool == TOOL_META_YEAR)
+        staged_original = track_year;
+    else
+        staged_tool = -1;
+}
+
+static void begin_confirmation(enum rbprep_confirm_action action)
+{
+    confirm_action = action;
+    confirm_active = true;
+    confirm_ok = true;
+    confirm_wait_release = !!(rb->button_status() & BUTTON_SELECT);
+    force_full_redraw = true;
+}
+
+static bool append_playlist_journal(int node_index)
+{
+    struct rbprep_node_record node;
+    char name[80];
+    char line[160];
+    int fd;
+    int length;
+
+    if (!read_node_record(node_index, &node) ||
+        !read_index_string(node.name_offset, name, sizeof(name)))
+        return false;
+    fd = rb->open(RBPREP_PLAYLIST_JOURNAL,
+                  O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0)
+        return false;
+    length = rb->snprintf(line, sizeof(line), "%d\t%d\t%s\n",
+                          selected_track_id, node_index, name);
+    if (rb->write(fd, line, length) != length) {
+        rb->close(fd);
+        return false;
+    }
+    rb->close(fd);
+    return true;
+}
+
+static void apply_grid_origin(int origin)
+{
+    int index = nearest_beat_index(origin);
+
+    if (index >= 0) {
+        grid_offset += origin - (beat_times[index] + grid_offset);
+        grid_beat_shift = (1 - beat_numbers[index]) & 3;
+    } else {
+        grid_phase_ms = origin;
+        grid_offset = 0;
+    }
+}
+
+static void finish_confirmation(bool apply)
+{
+    enum rbprep_confirm_action action = confirm_action;
+
+    confirm_active = false;
+    confirm_action = CONFIRM_NONE;
+    if (!apply) {
+        if (action == CONFIRM_KEEP_EDIT)
+            discard_staged_edit();
+        force_full_redraw = true;
+        return;
+    }
+
+    if (action == CONFIRM_EXIT) {
+        exit_requested = true;
+    } else if (action == CONFIRM_CUE_SET) {
+        hotcues[confirm_slot] = confirm_time;
+        hotcue_colors[confirm_slot] = confirm_color;
+        cue_slot = confirm_slot;
+        playhead = confirm_time;
+        overview_dirty = true;
+    } else if (action == CONFIRM_CUE_DELETE) {
+        hotcues[confirm_slot] = -1;
+        cue_slot = confirm_slot;
+        overview_dirty = true;
+    } else if (action == CONFIRM_GRID_ORIGIN) {
+        apply_grid_origin(confirm_time);
+    } else if (action == CONFIRM_KEEP_EDIT) {
+        staged_tool = -1;
+    } else if (action == CONFIRM_ADD_PLAYLIST) {
+        if (append_playlist_journal(confirm_playlist_node)) {
+            playlist_add_mode = false;
+            mode = MODE_DECK;
+            rb->splash(HZ, "Playlist add queued");
+        } else {
+            rb->splash(HZ * 2, "Could not queue playlist add");
+        }
+    }
+    force_full_redraw = true;
+}
+
+static void draw_confirmation(void)
+{
+    const int x = 25;
+    const int y = 83;
+    const int width = LCD_WIDTH - 50;
+    const int height = 76;
+
+    rb->lcd_set_foreground(LCD_RGBPACK(4, 4, 4));
+    rb->lcd_fillrect(x, y, width, height);
+    rb->lcd_set_foreground(LCD_RGBPACK(105, 115, 108));
+    rb->lcd_drawrect(x, y, width, height);
+    text(x + 10, y + 9, "CONFIRM", LCD_RGBPACK(255, 135, 35));
+    text(x + 10, y + 29, confirm_message, LCD_WHITE);
+
+    rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(30, 34, 31)
+                                      : LCD_RGBPACK(25, 105, 175));
+    rb->lcd_fillrect(x + 12, y + 51, 72, 18);
+    text(x + 29, y + 55, "CANCEL", LCD_WHITE);
+    rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(255, 125, 30)
+                                      : LCD_RGBPACK(30, 34, 31));
+    rb->lcd_fillrect(x + width - 66, y + 51, 54, 18);
+    text(x + width - 48, y + 55, "OK", confirm_ok ? LCD_BLACK : LCD_WHITE);
+}
+
 static void draw_screen(void)
 {
     char line[80];
 
-    rb->lcd_set_background(LCD_RGBPACK(6, 10, 7));
+    rb->lcd_set_background(LCD_BLACK);
     rb->lcd_set_drawmode(DRMODE_SOLID);
     if (mode == MODE_PLAYLISTS || mode == MODE_TRACKS ||
         mode == MODE_LIBRARY || mode == MODE_SETTINGS) {
@@ -1337,7 +1613,7 @@ static void draw_screen(void)
         else {
             const char *items[] = {
                 "LIBRARY", "PLAYLISTS", "PREP DECK", "SETTINGS",
-                "PENDING EDITS", "INDEX STATUS"
+                "PENDING EDITS", "INDEX STATUS", "EXIT TO ROCKBOX"
             };
             int i;
             text(3, 3, "RB", LCD_RGBPACK(70, 235, 125));
@@ -1349,7 +1625,7 @@ static void draw_screen(void)
                 rb->snprintf(line, sizeof(line), "RBPREP INDEX NOT FOUND");
             text(10, 28, line, library_fd >= 0
                  ? LCD_RGBPACK(70, 235, 125) : LCD_RGBPACK(255, 90, 70));
-            for (i = 0; i < 6; i++) {
+            for (i = 0; i < 7; i++) {
                 if (i == selection) {
                     rb->lcd_set_foreground(LCD_RGBPACK(25, 105, 175));
                     rb->lcd_fillrect(0, 50 + i * 27, LCD_WIDTH, 25);
@@ -1357,6 +1633,8 @@ static void draw_screen(void)
                 text(10, 56 + i * 27, items[i], LCD_WHITE);
             }
         }
+        if (confirm_active)
+            draw_confirmation();
         rb->lcd_update();
         force_full_redraw = false;
         return;
@@ -1367,9 +1645,10 @@ static void draw_screen(void)
         rb->lcd_clear_display();
         draw_top_hud();
     } else {
-        draw_beat_phase();
+        draw_rating_color_card();
         draw_metadata_line();
         draw_tool_status();
+        draw_cue_lamp();
         if (overview_dirty ||
             !TIME_BEFORE(*rb->current_tick, overview_deadline)) {
             if (!TIME_BEFORE(*rb->current_tick, overview_deadline))
@@ -1383,12 +1662,14 @@ static void draw_screen(void)
         }
     }
 
-    rb->lcd_set_foreground(LCD_RGBPACK(5, 10, 7));
+    rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(RBPREP_DECK_X, RBPREP_WAVE_TOP,
                      RBPREP_DECK_WIDTH,
                      RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
     draw_waveform();
     draw_vu_meter();
+    if (confirm_active)
+        draw_confirmation();
 
     if (force_full_redraw) {
         rb->lcd_update();
@@ -1396,7 +1677,7 @@ static void draw_screen(void)
         overview_dirty = false;
         overview_deadline = *rb->current_tick + RBPREP_OVERVIEW_TICKS;
     } else {
-        rb->lcd_update_rect(172, 1, 45, 22);
+        rb->lcd_update_rect(171, 1, 48, 22);
         rb->lcd_update_rect(0, 24, LCD_WIDTH, 13);
         rb->lcd_update_rect(0, 58, LCD_WIDTH, 12);
         rb->lcd_update_rect(0, RBPREP_WAVE_TOP, LCD_WIDTH,
@@ -1443,12 +1724,19 @@ static bool update_play_clock(void)
 
 static void stop_editor_audio(void)
 {
+    bool resume;
+
     if (seek_state == SEEK_IDLE)
         return;
-    if (seek_state == SEEK_PREVIEW)
-        rb->audio_pause();
+    resume = !seek_was_paused && !cue_audition_active;
+    rb->audio_pause();
     rb->audio_ff_rewind(playhead);
+    rb->pcmbuf_fade(false, true);
     seek_state = SEEK_IDLE;
+    cue_audition_active = false;
+    cue_audition_latched = false;
+    if (resume)
+        rb->audio_resume();
     reset_play_clock(playhead, *rb->current_tick);
 }
 
@@ -1477,6 +1765,18 @@ static bool service_audio_seek(void)
 {
     long now = *rb->current_tick;
 
+    if (seek_state == SEEK_CUE_HOLD) {
+        struct mp3entry *id3 = rb->audio_current_track();
+        int position = id3 ? clamp_playhead(id3->elapsed)
+                           : clamp_playhead(play_clock_anchor +
+                             (long long)(now - play_clock_tick) * 1000 / HZ);
+        if (position != playhead) {
+            playhead = position;
+            return true;
+        }
+        return false;
+    }
+
     if (seek_state == SEEK_IDLE ||
         (TIME_BEFORE(now, seek_deadline) && now != seek_deadline))
         return false;
@@ -1488,11 +1788,23 @@ static bool service_audio_seek(void)
         seek_state = SEEK_SETTLE;
         seek_deadline = now + RBPREP_SEEK_SETTLE;
     } else if (seek_state == SEEK_SETTLE) {
-        if (seek_preview && seek_was_paused) {
+        if (seek_preview) {
+            rb->pcmbuf_fade(true, true);
             rb->audio_resume();
-            seek_state = SEEK_PREVIEW;
             seek_applied_tick = now;
-            seek_deadline = now + RBPREP_PREVIEW_TICKS;
+            reset_play_clock(seek_applied_target, now);
+            if (cue_audition_active) {
+                if (cue_audition_latched) {
+                    cue_audition_active = false;
+                    cue_audition_latched = false;
+                    seek_state = SEEK_IDLE;
+                } else {
+                    seek_state = SEEK_CUE_HOLD;
+                }
+            } else {
+                seek_state = SEEK_PREVIEW;
+                seek_deadline = now + RBPREP_PREVIEW_TICKS;
+            }
         } else if (seek_target != seek_applied_target) {
             rb->audio_ff_rewind(seek_target);
             seek_applied_target = seek_target;
@@ -1505,6 +1817,7 @@ static bool service_audio_seek(void)
         }
     } else {
         bool continue_scrub = seek_target != seek_applied_target;
+        rb->pcmbuf_fade(true, false);
         rb->audio_pause();
         rb->audio_pre_ff_rewind();
         rb->audio_ff_rewind(seek_target);
@@ -1515,6 +1828,12 @@ static bool service_audio_seek(void)
             seek_deadline = now + RBPREP_SEEK_SETTLE;
         } else {
             seek_state = SEEK_IDLE;
+            if (!seek_was_paused) {
+                rb->pcmbuf_fade(true, true);
+                rb->audio_resume();
+            } else {
+                rb->pcmbuf_fade(false, true);
+            }
             reset_play_clock(playhead, now);
         }
     }
@@ -1524,6 +1843,51 @@ static bool service_audio_seek(void)
 static void audition_playhead(void)
 {
     request_audio_seek(true);
+}
+
+static void start_cue_audition(void)
+{
+    if (hotcues[cue_slot] < 0 ||
+        !(rb->audio_status() & AUDIO_STATUS_PLAY))
+        return;
+    stop_editor_audio();
+    cue_audition_position = hotcues[cue_slot];
+    cue_audition_active = true;
+    cue_audition_latched = false;
+    playhead = cue_audition_position;
+    request_audio_seek(true);
+}
+
+static void finish_cue_audition(void)
+{
+    if (!cue_audition_active)
+        return;
+    if (cue_audition_latched) {
+        cue_audition_active = false;
+        cue_audition_latched = false;
+        seek_state = SEEK_IDLE;
+        rb->pcmbuf_fade(false, true);
+        reset_play_clock(playhead, *rb->current_tick);
+        return;
+    }
+    rb->pcmbuf_fade(true, false);
+    rb->audio_pause();
+    rb->audio_pre_ff_rewind();
+    rb->audio_ff_rewind(cue_audition_position);
+    rb->pcmbuf_fade(false, true);
+    playhead = cue_audition_position;
+    seek_state = SEEK_IDLE;
+    cue_audition_active = false;
+    reset_play_clock(playhead, *rb->current_tick);
+}
+
+static void latch_cue_audition(void)
+{
+    if (!cue_audition_active)
+        return;
+    cue_audition_latched = true;
+    if (seek_state == SEEK_CUE_HOLD)
+        finish_cue_audition();
 }
 
 static void seek_by(int delta, bool audition)
@@ -1537,10 +1901,15 @@ static void toggle_playback(void)
 {
     int status = rb->audio_status();
 
+    if (cue_audition_active) {
+        latch_cue_audition();
+        return;
+    }
     if (seek_state == SEEK_PREVIEW) {
         playhead = clamp_playhead(seek_applied_target +
             (long long)(*rb->current_tick - seek_applied_tick) * 1000 / HZ);
         seek_state = SEEK_IDLE;
+        rb->pcmbuf_fade(false, true);
         reset_play_clock(playhead, *rb->current_tick);
         return;
     }
@@ -1596,6 +1965,10 @@ static void short_select(void)
         } else if (selection == 3) {
             mode = MODE_SETTINGS;
             force_full_redraw = true;
+        } else if (selection == 6) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "EXIT TO ROCKBOX?");
+            begin_confirmation(CONFIRM_EXIT);
         } else if (selection <= 2) {
             rb->splash(HZ, "Choose a track first");
             force_full_redraw = true;
@@ -1607,6 +1980,13 @@ static void short_select(void)
             tree_selection = tree_top = 0;
             refresh_tree_children(index);
             force_full_redraw = true;
+        } else if (index >= 0 && playlist_add_mode) {
+            char name[40];
+            read_index_string(node.name_offset, name, sizeof(name));
+            confirm_playlist_node = index;
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "ADD TO %.28s?", name);
+            begin_confirmation(CONFIRM_ADD_PLAYLIST);
         } else if (index >= 0) {
             open_track_browser(index);
         }
@@ -1625,28 +2005,58 @@ static void short_select(void)
             if (deck_cue >= 0)
                 playhead = deck_cue;
             audition_playhead();
+        } else if (tool == TOOL_SCRUB_STEP) {
+            configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
+                            ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
         } else if (tool == TOOL_ZOOM) {
             zoom = 1;
+        } else if (tool == TOOL_PLAYLIST_MODE) {
+            playlist_playback = !playlist_playback;
+        } else if (tool == TOOL_ADD_PLAYLIST) {
+            if (selected_track_id >= 0) {
+                playlist_add_mode = true;
+                tree_selection = tree_top = 0;
+                refresh_tree_children(RBPREP_ROOT_NODE);
+                mode = MODE_PLAYLISTS;
+                force_full_redraw = true;
+            }
+        } else if (tool == TOOL_WAVEFORM_STYLE) {
+            waveform_half = !waveform_half;
+            rebuild_waveform_height_lut();
+            configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
+                            ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
+            force_full_redraw = true;
         }
     } else if (mode == MODE_CUES) {
         enum rbprep_tool tool = active_tool();
-        if (tool == TOOL_CUE_DELETE && deleted_cue_slot >= 0) {
-            hotcues[deleted_cue_slot] = deleted_cue_time;
-            hotcue_colors[deleted_cue_slot] = deleted_cue_color;
-            cue_slot = deleted_cue_slot;
-            deleted_cue_slot = -1;
-            overview_dirty = true;
-        } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE) {
-            if (hotcues[cue_slot] >= 0)
-                playhead = hotcues[cue_slot];
+        if (tool == TOOL_CUE_MOVE && hotcues[cue_slot] >= 0) {
+            playhead = hotcues[cue_slot];
             audition_playhead();
+        } else if (tool == TOOL_CUE_COLOR && staged_tool == tool) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "KEEP CUE COLOR?");
+            begin_confirmation(CONFIRM_KEEP_EDIT);
         }
     } else if (mode == MODE_GRID) {
-        if (active_tool() == TOOL_GRID_QUANTIZE)
+        enum rbprep_tool tool = active_tool();
+        if (tool == TOOL_GRID_QUANTIZE && staged_tool != tool) {
+            stage_active_edit();
             quantize = !quantize;
+        }
+        if (staged_tool == tool) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "KEEP GRID CHANGE?");
+            begin_confirmation(CONFIRM_KEEP_EDIT);
+        }
     } else if (mode == MODE_METADATA) {
-        if (active_tool() == TOOL_META_GENRE)
+        enum rbprep_tool tool = active_tool();
+        if (tool == TOOL_META_GENRE) {
             rb->splash(HZ, "Genre keyboard: next pass");
+        } else if (staged_tool == tool) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "KEEP METADATA CHANGE?");
+            begin_confirmation(CONFIRM_KEEP_EDIT);
+        }
     }
 }
 
@@ -1661,29 +2071,27 @@ static void long_select(void)
         enum rbprep_tool tool = active_tool();
         if (tool == TOOL_CUE_DELETE) {
             if (hotcues[cue_slot] >= 0) {
-                deleted_cue_slot = cue_slot;
-                deleted_cue_time = hotcues[cue_slot];
-                deleted_cue_color = hotcue_colors[cue_slot];
-                hotcues[cue_slot] = -1;
-                overview_dirty = true;
+                confirm_slot = cue_slot;
+                rb->snprintf(confirm_message, sizeof(confirm_message),
+                             "DELETE CUE %02d?", cue_slot + 1);
+                begin_confirmation(CONFIRM_CUE_DELETE);
             }
         } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE) {
-            hotcues[cue_slot] = quantized_time(playhead);
-            hotcue_colors[cue_slot] = color_index;
-            playhead = hotcues[cue_slot];
-            deleted_cue_slot = -1;
-            overview_dirty = true;
+            confirm_slot = cue_slot;
+            confirm_time = quantized_time(playhead);
+            confirm_color = color_index;
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "%s CUE %02d @ %dms?",
+                         hotcues[cue_slot] >= 0 ? "REPLACE" : "CREATE",
+                         cue_slot + 1, confirm_time);
+            begin_confirmation(CONFIRM_CUE_SET);
         }
     } else if (mode == MODE_GRID) {
         if (active_tool() == TOOL_GRID_ORIGIN) {
-            int index = nearest_beat_index(playhead);
-            if (index >= 0) {
-                grid_offset += playhead - (beat_times[index] + grid_offset);
-                grid_beat_shift = (1 - beat_numbers[index]) & 3;
-            } else {
-                grid_phase_ms = playhead;
-                grid_offset = 0;
-            }
+            confirm_time = playhead;
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "SET DOWNBEAT @ %dms?", playhead);
+            begin_confirmation(CONFIRM_GRID_ORIGIN);
         }
     }
 }
@@ -1701,6 +2109,8 @@ static void change_tool(bool next)
     int *selected = tool_selection();
     int count = tool_count();
 
+    discard_staged_edit();
+    finish_cue_audition();
     *selected = (*selected + (next ? 1 : count - 1)) % count;
     force_full_redraw = true;
 }
@@ -1722,30 +2132,53 @@ static void adjust_active_tool(int direction)
     if (tool == TOOL_SEEK || tool == TOOL_CUE_MOVE ||
         tool == TOOL_GRID_ORIGIN)
         seek_by(direction * scrub_step_ms(), true);
+    else if (tool == TOOL_SCRUB_STEP) {
+        scrub_step_index = (scrub_step_index +
+            (direction > 0 ? 1 : ARRAYLEN(scrub_steps) - 1)) %
+            ARRAYLEN(scrub_steps);
+        configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
+                        ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
+    }
     else if (tool == TOOL_ZOOM)
         change_zoom(direction > 0);
     else if (tool == TOOL_GAIN)
         change_volume(direction);
+    else if (tool == TOOL_PLAYLIST_MODE)
+        playlist_playback = direction > 0;
+    else if (tool == TOOL_WAVEFORM_STYLE) {
+        waveform_half = direction > 0;
+        rebuild_waveform_height_lut();
+        configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
+                        ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
+        force_full_redraw = true;
+    }
     else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_DELETE)
         cue_slot = (cue_slot + (direction > 0 ? 1 : 15)) & 15;
     else if (tool == TOOL_CUE_COLOR) {
+        stage_active_edit();
         hotcue_colors[cue_slot] =
             (hotcue_colors[cue_slot] + (direction > 0 ? 1 : 7)) & 7;
-        color_index = hotcue_colors[cue_slot];
         overview_dirty = true;
-    } else if (tool == TOOL_GRID_NUDGE)
+    } else if (tool == TOOL_GRID_NUDGE) {
+        stage_active_edit();
         grid_offset += direction;
-    else if (tool == TOOL_GRID_BPM)
+    } else if (tool == TOOL_GRID_BPM) {
+        stage_active_edit();
         grid_bpm_x100 = MAX(3000, MIN(30000,
                                      grid_bpm_x100 + direction));
-    else if (tool == TOOL_GRID_QUANTIZE)
+    } else if (tool == TOOL_GRID_QUANTIZE) {
+        stage_active_edit();
         quantize = direction > 0;
-    else if (tool == TOOL_META_RATING)
+    } else if (tool == TOOL_META_RATING) {
+        stage_active_edit();
         rating = MAX(0, MIN(5, rating + direction));
-    else if (tool == TOOL_META_COLOR)
+    } else if (tool == TOOL_META_COLOR) {
+        stage_active_edit();
         color_index = (color_index + (direction > 0 ? 1 : 7)) & 7;
-    else if (tool == TOOL_META_YEAR)
+    } else if (tool == TOOL_META_YEAR) {
+        stage_active_edit();
         track_year = MAX(0, MIN(9999, track_year + direction));
+    }
 }
 
 static void adjust_active_tool_coarse(int direction)
@@ -1759,15 +2192,41 @@ static void adjust_active_tool_coarse(int direction)
         int i;
         for (i = 0; i < 5; i++)
             change_volume(direction);
-    } else if (tool == TOOL_GRID_NUDGE)
+    } else if (tool == TOOL_GRID_NUDGE) {
+        stage_active_edit();
         grid_offset += direction * 10;
-    else if (tool == TOOL_GRID_BPM)
+    } else if (tool == TOOL_GRID_BPM) {
+        stage_active_edit();
         grid_bpm_x100 = MAX(3000, MIN(30000,
                                      grid_bpm_x100 + direction * 100));
-    else if (tool == TOOL_META_YEAR)
+    } else if (tool == TOOL_META_YEAR) {
+        stage_active_edit();
         track_year = MAX(0, MIN(9999, track_year + direction * 10));
+    }
     else
         adjust_active_tool(direction);
+}
+
+static bool service_playlist_playback(void)
+{
+    bool loaded = !!(rb->audio_status() & AUDIO_STATUS_PLAY);
+    bool finished = playlist_playback && audio_was_running && !loaded &&
+                    seek_state == SEEK_IDLE && playing_track_row >= 0 &&
+                    playhead >= MAX(0, track_length - 3000);
+
+    audio_was_running = loaded;
+    if (!finished)
+        return false;
+    if (playing_track_row + 1 >= track_row_count) {
+        rb->splash(HZ, "End of playlist");
+        force_full_redraw = true;
+        return true;
+    }
+
+    track_selection = playing_track_row + 1;
+    if (track_selection >= track_top + RBPREP_LIST_ROWS)
+        track_top = track_selection - RBPREP_LIST_ROWS + 1;
+    return play_track_row(track_selection);
 }
 
 enum plugin_status plugin_start(const void *parameter)
@@ -1806,6 +2265,15 @@ enum plugin_status plugin_start(const void *parameter)
     color_index = 0;
     track_year = 0;
     quantize = true;
+    playlist_playback = false;
+    playlist_add_mode = false;
+    playing_track_row = -1;
+    audio_was_running = !!(rb->audio_status() & AUDIO_STATUS_PLAY);
+    confirm_active = false;
+    exit_requested = false;
+    staged_tool = -1;
+    cue_audition_active = false;
+    cue_audition_latched = false;
     overview_playhead_white = true;
     seek_state = SEEK_IDLE;
     suppress_menu = suppress_play = false;
@@ -1816,6 +2284,8 @@ enum plugin_status plugin_start(const void *parameter)
     configfile_load(RBPREP_CONFIG_FILE, rbprep_config,
                     ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
     waveform_half = !!waveform_half;
+    scrub_step_index = MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1,
+                                  scrub_step_index));
     rebuild_waveform_height_lut();
     clear_analysis();
     open_library_index();
@@ -1838,6 +2308,14 @@ enum plugin_status plugin_start(const void *parameter)
             redraw = true;
         if (update_play_clock())
             redraw = true;
+        if (service_playlist_playback())
+            redraw = true;
+        if (exit_requested) {
+            stop_editor_audio();
+            if (library_fd >= 0)
+                rb->close(library_fd);
+            return PLUGIN_OK;
+        }
 
         if (mode >= MODE_DECK && !display_locked && !redraw &&
             !TIME_BEFORE(*rb->current_tick, overview_deadline)) {
@@ -1859,14 +2337,48 @@ enum plugin_status plugin_start(const void *parameter)
         button = rb->button_get_w_tmo(1);
         if (button != BUTTON_NONE)
             redraw = true;
+        if (confirm_active) {
+            if (confirm_wait_release) {
+                if (!(rb->button_status() & BUTTON_SELECT))
+                    confirm_wait_release = false;
+                continue;
+            }
+            if (button == BUTTON_LEFT || button == BUTTON_SCROLL_BACK ||
+                button == (BUTTON_SCROLL_BACK | BUTTON_REPEAT)) {
+                confirm_ok = false;
+                force_full_redraw = true;
+            } else if (button == BUTTON_RIGHT ||
+                       button == BUTTON_SCROLL_FWD ||
+                       button == (BUTTON_SCROLL_FWD | BUTTON_REPEAT)) {
+                confirm_ok = true;
+                force_full_redraw = true;
+            } else if (button == (BUTTON_MENU | BUTTON_REL)) {
+                finish_confirmation(false);
+            } else if (button == (BUTTON_SELECT | BUTTON_REL)) {
+                finish_confirmation(confirm_ok);
+            } else if (rb->default_event_handler(button) ==
+                       SYS_USB_CONNECTED) {
+                stop_editor_audio();
+                if (library_fd >= 0)
+                    rb->close(library_fd);
+                return PLUGIN_USB_CONNECTED;
+            }
+            continue;
+        }
         switch (button) {
         case BUTTON_MENU:
             if (!suppress_menu)
                 pressed = button;
             break;
         case BUTTON_PLAY:
-            if (!suppress_play)
+            if (cue_audition_active &&
+                (rb->button_status() & BUTTON_SELECT)) {
+                select_hold_fired = true;
+                suppress_play = true;
+                latch_cue_audition();
+            } else if (!suppress_play) {
                 pressed = button;
+            }
             break;
         case BUTTON_SELECT:
             select_hold_fired = false;
@@ -1884,6 +2396,8 @@ enum plugin_status plugin_start(const void *parameter)
                 change_tool(true);
             } else if (mode >= MODE_DECK &&
                        (rb->button_status() & BUTTON_MENU)) {
+                discard_staged_edit();
+                finish_cue_audition();
                 select_hold_fired = true;
                 pressed = BUTTON_NONE;
                 suppress_menu = true;
@@ -1891,11 +2405,19 @@ enum plugin_status plugin_start(const void *parameter)
                 force_full_redraw = true;
             } else if (mode >= MODE_DECK &&
                        (rb->button_status() & BUTTON_PLAY)) {
+                discard_staged_edit();
+                finish_cue_audition();
                 select_hold_fired = true;
                 pressed = BUTTON_NONE;
                 suppress_play = true;
                 mode = next_mode(mode);
                 force_full_redraw = true;
+            } else if (mode == MODE_CUES &&
+                       active_tool() == TOOL_CUE_SLOT &&
+                       hotcues[cue_slot] >= 0) {
+                pressed = BUTTON_SELECT;
+                select_hold_fired = true;
+                start_cue_audition();
             } else {
                 pressed = BUTTON_SELECT;
             }
@@ -1909,13 +2431,11 @@ enum plugin_status plugin_start(const void *parameter)
             if (pressed != BUTTON_MENU)
                 break;
             pressed = BUTTON_NONE;
+            discard_staged_edit();
             stop_editor_audio();
             if (mode == MODE_LIBRARY) {
-                if (library_fd >= 0)
-                    rb->close(library_fd);
-                return PLUGIN_OK;
-            }
-            if (mode == MODE_SETTINGS) {
+                force_full_redraw = true;
+            } else if (mode == MODE_SETTINGS) {
                 mode = MODE_LIBRARY;
             } else if (mode == MODE_PLAYLISTS &&
                        tree_parent != RBPREP_ROOT_NODE) {
@@ -1925,6 +2445,9 @@ enum plugin_status plugin_start(const void *parameter)
                 else
                     refresh_tree_children(RBPREP_ROOT_NODE);
                 tree_selection = tree_top = 0;
+            } else if (mode == MODE_PLAYLISTS && playlist_add_mode) {
+                playlist_add_mode = false;
+                mode = MODE_DECK;
             } else if (mode == MODE_TRACKS && active_playlist_node >= 0) {
                 mode = MODE_PLAYLISTS;
             } else if (mode >= MODE_DECK &&
@@ -1950,7 +2473,9 @@ enum plugin_status plugin_start(const void *parameter)
             if (pressed != BUTTON_SELECT)
                 break;
             pressed = BUTTON_NONE;
-            if (!select_hold_fired)
+            if (cue_audition_active)
+                finish_cue_audition();
+            else if (!select_hold_fired)
                 short_select();
             select_hold_fired = false;
             break;
@@ -1981,6 +2506,8 @@ enum plugin_status plugin_start(const void *parameter)
         case BUTTON_SELECT | BUTTON_MENU:
         case BUTTON_SELECT | BUTTON_MENU | BUTTON_REPEAT:
             if (!select_hold_fired && mode >= MODE_DECK) {
+                discard_staged_edit();
+                finish_cue_audition();
                 select_hold_fired = true;
                 pressed = BUTTON_NONE;
                 suppress_menu = true;
@@ -1990,7 +2517,13 @@ enum plugin_status plugin_start(const void *parameter)
             break;
         case BUTTON_SELECT | BUTTON_PLAY:
         case BUTTON_SELECT | BUTTON_PLAY | BUTTON_REPEAT:
-            if (!select_hold_fired && mode >= MODE_DECK) {
+            if (cue_audition_active) {
+                select_hold_fired = true;
+                pressed = BUTTON_NONE;
+                suppress_play = true;
+                latch_cue_audition();
+            } else if (!select_hold_fired && mode >= MODE_DECK) {
+                discard_staged_edit();
                 select_hold_fired = true;
                 pressed = BUTTON_NONE;
                 suppress_play = true;
@@ -2017,7 +2550,7 @@ enum plugin_status plugin_start(const void *parameter)
         case BUTTON_SCROLL_FWD:
         case BUTTON_SCROLL_FWD | BUTTON_REPEAT:
             if (mode == MODE_LIBRARY)
-                selection = MIN(5, selection + 1);
+                selection = MIN(6, selection + 1);
             else if (mode == MODE_PLAYLISTS && tree_child_count > 0) {
                 tree_selection = MIN(tree_child_count - 1,
                                      tree_selection + 1);
