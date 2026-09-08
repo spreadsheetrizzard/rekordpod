@@ -7,10 +7,16 @@
 #define RBPREP_PDB "/PIONEER/rekordbox/export.pdb"
 #define RBPREP_WAVEFORM "/.rockbox/rbprep/waveform.rgb"
 #define RBPREP_POINTS 32768
+#define RBPREP_BEATS 2048
+#define RBPREP_HUD_WIDTH 40
+#define RBPREP_DECK_X (RBPREP_HUD_WIDTH + 2)
+#define RBPREP_DECK_WIDTH (LCD_WIDTH - RBPREP_DECK_X)
 #define RBPREP_WAVE_TOP 20
 #define RBPREP_WAVE_BOTTOM 209
 #define RBPREP_MAX_ZOOM 128
-#define RBPREP_PREVIEW_TICKS MAX(1, HZ / 6)
+#define RBPREP_SEEK_DEBOUNCE MAX(1, HZ / 20)
+#define RBPREP_SEEK_SETTLE MAX(1, HZ / 10)
+#define RBPREP_PREVIEW_TICKS MAX(1, HZ / 5)
 
 enum rbprep_mode {
     MODE_LIBRARY,
@@ -25,10 +31,15 @@ static int selection;
 static int playhead;
 static unsigned char waveform[RBPREP_POINTS][4];
 static int waveform_points;
+static int waveform_hz = 150;
+static int beat_times[RBPREP_BEATS];
+static unsigned char beat_numbers[RBPREP_BEATS];
+static int beat_count;
 static int zoom = 1;
 static int grid_offset;
 static int grid_phase_ms = 26;
 static int grid_bpm_x100 = 15000;
+static int grid_beat_shift;
 static int cue_slot;
 static int deck_cue = -1;
 static int hotcues[16];
@@ -37,8 +48,27 @@ static int rating;
 static int color_index;
 static int track_length = 240000;
 static bool quantize = true;
-static bool scrub_preview_active;
-static long scrub_preview_deadline;
+static bool force_full_redraw = true;
+static bool suppress_menu;
+static bool suppress_play;
+static bool suppress_left;
+static bool suppress_right;
+
+enum rbprep_seek_state {
+    SEEK_IDLE,
+    SEEK_DEBOUNCE,
+    SEEK_SETTLE,
+    SEEK_PREVIEW
+};
+
+static enum rbprep_seek_state seek_state;
+static bool seek_preview;
+static bool seek_was_paused;
+static int seek_target;
+static long seek_deadline;
+static long seek_applied_tick;
+static int play_clock_anchor;
+static long play_clock_tick;
 
 static const char *color_labels[] = {
     "SAMPLE", "OPENER", "BUILDER", "PIVOTER",
@@ -78,15 +108,49 @@ static int beat_period_ms(void)
     return MAX(1, 6000000 / grid_bpm_x100);
 }
 
+static int adjusted_beat_number(int index)
+{
+    return ((beat_numbers[index] - 1 + grid_beat_shift) & 3) + 1;
+}
+
+static int nearest_beat_index(int time_ms)
+{
+    int low = 0;
+    int high = beat_count;
+    int target = time_ms - grid_offset;
+
+    if (beat_count <= 0)
+        return -1;
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+        if (beat_times[middle] < target)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    if (low <= 0)
+        return 0;
+    if (low >= beat_count)
+        return beat_count - 1;
+    if (target - beat_times[low - 1] <= beat_times[low] - target)
+        return low - 1;
+    return low;
+}
+
 static int quantized_time(int time_ms)
 {
     long long delta;
     long long beat;
+    int index;
     int period;
     int base;
 
     if (!quantize)
         return clamp_playhead(time_ms);
+
+    index = nearest_beat_index(time_ms);
+    if (index >= 0)
+        return clamp_playhead(beat_times[index] + grid_offset);
 
     period = beat_period_ms();
     base = grid_phase_ms + grid_offset;
@@ -121,7 +185,7 @@ static void viewport(int *first, int *span)
     }
 
     *span = MAX(1, waveform_points / zoom);
-    center = (long long)playhead * waveform_points / MAX(1, track_length);
+    center = (long long)playhead * waveform_hz / 1000;
     *first = zoom == 1 ? 0 : center - *span / 2;
 }
 
@@ -131,59 +195,73 @@ static int time_to_x(int time_ms, int first, int span)
 
     if (waveform_points <= 0 || track_length <= 0)
         return -1;
-    sample = (long long)time_ms * waveform_points / track_length;
-    return (sample - first) * LCD_WIDTH / span;
+    sample = (long long)time_ms * waveform_hz / 1000;
+    return RBPREP_DECK_X +
+           (sample - first) * RBPREP_DECK_WIDTH / span;
 }
 
 static void draw_beatgrid(int first, int span)
 {
     long long view_start;
     long long view_end;
-    long long delta;
-    long long beat;
-    long long time_ms;
     int period = beat_period_ms();
     int base = grid_phase_ms + grid_offset;
     int pixels_per_beat;
     int stride = 1;
+    int i;
 
     if (waveform_points <= 0)
         return;
 
-    view_start = MAX(0, (long long)first * track_length / waveform_points);
+    view_start = MAX(0, (long long)first * 1000 / waveform_hz);
     view_end = MIN(track_length,
-                   (long long)(first + span) * track_length /
-                   waveform_points);
-    pixels_per_beat = (long long)period * LCD_WIDTH /
+                   (long long)(first + span) * 1000 / waveform_hz);
+    pixels_per_beat = (long long)period * RBPREP_DECK_WIDTH /
                       MAX(1, view_end - view_start);
+
+    if (beat_count > 0) {
+        for (i = 0; i < beat_count; i++) {
+            int time_ms = beat_times[i] + grid_offset;
+            int number = adjusted_beat_number(i);
+            int x;
+
+            if (time_ms < view_start)
+                continue;
+            if (time_ms > view_end)
+                break;
+            if (pixels_per_beat < 3 && number != 1)
+                continue;
+            if (pixels_per_beat * 4 < 3 &&
+                number == 1 && ((i / 4) & 3))
+                continue;
+            x = time_to_x(time_ms, first, span);
+            if (x >= RBPREP_DECK_X && x < LCD_WIDTH) {
+                rb->lcd_set_foreground(number == 1
+                    ? LCD_RGBPACK(235, 235, 235)
+                    : LCD_RGBPACK(85, 105, 90));
+                rb->lcd_vline(x, RBPREP_WAVE_TOP,
+                              RBPREP_WAVE_BOTTOM);
+            }
+        }
+        return;
+    }
+
     if (pixels_per_beat < 3)
         stride = 4;
     if (pixels_per_beat * 4 < 3)
         stride = 16;
-
-    delta = view_start - base;
-    beat = delta / period;
-    if (delta < 0 && delta % period)
-        beat--;
-    while (beat % stride)
-        beat++;
-    time_ms = base + beat * period;
-    while (time_ms < view_start) {
-        beat += stride;
-        time_ms += period * stride;
-    }
-
-    while (time_ms <= view_end) {
-        int x = time_to_x(time_ms, first, span);
-        bool downbeat = (beat % 4) == 0;
+    for (i = 0; base + i * period <= view_end; i += stride) {
+        int time_ms = base + i * period;
+        int x;
+        if (time_ms < view_start)
+            continue;
+        x = time_to_x(time_ms, first, span);
         if (x >= 0 && x < LCD_WIDTH) {
-            rb->lcd_set_foreground(downbeat
+            rb->lcd_set_foreground((i & 3) == 0
                 ? LCD_RGBPACK(235, 235, 235)
                 : LCD_RGBPACK(85, 105, 90));
             rb->lcd_vline(x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
         }
-        beat += stride;
-        time_ms += period * stride;
     }
 }
 
@@ -201,11 +279,11 @@ static void draw_cues(int first, int span)
         if (hotcues[i] < 0)
             continue;
         x = time_to_x(hotcues[i], first, span);
-        if (x < 0 || x >= LCD_WIDTH)
+        if (x < RBPREP_DECK_X || x >= LCD_WIDTH)
             continue;
 
         color = cue_palette[hotcue_colors[i] & 7];
-        box_x = MAX(0, MIN(LCD_WIDTH - 11, x - 5));
+        box_x = MAX(RBPREP_DECK_X, MIN(LCD_WIDTH - 11, x - 5));
         box_y = RBPREP_WAVE_TOP + 3 + (i & 1) * 12;
         rb->lcd_set_foreground(color);
         rb->lcd_vline(x, box_y + 10, RBPREP_WAVE_BOTTOM);
@@ -225,7 +303,7 @@ static void draw_waveform(void)
     int max_height = (RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP) / 2 - 2;
 
     viewport(&first, &span);
-    for (x = 0; x < LCD_WIDTH; x++) {
+    for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
         int begin;
         int end;
         int index;
@@ -233,18 +311,19 @@ static void draw_waveform(void)
         int peak;
         int height;
         int color;
+        int screen_x = RBPREP_DECK_X + x;
 
         if (waveform_points <= 0) {
             rb->lcd_set_foreground(LCD_DARKGRAY);
-            rb->lcd_vline(x, mid - 3, mid + 3);
+            rb->lcd_vline(screen_x, mid - 3, mid + 3);
             continue;
         }
 
-        begin = first + (long long)x * span / LCD_WIDTH;
-        end = first + (long long)(x + 1) * span / LCD_WIDTH;
+        begin = first + (long long)x * span / RBPREP_DECK_WIDTH;
+        end = first + (long long)(x + 1) * span / RBPREP_DECK_WIDTH;
         if (end <= 0 || begin >= waveform_points) {
             rb->lcd_set_foreground(LCD_RGBPACK(15, 23, 17));
-            rb->lcd_vline(x, mid - 1, mid + 1);
+            rb->lcd_vline(screen_x, mid - 1, mid + 1);
             continue;
         }
         begin = MAX(0, begin);
@@ -265,13 +344,13 @@ static void draw_waveform(void)
                             waveform[peak_index][2],
                             waveform[peak_index][3]);
         rb->lcd_set_foreground(color);
-        rb->lcd_vline(x, mid - height, mid + height);
+        rb->lcd_vline(screen_x, mid - height, mid + height);
     }
 
     draw_beatgrid(first, span);
     draw_cues(first, span);
     rb->lcd_set_foreground(LCD_RGBPACK(255, 45, 45));
-    x = MAX(0, MIN(LCD_WIDTH - 1,
+    x = MAX(RBPREP_DECK_X, MIN(LCD_WIDTH - 1,
                    time_to_x(playhead, first, span)));
     rb->lcd_vline(x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
 }
@@ -281,8 +360,10 @@ static void load_waveform(void)
     int fd;
     int count;
     int cue_count;
+    int declared_beat_count = 0;
+    int extra_size;
     unsigned char header[16];
-    unsigned char extension[4];
+    unsigned char extension[12];
 
     waveform_points = 0;
     fd = rb->open(RBPREP_WAVEFORM, O_RDONLY);
@@ -298,41 +379,88 @@ static void load_waveform(void)
         grid_bpm_x100 = header[12] | (header[13] << 8);
         color_index = header[14] & 7;
         rating = MIN(5, header[15]);
-        if (header[7] >= 20 &&
-            rb->read(fd, extension, sizeof(extension)) == sizeof(extension)) {
+        rb->memset(extension, 0, sizeof(extension));
+        extra_size = MAX(0, MIN((int)sizeof(extension), header[7] - 16));
+        if (extra_size > 0 &&
+            rb->read(fd, extension, extra_size) != extra_size) {
+            rb->close(fd);
+            return;
+        }
+        if (extra_size >= 4) {
             grid_phase_ms = extension[0] | (extension[1] << 8) |
                             (extension[2] << 16) | (extension[3] << 24);
+        }
+        if (extra_size >= 8) {
+            declared_beat_count = extension[4] | (extension[5] << 8);
+            waveform_hz = extension[6] | (extension[7] << 8);
+            waveform_hz = MAX(1, waveform_hz);
         }
 
         count = MIN(count, RBPREP_POINTS);
         if (rb->read(fd, waveform, count * 4) == count * 4) {
             waveform_points = count;
-            for (count = 0; count < cue_count && count < 16; count++) {
+            for (count = 0; count < cue_count; count++) {
                 unsigned char cue[8];
                 int slot;
                 if (rb->read(fd, cue, 8) != 8)
                     break;
                 slot = cue[5];
-                if (slot > 0 && slot <= 16) {
+                if (count < 16 && slot > 0 && slot <= 16) {
                     hotcues[slot - 1] = cue[0] | (cue[1] << 8) |
                                          (cue[2] << 16) | (cue[3] << 24);
                     hotcue_colors[slot - 1] = cue[4] & 7;
                 }
+            }
+            beat_count = MIN(declared_beat_count, RBPREP_BEATS);
+            for (count = 0; count < beat_count; count++) {
+                unsigned char beat[8];
+                if (rb->read(fd, beat, sizeof(beat)) != sizeof(beat)) {
+                    beat_count = count;
+                    break;
+                }
+                beat_times[count] = beat[0] | (beat[1] << 8) |
+                                    (beat[2] << 16) | (beat[3] << 24);
+                beat_numbers[count] = MAX(1, MIN(4, beat[4]));
             }
         }
     }
     rb->close(fd);
 }
 
+static void draw_hud(void)
+{
+    static const char *labels[] = { "PLY", "CUE", "GRD", "TAG" };
+    static const enum rbprep_mode modes[] = {
+        MODE_DECK, MODE_CUES, MODE_GRID, MODE_METADATA
+    };
+    int i;
+
+    rb->lcd_set_foreground(LCD_RGBPACK(10, 17, 13));
+    rb->lcd_fillrect(0, RBPREP_WAVE_TOP, RBPREP_HUD_WIDTH,
+                     RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
+    for (i = 0; i < 4; i++) {
+        int y = 29 + i * 35;
+        if (mode == modes[i]) {
+            rb->lcd_set_foreground(LCD_RGBPACK(36, 126, 76));
+            rb->lcd_fillrect(2, y - 5, 36, 25);
+            text(8, y + 1, labels[i], LCD_WHITE);
+        } else {
+            text(8, y + 1, labels[i], LCD_RGBPACK(105, 125, 112));
+        }
+    }
+    rb->lcd_set_foreground(quantize ? LCD_RGBPACK(65, 225, 115)
+                                    : LCD_RGBPACK(75, 85, 78));
+    rb->lcd_drawrect(4, 174, 32, 22);
+    text(8, 180, quantize ? "Q ON" : "Q --",
+         quantize ? LCD_RGBPACK(65, 225, 115) : LCD_RGBPACK(105, 115, 108));
+    rb->lcd_set_foreground(LCD_RGBPACK(42, 62, 49));
+    rb->lcd_vline(RBPREP_HUD_WIDTH, RBPREP_WAVE_TOP,
+                  RBPREP_WAVE_BOTTOM);
+}
+
 static void draw_screen(void)
 {
     char line[80];
-    struct mp3entry *id3 = rb->audio_current_track();
-    int status = rb->audio_status();
-
-    if (id3 && (status & AUDIO_STATUS_PLAY) &&
-        !(status & AUDIO_STATUS_PAUSE) && !scrub_preview_active)
-        playhead = clamp_playhead(id3->elapsed);
 
     rb->lcd_set_background(LCD_RGBPACK(6, 10, 7));
     rb->lcd_clear_display();
@@ -340,9 +468,11 @@ static void draw_screen(void)
     rb->lcd_set_foreground(LCD_RGBPACK(18, 27, 20));
     rb->lcd_fillrect(0, 0, LCD_WIDTH, RBPREP_WAVE_TOP);
     text(3, 3, "RB", LCD_RGBPACK(70, 235, 125));
-    text(23, 3, mode_names[mode], LCD_WHITE);
+    text(mode == MODE_LIBRARY ? 23 : RBPREP_DECK_X, 3,
+         mode_names[mode], LCD_WHITE);
     rb->snprintf(line, sizeof(line), "Q %s", quantize ? "ON" : "OFF");
-    text(279, 3, line, quantize ? LCD_RGBPACK(70, 235, 125) : LCD_LIGHTGRAY);
+    text(281, 3, line, quantize ? LCD_RGBPACK(70, 235, 125)
+                                : LCD_LIGHTGRAY);
 
     if (mode == MODE_LIBRARY) {
         const char *items[] = {
@@ -365,6 +495,7 @@ static void draw_screen(void)
     } else {
         int bpm_whole = grid_bpm_x100 / 100;
         int bpm_fraction = grid_bpm_x100 % 100;
+        draw_hud();
         draw_waveform();
         rb->lcd_set_foreground(LCD_RGBPACK(10, 16, 12));
         rb->lcd_fillrect(0, RBPREP_WAVE_BOTTOM + 1, LCD_WIDTH,
@@ -395,8 +526,8 @@ static void draw_screen(void)
             text(3, 225, line, cue_palette[hotcue_colors[cue_slot] & 7]);
         } else if (mode == MODE_GRID) {
             rb->snprintf(line, sizeof(line),
-                         "GRID %+dms  SEL: Q  HOLD: DOWNBEAT",
-                         grid_offset);
+                         "GRID %dPTS %+dms  SEL:Q HOLD:ORIGIN",
+                         beat_count, grid_offset);
             text(3, 225, line, LCD_RGBPACK(80, 210, 255));
         } else {
             rb->snprintf(line, sizeof(line),
@@ -405,53 +536,136 @@ static void draw_screen(void)
             text(3, 225, line, LCD_RGBPACK(255, 190, 65));
         }
     }
-    rb->lcd_update();
+    if (force_full_redraw || mode == MODE_LIBRARY) {
+        rb->lcd_update();
+        force_full_redraw = false;
+    } else {
+        rb->lcd_update_rect(RBPREP_DECK_X, RBPREP_WAVE_TOP,
+                            RBPREP_DECK_WIDTH,
+                            RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
+        rb->lcd_update_rect(0, RBPREP_WAVE_BOTTOM + 1, LCD_WIDTH,
+                            LCD_HEIGHT - RBPREP_WAVE_BOTTOM - 1);
+    }
 }
 
-static void stop_scrub_preview(void)
+static void reset_play_clock(int anchor, long tick)
 {
-    if (!scrub_preview_active)
+    play_clock_anchor = clamp_playhead(anchor);
+    play_clock_tick = tick;
+}
+
+static bool update_play_clock(void)
+{
+    int status = rb->audio_status();
+    int position;
+
+    if (seek_state != SEEK_IDLE || !(status & AUDIO_STATUS_PLAY) ||
+        (status & AUDIO_STATUS_PAUSE))
+        return false;
+    position = clamp_playhead(play_clock_anchor +
+        (long long)(*rb->current_tick - play_clock_tick) * 1000 / HZ);
+    if (position == playhead)
+        return false;
+    playhead = position;
+    return true;
+}
+
+static void stop_editor_audio(void)
+{
+    if (seek_state == SEEK_IDLE)
         return;
-    rb->audio_pause();
+    if (seek_state == SEEK_PREVIEW)
+        rb->audio_pause();
     rb->audio_ff_rewind(playhead);
-    scrub_preview_active = false;
+    seek_state = SEEK_IDLE;
+    reset_play_clock(playhead, *rb->current_tick);
+}
+
+static void request_audio_seek(bool preview)
+{
+    int status = rb->audio_status();
+    bool original_pause;
+
+    if (!(status & AUDIO_STATUS_PLAY))
+        return;
+    original_pause = seek_state == SEEK_IDLE
+                   ? !!(status & AUDIO_STATUS_PAUSE) : seek_was_paused;
+    if (seek_state == SEEK_PREVIEW)
+        rb->audio_pause();
+    if (seek_state != SEEK_DEBOUNCE)
+        rb->audio_pre_ff_rewind();
+    seek_target = playhead;
+    seek_preview = preview;
+    seek_was_paused = original_pause;
+    seek_state = SEEK_DEBOUNCE;
+    seek_deadline = *rb->current_tick + RBPREP_SEEK_DEBOUNCE;
+    reset_play_clock(playhead, *rb->current_tick);
+}
+
+static bool service_audio_seek(void)
+{
+    long now = *rb->current_tick;
+
+    if (seek_state == SEEK_IDLE ||
+        (TIME_BEFORE(now, seek_deadline) && now != seek_deadline))
+        return false;
+
+    if (seek_state == SEEK_DEBOUNCE) {
+        rb->audio_ff_rewind(seek_target);
+        seek_applied_tick = now;
+        seek_state = SEEK_SETTLE;
+        seek_deadline = now + RBPREP_SEEK_SETTLE;
+    } else if (seek_state == SEEK_SETTLE) {
+        if (seek_preview && seek_was_paused) {
+            rb->audio_resume();
+            seek_state = SEEK_PREVIEW;
+            seek_applied_tick = now;
+            seek_deadline = now + RBPREP_PREVIEW_TICKS;
+        } else {
+            seek_state = SEEK_IDLE;
+            reset_play_clock(seek_target, seek_applied_tick);
+        }
+    } else {
+        rb->audio_pause();
+        rb->audio_pre_ff_rewind();
+        rb->audio_ff_rewind(seek_target);
+        playhead = seek_target;
+        seek_state = SEEK_IDLE;
+        reset_play_clock(playhead, now);
+    }
+    return true;
 }
 
 static void audition_playhead(void)
 {
-    int status = rb->audio_status();
-    bool restore_pause = scrub_preview_active ||
-                         (status & AUDIO_STATUS_PAUSE);
-
-    if (!(status & AUDIO_STATUS_PLAY))
-        return;
-    rb->audio_ff_rewind(playhead);
-    if (status & AUDIO_STATUS_PAUSE)
-        rb->audio_resume();
-    if (restore_pause) {
-        scrub_preview_active = true;
-        scrub_preview_deadline = *rb->current_tick + RBPREP_PREVIEW_TICKS;
-    }
+    request_audio_seek(true);
 }
 
 static void seek_by(int delta, bool audition)
 {
     playhead = clamp_playhead(playhead + delta);
     if (audition)
-        audition_playhead();
+        request_audio_seek(true);
 }
 
 static void toggle_playback(void)
 {
     int status = rb->audio_status();
 
-    if (scrub_preview_active) {
-        scrub_preview_active = false;
+    if (seek_state == SEEK_PREVIEW) {
+        playhead = clamp_playhead(seek_target +
+            (long long)(*rb->current_tick - seek_applied_tick) * 1000 / HZ);
+        seek_state = SEEK_IDLE;
+        reset_play_clock(playhead, *rb->current_tick);
         return;
     }
+    if (seek_state != SEEK_IDLE)
+        stop_editor_audio();
     if (status & AUDIO_STATUS_PAUSE) {
         rb->audio_resume();
+        reset_play_clock(playhead, *rb->current_tick);
     } else if (status & AUDIO_STATUS_PLAY) {
+        update_play_clock();
         rb->audio_pause();
     } else if (rb->global_status->resume_index != -1 &&
                rb->playlist_resume() != -1) {
@@ -459,6 +673,8 @@ static void toggle_playback(void)
                                   rb->global_status->resume_crc32,
                                   rb->global_status->resume_elapsed,
                                   rb->global_status->resume_offset);
+        playhead = rb->global_status->resume_elapsed;
+        reset_play_clock(playhead, *rb->current_tick);
     } else {
         rb->splash(HZ, "No Rockbox track loaded");
     }
@@ -481,8 +697,10 @@ static enum rbprep_mode next_mode(enum rbprep_mode current)
 static void short_select(void)
 {
     if (mode == MODE_LIBRARY) {
-        if (selection == 2)
+        if (selection == 2) {
             mode = MODE_DECK;
+            force_full_redraw = true;
+        }
     } else if (mode == MODE_DECK) {
         if (deck_cue >= 0)
             playhead = deck_cue;
@@ -493,6 +711,7 @@ static void short_select(void)
         audition_playhead();
     } else if (mode == MODE_GRID) {
         quantize = !quantize;
+        force_full_redraw = true;
     } else {
         rating = (rating + 1) % 6;
     }
@@ -508,8 +727,14 @@ static void long_select(void)
         hotcue_colors[cue_slot] = color_index;
         playhead = hotcues[cue_slot];
     } else if (mode == MODE_GRID) {
-        grid_phase_ms = playhead;
-        grid_offset = 0;
+        int index = nearest_beat_index(playhead);
+        if (index >= 0) {
+            grid_offset += playhead - (beat_times[index] + grid_offset);
+            grid_beat_shift = (1 - beat_numbers[index]) & 3;
+        } else {
+            grid_phase_ms = playhead;
+            grid_offset = 0;
+        }
     } else if (mode == MODE_METADATA) {
         color_index = (color_index + 1) & 7;
     }
@@ -528,6 +753,7 @@ enum plugin_status plugin_start(const void *parameter)
     int button;
     int pressed = BUTTON_NONE;
     bool select_hold_fired = false;
+    struct mp3entry *id3;
 
     (void)parameter;
     rb->lcd_setfont(FONT_SYSFIXED);
@@ -536,45 +762,72 @@ enum plugin_status plugin_start(const void *parameter)
     playhead = 0;
     zoom = 1;
     grid_offset = 0;
+    grid_beat_shift = 0;
     cue_slot = 0;
     rating = 0;
     color_index = 0;
     quantize = true;
-    scrub_preview_active = false;
+    waveform_hz = 150;
+    beat_count = 0;
+    seek_state = SEEK_IDLE;
+    suppress_menu = suppress_play = false;
+    suppress_left = suppress_right = false;
+    force_full_redraw = true;
     for (button = 0; button < 16; button++) {
         hotcues[button] = -1;
         hotcue_colors[button] = 3;
     }
     load_waveform();
+    id3 = rb->audio_current_track();
+    if (id3) {
+        if (id3->length > 0)
+            track_length = id3->length;
+        playhead = clamp_playhead(id3->elapsed);
+    }
+    reset_play_clock(playhead, *rb->current_tick);
 
     /* Discard the release of SELECT used to launch the plugin. */
     rb->button_clear_queue();
     while (true) {
-        if (scrub_preview_active &&
-            TIME_AFTER(*rb->current_tick, scrub_preview_deadline))
-            stop_scrub_preview();
+        service_audio_seek();
+        update_play_clock();
 
         draw_screen();
         button = rb->button_get_w_tmo(HZ / 20);
         switch (button) {
         case BUTTON_MENU:
+            if (!suppress_menu)
+                pressed = button;
+            break;
         case BUTTON_PLAY:
-            pressed = button;
+            if (!suppress_play)
+                pressed = button;
             break;
         case BUTTON_SELECT:
             pressed = BUTTON_SELECT;
             select_hold_fired = false;
             break;
         case BUTTON_MENU | BUTTON_REL:
+            if (suppress_menu) {
+                suppress_menu = false;
+                pressed = BUTTON_NONE;
+                break;
+            }
             if (pressed != BUTTON_MENU)
                 break;
             pressed = BUTTON_NONE;
-            stop_scrub_preview();
+            stop_editor_audio();
             if (mode == MODE_LIBRARY)
                 return PLUGIN_OK;
             mode = MODE_LIBRARY;
+            force_full_redraw = true;
             break;
         case BUTTON_PLAY | BUTTON_REL:
+            if (suppress_play) {
+                suppress_play = false;
+                pressed = BUTTON_NONE;
+                break;
+            }
             if (pressed != BUTTON_PLAY)
                 break;
             pressed = BUTTON_NONE;
@@ -600,7 +853,9 @@ enum plugin_status plugin_start(const void *parameter)
                 mode != MODE_LIBRARY) {
                 select_hold_fired = true;
                 pressed = BUTTON_NONE;
+                suppress_left = true;
                 mode = previous_mode(mode);
+                force_full_redraw = true;
             }
             break;
         case BUTTON_SELECT | BUTTON_RIGHT:
@@ -609,7 +864,9 @@ enum plugin_status plugin_start(const void *parameter)
                 mode != MODE_LIBRARY) {
                 select_hold_fired = true;
                 pressed = BUTTON_NONE;
+                suppress_right = true;
                 mode = next_mode(mode);
+                force_full_redraw = true;
             }
             break;
         case BUTTON_SELECT | BUTTON_MENU:
@@ -618,6 +875,7 @@ enum plugin_status plugin_start(const void *parameter)
                 mode != MODE_LIBRARY) {
                 select_hold_fired = true;
                 pressed = BUTTON_NONE;
+                suppress_menu = true;
                 change_zoom(false);
             }
             break;
@@ -627,8 +885,17 @@ enum plugin_status plugin_start(const void *parameter)
                 mode != MODE_LIBRARY) {
                 select_hold_fired = true;
                 pressed = BUTTON_NONE;
+                suppress_play = true;
                 change_zoom(true);
             }
+            break;
+        case BUTTON_SELECT | BUTTON_MENU | BUTTON_REL:
+            suppress_menu = false;
+            pressed = BUTTON_NONE;
+            break;
+        case BUTTON_SELECT | BUTTON_PLAY | BUTTON_REL:
+            suppress_play = false;
+            pressed = BUTTON_NONE;
             break;
         case BUTTON_SCROLL_FWD:
         case BUTTON_SCROLL_FWD | BUTTON_REPEAT:
@@ -646,6 +913,8 @@ enum plugin_status plugin_start(const void *parameter)
             break;
         case BUTTON_LEFT:
         case BUTTON_LEFT | BUTTON_REPEAT:
+            if (suppress_left)
+                break;
             if (mode == MODE_GRID)
                 grid_offset--;
             else if (mode == MODE_CUES)
@@ -655,8 +924,13 @@ enum plugin_status plugin_start(const void *parameter)
             else if (mode != MODE_LIBRARY)
                 seek_by(-1000, true);
             break;
+        case BUTTON_LEFT | BUTTON_REL:
+            suppress_left = false;
+            break;
         case BUTTON_RIGHT:
         case BUTTON_RIGHT | BUTTON_REPEAT:
+            if (suppress_right)
+                break;
             if (mode == MODE_GRID)
                 grid_offset++;
             else if (mode == MODE_CUES)
@@ -666,9 +940,12 @@ enum plugin_status plugin_start(const void *parameter)
             else if (mode != MODE_LIBRARY)
                 seek_by(1000, true);
             break;
+        case BUTTON_RIGHT | BUTTON_REL:
+            suppress_right = false;
+            break;
         default:
             if (rb->default_event_handler(button) == SYS_USB_CONNECTED) {
-                stop_scrub_preview();
+                stop_editor_audio();
                 return PLUGIN_USB_CONNECTED;
             }
             break;
