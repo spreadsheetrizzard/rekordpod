@@ -31,6 +31,7 @@
 #define RBPREP_MAX_ZOOM 128
 #define RBPREP_SEEK_DEBOUNCE MAX(1, HZ / 20)
 #define RBPREP_SEEK_SETTLE MAX(1, HZ / 10)
+#define RBPREP_CUE_SETTLE MAX(1, HZ / 50)
 #define RBPREP_PREVIEW_TICKS MAX(1, HZ * 4 / 25)
 #define RBPREP_OVERVIEW_TICKS MAX(1, HZ / 2)
 #define RBPREP_FRAME_TICKS MAX(1, HZ / 25)
@@ -2164,15 +2165,27 @@ static void audition_playhead(void)
 
 static void start_cue_audition(void)
 {
+    long now;
+
     if (hotcues[cue_slot] < 0 ||
         !(rb->audio_status() & AUDIO_STATUS_PLAY))
         return;
     stop_editor_audio();
+    now = *rb->current_tick;
     cue_audition_position = hotcues[cue_slot];
     cue_audition_active = true;
     cue_audition_latched = false;
     playhead = cue_audition_position;
-    request_audio_seek(true);
+    seek_target = cue_audition_position;
+    seek_applied_target = cue_audition_position;
+    seek_preview = true;
+    seek_was_paused = true;
+    rb->audio_pre_ff_rewind();
+    rb->audio_ff_rewind(cue_audition_position);
+    seek_applied_tick = now;
+    seek_state = SEEK_SETTLE;
+    seek_deadline = now + RBPREP_CUE_SETTLE;
+    reset_play_clock(cue_audition_position, now);
 }
 
 static void finish_cue_audition(void)
@@ -2180,10 +2193,13 @@ static void finish_cue_audition(void)
     if (!cue_audition_active)
         return;
     if (cue_audition_latched) {
+        rb->pcmbuf_fade(true, true);
+        rb->audio_resume();
+        if (seek_state != SEEK_CUE_HOLD)
+            playhead = cue_audition_position;
         cue_audition_active = false;
         cue_audition_latched = false;
         seek_state = SEEK_IDLE;
-        rb->pcmbuf_fade(false, true);
         reset_play_clock(playhead, *rb->current_tick);
         return;
     }
@@ -2203,8 +2219,7 @@ static void latch_cue_audition(void)
     if (!cue_audition_active)
         return;
     cue_audition_latched = true;
-    if (seek_state == SEEK_CUE_HOLD)
-        finish_cue_audition();
+    finish_cue_audition();
 }
 
 static void seek_by(int delta, bool audition)
@@ -2731,6 +2746,15 @@ enum plugin_status plugin_start(const void *parameter)
                 suppress_menu = true;
                 mode = previous_mode(mode);
                 force_full_redraw = true;
+            } else if (mode == MODE_CUES &&
+                       active_tool() == TOOL_CUE_SLOT &&
+                       hotcues[cue_slot] >= 0 &&
+                       (rb->button_status() & BUTTON_PLAY)) {
+                select_hold_fired = true;
+                pressed = BUTTON_NONE;
+                suppress_play = true;
+                start_cue_audition();
+                latch_cue_audition();
             } else if (mode >= MODE_DECK &&
                        (rb->button_status() & BUTTON_PLAY)) {
                 discard_staged_edit();
@@ -2754,6 +2778,8 @@ enum plugin_status plugin_start(const void *parameter)
             if (suppress_menu) {
                 suppress_menu = false;
                 pressed = BUTTON_NONE;
+                if (rb->button_status() & BUTTON_SELECT)
+                    select_hold_fired = false;
                 break;
             }
             if (pressed != BUTTON_MENU)
@@ -2791,6 +2817,8 @@ enum plugin_status plugin_start(const void *parameter)
             if (suppress_play) {
                 suppress_play = false;
                 pressed = BUTTON_NONE;
+                if (rb->button_status() & BUTTON_SELECT)
+                    select_hold_fired = false;
                 break;
             }
             if (pressed != BUTTON_PLAY)
@@ -2863,18 +2891,26 @@ enum plugin_status plugin_start(const void *parameter)
         case BUTTON_SELECT | BUTTON_LEFT | BUTTON_REL:
             suppress_left = false;
             pressed = BUTTON_NONE;
+            if (rb->button_status() & BUTTON_SELECT)
+                select_hold_fired = false;
             break;
         case BUTTON_SELECT | BUTTON_RIGHT | BUTTON_REL:
             suppress_right = false;
             pressed = BUTTON_NONE;
+            if (rb->button_status() & BUTTON_SELECT)
+                select_hold_fired = false;
             break;
         case BUTTON_SELECT | BUTTON_MENU | BUTTON_REL:
             suppress_menu = false;
             pressed = BUTTON_NONE;
+            if (rb->button_status() & BUTTON_SELECT)
+                select_hold_fired = false;
             break;
         case BUTTON_SELECT | BUTTON_PLAY | BUTTON_REL:
             suppress_play = false;
             pressed = BUTTON_NONE;
+            if (rb->button_status() & BUTTON_SELECT)
+                select_hold_fired = false;
             break;
         case BUTTON_SCROLL_FWD:
         case BUTTON_SCROLL_FWD | BUTTON_REPEAT:
@@ -2936,6 +2972,9 @@ enum plugin_status plugin_start(const void *parameter)
         case BUTTON_LEFT | BUTTON_REL:
             if (suppress_left) {
                 suppress_left = false;
+                pressed = BUTTON_NONE;
+                if (rb->button_status() & BUTTON_SELECT)
+                    select_hold_fired = false;
             } else if (pressed == BUTTON_LEFT && mode >= MODE_DECK) {
                 pressed = BUTTON_NONE;
                 adjust_active_tool_coarse(-1);
@@ -2954,6 +2993,9 @@ enum plugin_status plugin_start(const void *parameter)
         case BUTTON_RIGHT | BUTTON_REL:
             if (suppress_right) {
                 suppress_right = false;
+                pressed = BUTTON_NONE;
+                if (rb->button_status() & BUTTON_SELECT)
+                    select_hold_fired = false;
             } else if (pressed == BUTTON_RIGHT && mode >= MODE_DECK) {
                 pressed = BUTTON_NONE;
                 adjust_active_tool_coarse(1);
