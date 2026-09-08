@@ -14,8 +14,10 @@
 #define RBPREP_POINTS 131072
 #define RBPREP_BEATS 16384
 #define RBPREP_INDEX_HEADER 40
-#define RBPREP_TRACK_RECORD 24
-#define RBPREP_NODE_RECORD 20
+#define RBPREP_TRACK_RECORD 28
+#define RBPREP_NODE_RECORD 24
+#define RBPREP_TRACK_RECORD_V1 24
+#define RBPREP_NODE_RECORD_V1 20
 #define RBPREP_ROOT_NODE 0xffffffffu
 #define RBPREP_LIST_ROWS 9
 #define RBPREP_TREE_NODES 2048
@@ -132,6 +134,7 @@ static int zoom = 1;
 static int grid_offset;
 static int grid_phase_ms = 26;
 static int grid_bpm_x100 = 15000;
+static int grid_source_bpm_x100 = 15000;
 static int grid_beat_shift;
 static int cue_slot;
 static int deck_cue = -1;
@@ -219,6 +222,7 @@ struct rbprep_track_record {
     uint32_t title_offset;
     uint32_t artist_offset;
     uint32_t genre_offset;
+    uint32_t key_offset;
     int bpm_x100;
     int rating;
     int color;
@@ -230,9 +234,13 @@ struct rbprep_node_record {
     uint32_t first_member;
     uint32_t member_count;
     int kind;
+    uint32_t source_id;
 };
 
 static int library_fd = -1;
+static int library_index_version;
+static int library_track_record_size;
+static int library_node_record_size;
 static uint32_t library_track_count;
 static uint32_t library_node_count;
 static uint32_t library_member_count;
@@ -255,6 +263,7 @@ static enum rbprep_mode deck_return_mode = MODE_LIBRARY;
 static char selected_title[96];
 static char selected_artist[72];
 static char selected_genre[32];
+static char selected_key[24];
 
 static void stop_editor_audio(void);
 static void reset_play_clock(int anchor, long tick);
@@ -406,17 +415,25 @@ static bool read_track_record(int index, struct rbprep_track_record *track)
     unsigned char data[RBPREP_TRACK_RECORD];
 
     if (index < 0 || (uint32_t)index >= library_track_count ||
-        !read_index_at(library_track_offset + index * RBPREP_TRACK_RECORD,
-                       data, sizeof(data)))
+        !read_index_at(library_track_offset + index * library_track_record_size,
+                       data, library_track_record_size))
         return false;
     track->id = read_u32(data);
     track->path_offset = read_u32(data + 4);
     track->title_offset = read_u32(data + 8);
     track->artist_offset = read_u32(data + 12);
     track->genre_offset = read_u32(data + 16);
-    track->bpm_x100 = read_u16(data + 20);
-    track->rating = data[22];
-    track->color = data[23];
+    if (library_index_version >= 2) {
+        track->key_offset = read_u32(data + 20);
+        track->bpm_x100 = read_u16(data + 24);
+        track->rating = data[26];
+        track->color = data[27];
+    } else {
+        track->key_offset = 0;
+        track->bpm_x100 = read_u16(data + 20);
+        track->rating = data[22];
+        track->color = data[23];
+    }
     return true;
 }
 
@@ -425,14 +442,15 @@ static bool read_node_record(int index, struct rbprep_node_record *node)
     unsigned char data[RBPREP_NODE_RECORD];
 
     if (index < 0 || (uint32_t)index >= library_node_count ||
-        !read_index_at(library_node_offset + index * RBPREP_NODE_RECORD,
-                       data, sizeof(data)))
+        !read_index_at(library_node_offset + index * library_node_record_size,
+                       data, library_node_record_size))
         return false;
     node->parent = read_u32(data);
     node->name_offset = read_u32(data + 4);
     node->first_member = read_u32(data + 8);
     node->member_count = read_u32(data + 12);
     node->kind = data[16];
+    node->source_id = library_index_version >= 2 ? read_u32(data + 20) : 0;
     return true;
 }
 
@@ -511,16 +529,26 @@ static int track_index_at_row(int row)
 static bool open_library_index(void)
 {
     unsigned char header[RBPREP_INDEX_HEADER];
+    int version;
 
     library_fd = rb->open(RBPREP_INDEX, O_RDONLY);
+    version = 0;
     if (library_fd < 0 ||
         rb->read(library_fd, header, sizeof(header)) != sizeof(header) ||
-        rb->memcmp(header, "RBI1", 4) || read_u16(header + 4) != 1) {
+        rb->memcmp(header, "RBI1", 4) ||
+        ((version = read_u16(header + 4)) != 1 && version != 2)) {
         if (library_fd >= 0)
             rb->close(library_fd);
         library_fd = -1;
         return false;
     }
+    library_index_version = version;
+    library_track_record_size = version >= 2
+                              ? RBPREP_TRACK_RECORD
+                              : RBPREP_TRACK_RECORD_V1;
+    library_node_record_size = version >= 2
+                             ? RBPREP_NODE_RECORD
+                             : RBPREP_NODE_RECORD_V1;
     library_track_count = read_u32(header + 8);
     library_node_count = read_u32(header + 12);
     library_member_count = read_u32(header + 16);
@@ -549,17 +577,28 @@ static int adjusted_beat_number(int index)
     return ((beat_numbers[index] - 1 + grid_beat_shift) & 3) + 1;
 }
 
+static int adjusted_beat_time(int index)
+{
+    long long delta;
+
+    if (index < 0 || index >= beat_count)
+        return grid_phase_ms + grid_offset;
+    delta = (long long)beat_times[index] - grid_phase_ms;
+    if (grid_bpm_x100 > 0 && grid_source_bpm_x100 > 0)
+        delta = delta * grid_source_bpm_x100 / grid_bpm_x100;
+    return grid_phase_ms + grid_offset + delta;
+}
+
 static int nearest_beat_index(int time_ms)
 {
     int low = 0;
     int high = beat_count;
-    int target = time_ms - grid_offset;
 
     if (beat_count <= 0)
         return -1;
     while (low < high) {
         int middle = low + (high - low) / 2;
-        if (beat_times[middle] < target)
+        if (adjusted_beat_time(middle) < time_ms)
             low = middle + 1;
         else
             high = middle;
@@ -568,7 +607,8 @@ static int nearest_beat_index(int time_ms)
         return 0;
     if (low >= beat_count)
         return beat_count - 1;
-    if (target - beat_times[low - 1] <= beat_times[low] - target)
+    if (time_ms - adjusted_beat_time(low - 1) <=
+        adjusted_beat_time(low) - time_ms)
         return low - 1;
     return low;
 }
@@ -577,13 +617,12 @@ static int current_beat_index(int time_ms)
 {
     int low = 0;
     int high = beat_count;
-    int target = time_ms - grid_offset;
 
-    if (beat_count <= 0 || target < beat_times[0])
+    if (beat_count <= 0 || time_ms < adjusted_beat_time(0))
         return -1;
     while (low < high) {
         int middle = low + (high - low) / 2;
-        if (beat_times[middle] <= target)
+        if (adjusted_beat_time(middle) <= time_ms)
             low = middle + 1;
         else
             high = middle;
@@ -606,7 +645,7 @@ static int quantized_time(int time_ms)
        It must never pull a late-in-beat cue forward into the next beat. */
     index = current_beat_index(time_ms);
     if (index >= 0)
-        return clamp_playhead(beat_times[index] + grid_offset);
+        return clamp_playhead(adjusted_beat_time(index));
 
     period = beat_period_ms();
     base = grid_phase_ms + grid_offset;
@@ -707,7 +746,7 @@ static void draw_beatgrid(int first, int span)
 
     if (beat_count > 0) {
         for (i = 0; i < beat_count; i++) {
-            int time_ms = beat_times[i] + grid_offset;
+            int time_ms = adjusted_beat_time(i);
             int number = adjusted_beat_number(i);
             int x;
 
@@ -813,6 +852,27 @@ static void draw_loop_markers(int first, int span)
     }
 }
 
+static void draw_loop_zone(int first, int span)
+{
+    int in_x;
+    int out_x;
+    int left;
+    int right;
+
+    if (loop_in < 0 || loop_out <= loop_in)
+        return;
+    in_x = time_to_x(loop_in, first, span);
+    out_x = time_to_x(loop_out, first, span);
+    left = MAX(RBPREP_DECK_X, in_x);
+    right = MIN(RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1, out_x);
+    if (right < left)
+        return;
+    rb->lcd_set_foreground(loop_active ? LCD_RGBPACK(43, 25, 3)
+                                       : LCD_RGBPACK(25, 20, 7));
+    rb->lcd_fillrect(left, RBPREP_WAVE_TOP, right - left + 1,
+                     RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
+}
+
 static void rebuild_waveform_columns(int first, int span)
 {
     int x;
@@ -866,6 +926,7 @@ static void draw_waveform(void)
     int mid = (RBPREP_WAVE_TOP + RBPREP_WAVE_BOTTOM) / 2;
 
     viewport(&first, &span);
+    draw_loop_zone(first, span);
     if (waveform_points > 0)
         rebuild_waveform_columns(first, span);
     for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
@@ -1251,6 +1312,7 @@ static bool load_waveform(int track_id)
     track_length = MAX(1, (int)read_u32(header + 16));
     waveform_duration_ms = MAX(1, (int)read_u32(header + 20));
     grid_bpm_x100 = read_u16(header + 24);
+    grid_source_bpm_x100 = grid_bpm_x100;
     grid_phase_ms = read_u32(header + 28);
     rating = MIN(5, header[32]);
     color_index = header[33] & 7;
@@ -1356,7 +1418,13 @@ static bool play_track_row(int row)
                       sizeof(selected_artist));
     read_index_string(track.genre_offset, selected_genre,
                       sizeof(selected_genre));
+    if (track.key_offset)
+        read_index_string(track.key_offset, selected_key,
+                          sizeof(selected_key));
+    else
+        selected_key[0] = '\0';
     grid_bpm_x100 = track.bpm_x100;
+    grid_source_bpm_x100 = grid_bpm_x100;
     rating = track.rating;
     color_index = track.color & 7;
     track_year = 0;
@@ -1677,32 +1745,26 @@ static const char *page_label(void)
 static void draw_beat_phase(void)
 {
     int beat = 1;
-    int bar = 1;
     int index = current_beat_index(playhead);
     int i;
-    char counter[12];
 
     if (index >= 0) {
         beat = adjusted_beat_number(index);
-        bar = (index + adjusted_beat_number(0) - 1) / 4 + 1;
     } else if (beat_count <= 0) {
         int ordinal = (playhead - grid_phase_ms - grid_offset) /
                       beat_period_ms();
         if (ordinal >= 0) {
             beat = (ordinal & 3) + 1;
-            bar = ordinal / 4 + 1;
         }
     }
 
     for (i = 0; i < 4; i++) {
-        int x = 201 + i * 9;
+        int x = 229 + i * 9;
         rb->lcd_set_foreground(i + 1 == beat
                               ? LCD_RGBPACK(70, 235, 125)
                               : LCD_RGBPACK(35, 53, 42));
         rb->lcd_fillrect(x, 51, 7, 7);
     }
-    rb->snprintf(counter, sizeof(counter), "%03d.%d", bar, beat);
-    text(239, 49, counter, LCD_RGBPACK(185, 205, 191));
 }
 
 static void draw_rating_stars(int x, int y)
@@ -1766,15 +1828,15 @@ static void draw_metadata_line(void)
     rb->snprintf(line, sizeof(line), "%d.%02d",
                  grid_bpm_x100 / 100, grid_bpm_x100 % 100);
     text(161, 49, line, LCD_RGBPACK(85, 220, 255));
+    rb->snprintf(line, sizeof(line), "K:%s",
+                 selected_key[0] ? selected_key : "--");
+    text(201, 49, line, LCD_RGBPACK(185, 205, 191));
     draw_beat_phase();
-    text(277, 49, "Q",
+    text(268, 49, "Q",
          quantize ? LCD_RGBPACK(70, 235, 125)
                   : LCD_RGBPACK(105, 115, 108));
-    text(294, 49, "CUE", cue_audio_active()
+    text(284, 49, "CUE", cue_audio_active()
          ? LCD_RGBPACK(255, 135, 35) : LCD_RGBPACK(82, 87, 84));
-    text(161, 60, "BPM", LCD_RGBPACK(70, 82, 74));
-    text(201, 60, "PHASE", LCD_RGBPACK(70, 82, 74));
-    text(239, 60, "BAR", LCD_RGBPACK(70, 82, 74));
 }
 
 static void draw_rating_color_card(void)
@@ -2084,8 +2146,12 @@ static bool append_playlist_journal(int node_index)
                   O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0)
         return false;
-    length = rb->snprintf(line, sizeof(line), "%d\t%d\t%s\n",
-                          selected_track_id, node_index, name);
+    length = rb->snprintf(line, sizeof(line), "%d\t%lu\t%s\n",
+                          selected_track_id,
+                          (unsigned long)(node.source_id
+                                          ? node.source_id
+                                          : (uint32_t)node_index),
+                          name);
     if (rb->write(fd, line, length) != length) {
         rb->close(fd);
         return false;
@@ -2099,7 +2165,7 @@ static void apply_grid_origin(int origin)
     int index = nearest_beat_index(origin);
 
     if (index >= 0) {
-        grid_offset += origin - (beat_times[index] + grid_offset);
+        grid_offset += origin - adjusted_beat_time(index);
         grid_beat_shift = (1 - beat_numbers[index]) & 3;
     } else {
         grid_phase_ms = origin;
@@ -2205,7 +2271,7 @@ static void draw_screen(void)
             draw_index_status();
         else {
             const char *items[] = {
-                "LIBRARY", "PLAYLISTS", "PREP DECK", "SETTINGS",
+                "LIBRARY", "PLAYLISTS", "SETTINGS",
                 "PENDING EDITS", "INDEX STATUS", "EXIT TO ROCKBOX"
             };
             int i;
@@ -2218,7 +2284,7 @@ static void draw_screen(void)
                 rb->snprintf(line, sizeof(line), "RBPREP INDEX NOT FOUND");
             text(10, 28, line, library_fd >= 0
                  ? LCD_RGBPACK(70, 235, 125) : LCD_RGBPACK(255, 90, 70));
-            for (i = 0; i < 7; i++) {
+            for (i = 0; i < 6; i++) {
                 if (i == selection) {
                     rb->lcd_set_foreground(LCD_RGBPACK(25, 105, 175));
                     rb->lcd_fillrect(0, 50 + i * 27, LCD_WIDTH, 25);
@@ -2538,7 +2604,7 @@ static void beat_jump(int direction)
 
     if (beat_count > 0 && index >= 0) {
         index = MAX(0, MIN(beat_count - 1, index + direction));
-        target = beat_times[index] + grid_offset;
+        target = adjusted_beat_time(index);
     } else {
         int period = beat_period_ms();
         int snapped = quantized_time(playhead);
@@ -2594,28 +2660,21 @@ static void short_select(void)
             refresh_tree_children(RBPREP_ROOT_NODE);
             mode = MODE_PLAYLISTS;
             force_full_redraw = true;
-        } else if (selection == 2 && selected_track_index >= 0) {
-            deck_return_mode = MODE_LIBRARY;
-            mode = MODE_DECK;
-            force_full_redraw = true;
-        } else if (selection == 3) {
+        } else if (selection == 2) {
             mode = MODE_SETTINGS;
             force_full_redraw = true;
-        } else if (selection == 4) {
+        } else if (selection == 3) {
             refresh_pending_summary();
             mode = MODE_PENDING;
             force_full_redraw = true;
-        } else if (selection == 5) {
+        } else if (selection == 4) {
             refresh_pending_summary();
             mode = MODE_INDEX;
             force_full_redraw = true;
-        } else if (selection == 6) {
+        } else if (selection == 5) {
             rb->snprintf(confirm_message, sizeof(confirm_message),
                          "EXIT TO ROCKBOX?");
             begin_confirmation(CONFIRM_EXIT);
-        } else if (selection <= 2) {
-            rb->splash(HZ, "Choose a track first");
-            force_full_redraw = true;
         }
     } else if (mode == MODE_PLAYLISTS) {
         struct rbprep_node_record node;
@@ -3066,6 +3125,7 @@ enum plugin_status plugin_start(const void *parameter)
     menu_hold_fired = false;
     force_full_redraw = true;
     selected_title[0] = selected_artist[0] = selected_genre[0] = '\0';
+    selected_key[0] = '\0';
     selected_track_index = selected_track_id = -1;
     configfile_load(RBPREP_CONFIG_FILE, rbprep_config,
                     ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
@@ -3206,8 +3266,7 @@ enum plugin_status plugin_start(const void *parameter)
                 menu_hold_fired = false;
             } else if (mode >= MODE_DECK) {
                 if (tool_menu_active) {
-                    select_tool(tool_menu_original);
-                    tool_menu_active = false;
+                    browse_tool_menu(-1);
                 } else {
                     tool_menu_original = active_tool();
                     tool_menu_active = true;
@@ -3223,6 +3282,11 @@ enum plugin_status plugin_start(const void *parameter)
                 pressed = BUTTON_NONE;
                 if (rb->button_status() & BUTTON_SELECT)
                     select_hold_fired = false;
+                break;
+            }
+            if (tool_menu_active && mode >= MODE_DECK) {
+                pressed = BUTTON_NONE;
+                browse_tool_menu(1);
                 break;
             }
             if (pressed != BUTTON_PLAY)
@@ -3275,7 +3339,7 @@ enum plugin_status plugin_start(const void *parameter)
             if (tool_menu_active && mode >= MODE_DECK)
                 browse_tool_menu(1);
             else if (mode == MODE_LIBRARY)
-                selection = MIN(6, selection + 1);
+                selection = MIN(5, selection + 1);
             else if (mode == MODE_PLAYLISTS && tree_child_count > 0) {
                 tree_selection = MIN(tree_child_count - 1,
                                      tree_selection + 1);
@@ -3324,11 +3388,16 @@ enum plugin_status plugin_start(const void *parameter)
         case BUTTON_LEFT:
             if (suppress_left)
                 break;
-            if (mode >= MODE_DECK && !tool_menu_active)
+            if (tool_menu_active && mode >= MODE_DECK) {
+                browse_tool_menu(-1);
+                pressed = BUTTON_NONE;
+            } else if (mode >= MODE_DECK)
                 pressed = BUTTON_LEFT;
             break;
         case BUTTON_LEFT | BUTTON_REPEAT:
-            if (!suppress_left && mode >= MODE_DECK && !tool_menu_active)
+            if (tool_menu_active && mode >= MODE_DECK)
+                browse_tool_menu(-1);
+            else if (!suppress_left && mode >= MODE_DECK)
                 adjust_active_tool_coarse(-1);
             break;
         case BUTTON_LEFT | BUTTON_REL:
@@ -3346,11 +3415,16 @@ enum plugin_status plugin_start(const void *parameter)
         case BUTTON_RIGHT:
             if (suppress_right)
                 break;
-            if (mode >= MODE_DECK && !tool_menu_active)
+            if (tool_menu_active && mode >= MODE_DECK) {
+                browse_tool_menu(1);
+                pressed = BUTTON_NONE;
+            } else if (mode >= MODE_DECK)
                 pressed = BUTTON_RIGHT;
             break;
         case BUTTON_RIGHT | BUTTON_REPEAT:
-            if (!suppress_right && mode >= MODE_DECK && !tool_menu_active)
+            if (tool_menu_active && mode >= MODE_DECK)
+                browse_tool_menu(1);
+            else if (!suppress_right && mode >= MODE_DECK)
                 adjust_active_tool_coarse(1);
             break;
         case BUTTON_RIGHT | BUTTON_REL:

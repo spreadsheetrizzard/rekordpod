@@ -18,8 +18,8 @@ import zlib
 WAVEFORM_HZ = 150
 MAX_DEVICE_POINTS = 131_072
 INDEX_HEADER_SIZE = 40
-TRACK_RECORD_SIZE = 24
-NODE_RECORD_SIZE = 20
+TRACK_RECORD_SIZE = 28
+NODE_RECORD_SIZE = 24
 ROOT_NODE = 0xFFFFFFFF
 
 COLOR_LABELS = {
@@ -103,21 +103,23 @@ def build_index(connection: sqlite3.Connection) -> bytes:
     strings = StringTable()
     track_rows = connection.execute(
         "SELECT stable_key, rekordbox_track_id, location, title, artist, "
-        "genre, bpm, rating, color FROM tracks "
+        "genre, musical_key, bpm, rating, color FROM tracks "
         "ORDER BY LTRIM(title) COLLATE NOCASE, artist COLLATE NOCASE, "
         "CAST(rekordbox_track_id AS INTEGER)"
     ).fetchall()
     track_lookup: dict[str, int] = {}
     track_records = bytearray()
     for index, row in enumerate(track_rows):
-        stable_key, track_id, path, title, artist, genre, bpm, rating, color = row
+        (stable_key, track_id, path, title, artist, genre, musical_key,
+         bpm, rating, color) = row
         track_lookup[stable_key] = index
         track_records.extend(struct.pack(
-            "<IIIIIHBB",
+            "<IIIIIIHBB",
             int(track_id), strings.add(str(path or "").strip()),
             strings.add(str(title or "").strip()),
             strings.add(str(artist or "").strip()),
             strings.add(str(genre or "").strip()),
+            strings.add(str(musical_key or "").strip()),
             max(0, min(65535, round(float(bpm or 0) * 100))),
             max(0, min(5, int(rating or 0))),
             COLOR_LABELS.get(str(color or "").casefold(), 0),
@@ -142,7 +144,7 @@ def build_index(connection: sqlite3.Connection) -> bytes:
                 folder_lookup[key] = node_index
                 nodes.append({
                     "parent": parent, "name": part, "first": 0,
-                    "count": 0, "kind": 0,
+                    "count": 0, "kind": 0, "source_id": 0,
                 })
             parent = node_index
 
@@ -157,13 +159,15 @@ def build_index(connection: sqlite3.Connection) -> bytes:
         nodes.append({
             "parent": parent, "name": parts[-1], "first": first_member,
             "count": len(memberships) - first_member, "kind": 1,
+            "source_id": int(playlist_id),
         })
 
     node_records = bytearray()
     for node in nodes:
         node_records.extend(struct.pack(
-            "<IIIIB3x", int(node["parent"]), strings.add(node["name"]),
+            "<IIIIB3xI", int(node["parent"]), strings.add(node["name"]),
             int(node["first"]), int(node["count"]), int(node["kind"]),
+            int(node["source_id"]),
         ))
     member_records = b"".join(struct.pack("<I", value) for value in memberships)
 
@@ -172,7 +176,7 @@ def build_index(connection: sqlite3.Connection) -> bytes:
     member_offset = node_offset + len(node_records)
     string_offset = member_offset + len(member_records)
     header = struct.pack(
-        "<4sHHIIIIIIII", b"RBI1", 1, INDEX_HEADER_SIZE,
+        "<4sHHIIIIIIII", b"RBI1", 2, INDEX_HEADER_SIZE,
         len(track_rows), len(nodes), len(memberships), track_offset,
         node_offset, member_offset, string_offset, len(strings.data),
     )
