@@ -10,6 +10,8 @@
 
 #define RBPREP_PDB "/PIONEER/rekordbox/export.pdb"
 #define RBPREP_INDEX "/.rockbox/rbprep/library.rbi"
+#define RBPREP_GENRES "/.rockbox/rbprep/genres.rbg"
+#define RBPREP_CUSTOM_GENRES "/.rockbox/rbprep/custom-genres.txt"
 #define RBPREP_TRACK_DIR "/.rockbox/rbprep/tracks"
 #define RBPREP_POINTS 131072
 #define RBPREP_BEATS 16384
@@ -45,10 +47,11 @@
 #define RBPREP_OVERVIEW_TICKS MAX(1, HZ / 2)
 #define RBPREP_FRAME_TICKS MAX(1, HZ / 20)
 #define RBPREP_HUD_SCROLL_TICKS MAX(1, HZ / 10)
-#define RBPREP_CONFIG_VERSION 1
+#define RBPREP_CONFIG_VERSION 2
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
 #define RBPREP_PLAYLIST_JOURNAL "/.rockbox/rbprep/playlist-adds.rba"
 #define RBPREP_EDIT_JOURNAL "/.rockbox/rbprep/edits.rbe"
+#define RBPREP_BURN_STATE "/.rockbox/rbprep/local-burn.rbs"
 /* Fixed-size, little-endian RBE1 snapshots make interrupted appends harmless
    and keep the eventual macOS importer independent of compiler struct layout. */
 #define RBPREP_EDIT_RECORD_SIZE 216
@@ -58,9 +61,11 @@ enum rbprep_mode {
     MODE_LIBRARY,
     MODE_PLAYLISTS,
     MODE_TRACKS,
+    MODE_USB,
     MODE_SETTINGS,
     MODE_PENDING,
     MODE_INDEX,
+    MODE_GENRES,
     MODE_DECK,
     MODE_GRID,
     MODE_CUES,
@@ -103,7 +108,9 @@ enum rbprep_confirm_action {
     CONFIRM_CUE_DELETE,
     CONFIRM_GRID_ORIGIN,
     CONFIRM_KEEP_EDIT,
-    CONFIRM_ADD_PLAYLIST
+    CONFIRM_ADD_PLAYLIST,
+    CONFIRM_GENRE,
+    CONFIRM_BURN
 };
 
 struct rbprep_wave_column {
@@ -166,7 +173,21 @@ static int cue_tool;
 static int loop_tool;
 static int metadata_tool;
 static int waveform_half;
+static int visualizer_mode;
 static int scrub_step_index = 4;
+static int settings_selection;
+static int usb_selection;
+static int genre_selection;
+static int genre_top;
+static int genre_count;
+static int built_genre_count;
+static int custom_genre_count;
+#define RBPREP_CUSTOM_GENRE_MAX 32
+static char custom_genres[RBPREP_CUSTOM_GENRE_MAX][32];
+static char confirm_genre[32];
+static unsigned char meter_history_left[RBPREP_DECK_WIDTH];
+static unsigned char meter_history_right[RBPREP_DECK_WIDTH];
+static int meter_history_head;
 static bool playlist_playback;
 static bool playlist_add_mode;
 static int playing_track_row = -1;
@@ -250,6 +271,9 @@ struct rbprep_node_record {
 };
 
 static int library_fd = -1;
+static int genre_fd = -1;
+static uint32_t genre_offsets_base;
+static uint32_t genre_strings_base;
 static int library_index_version;
 static int library_track_record_size;
 static int library_node_record_size;
@@ -337,11 +361,13 @@ static const char *cue_color_names[] = {
 };
 
 static const char *mode_names[] = {
-    "LIBRARY", "PLAYLISTS", "TRACKS", "SETTINGS", "PENDING",
-    "INDEX", "PLAYBACK", "BEATGRID", "HOT CUES", "LOOP", "METADATA"
+    "LIBRARY", "PLAYLISTS", "TRACKS", "USB", "SETTINGS", "PENDING",
+    "INDEX", "GENRES", "PLAYBACK", "BEATGRID", "HOT CUES", "LOOP",
+    "METADATA"
 };
 
 static char *waveform_styles[] = { "full", "half" };
+static char *visualizer_styles[] = { "rgb waveform", "minimeters" };
 static const int scrub_steps[] = {
     1, 2, 5, 10, 20, 50, 100, 250, 500, 1000
 };
@@ -349,6 +375,8 @@ static const int scrub_steps[] = {
 static const struct configdata rbprep_config[] = {
     { TYPE_ENUM, 0, 1, { .int_p = &waveform_half },
       "waveform style", waveform_styles },
+    { TYPE_ENUM, 0, 1, { .int_p = &visualizer_mode },
+      "visualizer", visualizer_styles },
     { TYPE_INT, 0, ARRAYLEN(scrub_steps) - 1,
       { .int_p = &scrub_step_index }, "scrub step", NULL }
 };
@@ -363,6 +391,39 @@ static const int cue_palette[] = {
     LCD_RGBPACK(175, 90, 255),
     LCD_RGBPACK(255, 80, 185)
 };
+
+/* Three-pixel hexadecimal glyphs, packed as five rows of three bits. */
+static const uint16_t micro_hex_glyphs[16] = {
+    0x7B6F, 0x2492, 0x73E7, 0x73CF,
+    0x5BC9, 0x79CF, 0x79EF, 0x7249,
+    0x7BEF, 0x7BCF, 0x7BED, 0x6BAE,
+    0x7927, 0x6B6E, 0x79E7, 0x79E4
+};
+
+static void draw_overview_cue_marker(int center_x, int slot, int color)
+{
+    int x = MAX(RBPREP_OVERVIEW_X + 2,
+                MIN(RBPREP_OVERVIEW_X + RBPREP_OVERVIEW_WIDTH - 3,
+                    center_x));
+    int y = RBPREP_OVERVIEW_Y;
+    int row;
+    int column;
+    /* Cue slots are presented as 1..9, A..F, 0 in the tiny 3px label. */
+    uint16_t glyph = micro_hex_glyphs[(slot + 1) & 15];
+
+    rb->lcd_set_foreground(color);
+    rb->lcd_fillrect(x - 2, y, 5, 5);
+    rb->lcd_hline(x - 1, x + 1, y + 5);
+    rb->lcd_drawpixel(x, y + 6);
+    rb->lcd_set_foreground(LCD_BLACK);
+    for (row = 0; row < 5; row++) {
+        int bits = (glyph >> ((4 - row) * 3)) & 7;
+        for (column = 0; column < 3; column++) {
+            if (bits & (4 >> column))
+                rb->lcd_drawpixel(x - 1 + column, y + row);
+        }
+    }
+}
 
 /* Beat lengths are stored in thirty-seconds so sub-beat loops stay exact. */
 static const int loop_beats_x32[] = {
@@ -478,6 +539,131 @@ static bool read_index_string(uint32_t offset, char *buffer, size_t size)
     while (used + 1 < size && rb->read(library_fd, &value, 1) == 1 && value)
         buffer[used++] = value;
     buffer[used] = '\0';
+    return true;
+}
+
+static bool read_built_genre(int index, char *buffer, size_t size)
+{
+    unsigned char raw[4];
+    uint32_t offset;
+    size_t used = 0;
+    unsigned char value;
+
+    if (index < 0 || index >= built_genre_count || genre_fd < 0 ||
+        size == 0 ||
+        rb->lseek(genre_fd, genre_offsets_base + index * 4, SEEK_SET) < 0 ||
+        rb->read(genre_fd, raw, sizeof(raw)) != sizeof(raw))
+        return false;
+    offset = read_u32(raw);
+    if (rb->lseek(genre_fd, genre_strings_base + offset, SEEK_SET) < 0)
+        return false;
+    while (used + 1 < size && rb->read(genre_fd, &value, 1) == 1 && value)
+        buffer[used++] = value;
+    buffer[used] = '\0';
+    return true;
+}
+
+static bool genre_name_at(int index, char *buffer, size_t size)
+{
+    if (index < 0 || index >= genre_count)
+        return false;
+    if (index < built_genre_count)
+        return read_built_genre(index, buffer, size);
+    rb->strlcpy(buffer, custom_genres[index - built_genre_count], size);
+    return true;
+}
+
+static bool genre_exists(const char *name)
+{
+    int i;
+    char candidate[32];
+
+    for (i = 0; i < genre_count; i++) {
+        if (genre_name_at(i, candidate, sizeof(candidate)) &&
+            !rb->strcasecmp(candidate, name))
+            return true;
+    }
+    return false;
+}
+
+static void load_genre_rollup(void)
+{
+    unsigned char header[16];
+    char line[32];
+    int fd;
+    int length = 0;
+    unsigned char value;
+
+    if (genre_fd >= 0)
+        rb->close(genre_fd);
+    genre_fd = rb->open(RBPREP_GENRES, O_RDONLY);
+    built_genre_count = 0;
+    custom_genre_count = 0;
+    if (genre_fd >= 0 &&
+        rb->read(genre_fd, header, sizeof(header)) == sizeof(header) &&
+        !rb->memcmp(header, "RBG1", 4) && read_u16(header + 4) == 1 &&
+        read_u16(header + 6) == sizeof(header)) {
+        built_genre_count = read_u32(header + 8);
+        genre_offsets_base = sizeof(header);
+        genre_strings_base = genre_offsets_base + built_genre_count * 4;
+    } else if (genre_fd >= 0) {
+        rb->close(genre_fd);
+        genre_fd = -1;
+    }
+    genre_count = built_genre_count;
+
+    fd = rb->open(RBPREP_CUSTOM_GENRES, O_RDONLY);
+    if (fd >= 0) {
+        while (custom_genre_count < RBPREP_CUSTOM_GENRE_MAX &&
+               rb->read(fd, &value, 1) == 1) {
+            if (value == '\n' || value == '\r') {
+                if (length > 0) {
+                    line[length] = '\0';
+                    if (!genre_exists(line)) {
+                        rb->strlcpy(custom_genres[custom_genre_count++],
+                                    line, sizeof(custom_genres[0]));
+                        genre_count = built_genre_count + custom_genre_count;
+                    }
+                    length = 0;
+                }
+            } else if (value >= 32 && length + 1 < (int)sizeof(line)) {
+                line[length++] = value;
+            }
+        }
+        if (length > 0 && custom_genre_count < RBPREP_CUSTOM_GENRE_MAX) {
+            line[length] = '\0';
+            if (!genre_exists(line))
+                rb->strlcpy(custom_genres[custom_genre_count++], line,
+                            sizeof(custom_genres[0]));
+        }
+        rb->close(fd);
+    }
+    genre_count = built_genre_count + custom_genre_count;
+}
+
+static bool append_custom_genre(const char *name)
+{
+    char line[40];
+    int fd;
+    int length;
+
+    if (!name[0] || genre_exists(name))
+        return true;
+    if (custom_genre_count >= RBPREP_CUSTOM_GENRE_MAX)
+        return false;
+    fd = rb->open(RBPREP_CUSTOM_GENRES,
+                  O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0)
+        return false;
+    length = rb->snprintf(line, sizeof(line), "%s\n", name);
+    if (rb->write(fd, line, length) != length) {
+        rb->close(fd);
+        return false;
+    }
+    rb->close(fd);
+    rb->strlcpy(custom_genres[custom_genre_count++], name,
+                sizeof(custom_genres[0]));
+    genre_count = built_genre_count + custom_genre_count;
     return true;
 }
 
@@ -931,6 +1117,65 @@ static void rebuild_waveform_columns(int first, int span)
     waveform_columns_valid = true;
 }
 
+static int meter_trace_color(int level)
+{
+    if (level > 214)
+        return LCD_RGBPACK(255, 70, 55);
+    if (level > 170)
+        return LCD_RGBPACK(255, 200, 55);
+    if (level > 92)
+        return LCD_RGBPACK(65, 225, 125);
+    return LCD_RGBPACK(35, 132, 92);
+}
+
+static void draw_minimeters(void)
+{
+    int first;
+    int span;
+    int mid = (RBPREP_SIGNAL_TOP + RBPREP_SIGNAL_BOTTOM) / 2;
+    int max_height = RBPREP_SIGNAL_HEIGHT / 2 - 3;
+    int x;
+
+    viewport(&first, &span);
+    draw_loop_zone(first, span);
+    meter_history_left[meter_history_head] =
+        MIN(255, (int)(vu_left * 255 / 32768));
+    meter_history_right[meter_history_head] =
+        MIN(255, (int)(vu_right * 255 / 32768));
+    meter_history_head = (meter_history_head + 1) % RBPREP_DECK_WIDTH;
+
+    rb->lcd_set_foreground(LCD_RGBPACK(18, 29, 23));
+    rb->lcd_hline(RBPREP_DECK_X,
+                  RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1, mid);
+    rb->lcd_hline(RBPREP_DECK_X,
+                  RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1,
+                  mid - max_height / 2);
+    rb->lcd_hline(RBPREP_DECK_X,
+                  RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1,
+                  mid + max_height / 2);
+    for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
+        int index = (meter_history_head + x) % RBPREP_DECK_WIDTH;
+        int left = meter_history_left[index];
+        int right = meter_history_right[index];
+        int left_height = MAX(1, left * max_height / 255);
+        int right_height = MAX(1, right * max_height / 255);
+        int screen_x = RBPREP_DECK_X + x;
+
+        rb->lcd_set_foreground(meter_trace_color(left));
+        rb->lcd_vline(screen_x, mid - left_height, mid - 1);
+        rb->lcd_set_foreground(meter_trace_color(right));
+        rb->lcd_vline(screen_x, mid + 1, mid + right_height);
+    }
+    draw_beatgrid(first, span);
+    draw_loop_markers(first, span);
+    draw_cues(first, span);
+    rb->lcd_set_foreground(LCD_RGBPACK(255, 45, 45));
+    x = MAX(RBPREP_DECK_X,
+            MIN(RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1,
+                time_to_x(playhead, first, span)));
+    rb->lcd_vline(x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
+}
+
 static void draw_waveform(void)
 {
     int first;
@@ -938,6 +1183,10 @@ static void draw_waveform(void)
     int x;
     int mid = (RBPREP_SIGNAL_TOP + RBPREP_SIGNAL_BOTTOM) / 2;
 
+    if (visualizer_mode) {
+        draw_minimeters();
+        return;
+    }
     viewport(&first, &span);
     draw_loop_zone(first, span);
     if (waveform_points > 0)
@@ -1042,9 +1291,8 @@ static void draw_overview_waveform(void)
         cue_x = RBPREP_OVERVIEW_X +
                 (long long)hotcues[x] * (RBPREP_OVERVIEW_WIDTH - 1) /
                 MAX(1, track_length);
-        rb->lcd_set_foreground(cue_palette[hotcue_colors[x] & 7]);
-        rb->lcd_vline(cue_x, RBPREP_OVERVIEW_Y,
-                      RBPREP_OVERVIEW_Y + 3);
+        draw_overview_cue_marker(cue_x, x,
+                                 cue_palette[hotcue_colors[x] & 7]);
     }
 
     if (loop_in >= 0 && loop_out > loop_in) {
@@ -1151,6 +1399,9 @@ static void clear_analysis(void)
     loop_active = false;
     cue_audition_active = false;
     cue_audition_latched = false;
+    rb->memset(meter_history_left, 0, sizeof(meter_history_left));
+    rb->memset(meter_history_right, 0, sizeof(meter_history_right));
+    meter_history_head = 0;
     for (i = 0; i < 16; i++) {
         hotcues[i] = -1;
         hotcue_colors[i] = 3;
@@ -1252,6 +1503,44 @@ static bool save_edit_snapshot(void)
     return true;
 }
 
+static void read_burn_offsets(uint32_t *edit_offset,
+                              uint32_t *playlist_offset)
+{
+    unsigned char data[12];
+    int fd;
+
+    *edit_offset = *playlist_offset = 0;
+    fd = rb->open(RBPREP_BURN_STATE, O_RDONLY);
+    if (fd < 0)
+        return;
+    if (rb->read(fd, data, sizeof(data)) == sizeof(data) &&
+        !rb->memcmp(data, "RBL1", 4)) {
+        *edit_offset = read_u32(data + 4);
+        *playlist_offset = read_u32(data + 8);
+    }
+    rb->close(fd);
+}
+
+static bool write_burn_offsets(uint32_t edit_offset,
+                               uint32_t playlist_offset)
+{
+    unsigned char data[12];
+    int fd;
+
+    rb->memcpy(data, "RBL1", 4);
+    write_u32(data + 4, edit_offset);
+    write_u32(data + 8, playlist_offset);
+    fd = rb->open(RBPREP_BURN_STATE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0)
+        return false;
+    if (rb->write(fd, data, sizeof(data)) != sizeof(data)) {
+        rb->close(fd);
+        return false;
+    }
+    rb->close(fd);
+    return true;
+}
+
 static void refresh_pending_summary(void)
 {
     unsigned char data[RBPREP_EDIT_RECORD_SIZE];
@@ -1259,12 +1548,18 @@ static void refresh_pending_summary(void)
     int fd;
     int bytes;
     int i;
+    uint32_t edit_offset;
+    uint32_t playlist_offset;
+
+    read_burn_offsets(&edit_offset, &playlist_offset);
 
     pending_snapshot_count = 0;
     pending_playlist_count = 0;
     pending_visible_count = 0;
     fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
     if (fd >= 0) {
+        if (edit_offset <= (uint32_t)rb->filesize(fd))
+            rb->lseek(fd, edit_offset, SEEK_SET);
         while (rb->read(fd, data, sizeof(data)) == sizeof(data)) {
             struct rbprep_pending_entry *entry;
             int slot;
@@ -1288,6 +1583,8 @@ static void refresh_pending_summary(void)
 
     fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
     if (fd >= 0) {
+        if (playlist_offset <= (uint32_t)rb->filesize(fd))
+            rb->lseek(fd, playlist_offset, SEEK_SET);
         while ((bytes = rb->read(fd, text_buffer, sizeof(text_buffer))) > 0) {
             for (i = 0; i < bytes; i++)
                 if (text_buffer[i] == '\n')
@@ -1296,6 +1593,8 @@ static void refresh_pending_summary(void)
         rb->close(fd);
     }
 }
+
+#include "rbprep_burn.h"
 
 static bool load_waveform(int track_id)
 {
@@ -1910,8 +2209,8 @@ static void draw_tool_status(void)
     else if (tool == TOOL_ADD_PLAYLIST)
         rb->snprintf(line, sizeof(line), "ADD TO PLAYLIST");
     else if (tool == TOOL_WAVEFORM_STYLE)
-        rb->snprintf(line, sizeof(line), "WAVEFORM  %s",
-                     waveform_half ? "HALF" : "FULL");
+        rb->snprintf(line, sizeof(line), "VISUALIZER  %s",
+                     visualizer_mode ? "MINIMETERS" : "RGB WAVE");
     else if (tool == TOOL_GRID_NUDGE)
         rb->snprintf(line, sizeof(line), "GRID  %+dms", grid_offset);
     else if (tool == TOOL_GRID_BPM)
@@ -1995,18 +2294,170 @@ static void draw_top_hud(void)
 static void draw_settings(void)
 {
     char line[64];
+    int row;
+    const char *names[] = { "VISUALIZER", "WAVEFORM SHAPE" };
+    const char *values[] = {
+        visualizer_mode ? "MINIMETERS" : "RGB WAVEFORM",
+        waveform_half ? "HALF" : "FULL"
+    };
 
     text(7, 3, "RBPREP SETTINGS", LCD_RGBPACK(70, 235, 125));
-    rb->lcd_set_foreground(LCD_RGBPACK(25, 105, 175));
-    rb->lcd_fillrect(0, 42, LCD_WIDTH, 27);
-    text(10, 49, "WAVEFORM", LCD_WHITE);
-    rb->snprintf(line, sizeof(line), "%s", waveform_half ? "HALF" : "FULL");
-    text(260, 49, line, LCD_RGBPACK(70, 235, 125));
-    text(10, 84, waveform_half
-         ? "One-sided: maximum vertical definition"
-         : "Mirrored: traditional full waveform",
+    text(7, 20, "DECK DISPLAY", LCD_RGBPACK(105, 125, 112));
+    for (row = 0; row < 2; row++) {
+        int y = 43 + row * 31;
+        if (row == settings_selection) {
+            rb->lcd_set_foreground(LCD_RGBPACK(18, 78, 128));
+            rb->lcd_fillrect(0, y - 3, LCD_WIDTH, 27);
+            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
+            rb->lcd_fillrect(0, y - 3, 3, 27);
+        }
+        text(10, y + 3, names[row], LCD_WHITE);
+        rb->snprintf(line, sizeof(line), "%s", values[row]);
+        text(row == 0 ? 224 : 260, y + 3, line,
+             LCD_RGBPACK(70, 235, 125));
+    }
+    text(10, 121, visualizer_mode
+         ? "Stereo peak history; beatgrid + cue overlays stay live"
+         : (waveform_half
+            ? "RGB detail, one-sided for maximum vertical definition"
+            : "RGB detail, mirrored around the play axis"),
          LCD_RGBPACK(145, 165, 151));
-    text(10, 216, "WHEEL/SELECT: CHANGE     MENU: BACK", LCD_WHITE);
+    text(10, 216, "WHEEL: CHOOSE   SELECT: CHANGE   MENU: BACK", LCD_WHITE);
+}
+
+static void apply_usb_choice(int choice)
+{
+    usb_selection = !!choice;
+#ifdef USB_ENABLE_HID
+    rb->global_settings->usb_hid = false;
+    rb->usb_set_hid(false);
+#endif
+#ifdef USB_ENABLE_AUDIO
+    rb->global_settings->usb_audio = usb_selection ? 1 : 0;
+    rb->usb_set_audio(rb->global_settings->usb_audio);
+#endif
+#if !defined(SIMULATOR) && !defined(USB_NONE) && \
+    (defined(HAVE_USB_ADB) || defined(HAVE_USB_POWER))
+    rb->global_settings->usb_mode = usb_selection
+                                  ? USB_MODE_CHARGE
+                                  : USB_MODE_MASS_STORAGE;
+    rb->usb_set_mode(rb->global_settings->usb_mode);
+#endif
+    rb->settings_save();
+}
+
+static void draw_usb_mode(void)
+{
+    int row;
+    const char *names[] = { "DATA TRANSFER", "USB DAC" };
+    const char *details[] = {
+        "Rekordbox FAT volume over USB; audio class disabled",
+        "Mac audio to iPod headphone output; storage hidden"
+    };
+
+    text(7, 3, "USB MODE", LCD_RGBPACK(85, 220, 255));
+    text(7, 20, "TAKES EFFECT ON NEXT USB CONNECTION",
+         LCD_RGBPACK(105, 125, 112));
+    for (row = 0; row < 2; row++) {
+        int y = 55 + row * 55;
+        if (row == usb_selection) {
+            rb->lcd_set_foreground(LCD_RGBPACK(18, 78, 128));
+            rb->lcd_fillrect(0, y - 5, LCD_WIDTH, 45);
+            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
+            rb->lcd_fillrect(0, y - 5, 4, 45);
+        }
+        text(12, y, names[row], LCD_WHITE);
+        text(12, y + 18, details[row], LCD_RGBPACK(135, 155, 141));
+    }
+    text(7, 183, "USB HID IS KEPT OFF IN BOTH MODES",
+         LCD_RGBPACK(255, 145, 40));
+    text(7, 226, "WHEEL: CHOOSE   SELECT: SAVE   MENU: BACK", LCD_WHITE);
+}
+
+static void draw_genre_picker(void)
+{
+    int row;
+    char name[32];
+    char line[48];
+
+    text(7, 3, "GENRE ROLLUP", LCD_RGBPACK(255, 145, 40));
+    rb->snprintf(line, sizeof(line), "%d LIBRARY GENRES", genre_count);
+    text(205, 3, line, LCD_RGBPACK(105, 125, 112));
+    for (row = 0; row < RBPREP_LIST_ROWS; row++) {
+        int ordinal = genre_top + row;
+        int y = 27 + row * 21;
+        if (ordinal > genre_count)
+            break;
+        if (ordinal == genre_selection) {
+            rb->lcd_set_foreground(LCD_RGBPACK(18, 78, 128));
+            rb->lcd_fillrect(0, y - 3, LCD_WIDTH, 20);
+            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
+            rb->lcd_fillrect(0, y - 3, 3, 20);
+        }
+        if (ordinal == 0) {
+            text(10, y, "+ ADD GENRE...", LCD_RGBPACK(70, 235, 125));
+        } else if (genre_name_at(ordinal - 1, name, sizeof(name))) {
+            rb->snprintf(line, sizeof(line), "%s%s",
+                         !rb->strcasecmp(name, selected_genre) ? "> " : "  ",
+                         name);
+            text(10, y, line, LCD_WHITE);
+        }
+    }
+    text(7, 226, "WHEEL: BROWSE   SELECT: ASSIGN   MENU: BACK", LCD_WHITE);
+}
+
+static void draw_main_menu(void)
+{
+    static const char *items[] = {
+        "COLLECTION", "PLAYLISTS", "USB MODE", "DECK SETTINGS",
+        "PENDING EDITS", "INDEX STATUS", "EXIT TO ROCKBOX"
+    };
+    static const char *codes[] = {
+        "TRK", "PLS", "USB", "DSP", "EDT", "IDX", "EXT"
+    };
+    char line[80];
+    int i;
+
+    rb->lcd_set_foreground(LCD_RGBPACK(10, 13, 16));
+    rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+    rb->lcd_set_foreground(LCD_RGBPACK(21, 29, 35));
+    rb->lcd_fillrect(0, 0, LCD_WIDTH, 38);
+    text(7, 4, "RBPREP", LCD_RGBPACK(70, 235, 125));
+    text(59, 4, "EXPORT PERFORMANCE SYSTEM", LCD_WHITE);
+    if (library_fd >= 0)
+        rb->snprintf(line, sizeof(line), "%lu TRACKS  /  DEVICE INDEX ONLINE",
+                     (unsigned long)library_track_count);
+    else
+        rb->snprintf(line, sizeof(line), "DEVICE INDEX OFFLINE");
+    text(7, 21, line, library_fd >= 0
+         ? LCD_RGBPACK(105, 178, 139) : LCD_RGBPACK(255, 90, 70));
+
+    for (i = 0; i < (int)ARRAYLEN(items); i++) {
+        int y = 45 + i * 26;
+        bool selected = i == selection;
+        if (selected) {
+            rb->lcd_set_foreground(LCD_RGBPACK(17, 73, 119));
+            rb->lcd_fillrect(0, y - 2, LCD_WIDTH, 23);
+            rb->lcd_set_foreground(LCD_RGBPACK(85, 220, 255));
+            rb->lcd_fillrect(0, y - 2, 4, 23);
+        }
+        text(10, y + 3, codes[i], selected
+             ? LCD_RGBPACK(85, 220, 255) : LCD_RGBPACK(82, 105, 94));
+        text(50, y + 3, items[i], selected ? LCD_WHITE
+             : LCD_RGBPACK(178, 192, 183));
+        if (i == 2)
+            text(257, y + 3, usb_selection ? "DAC" : "DATA",
+                 usb_selection ? LCD_RGBPACK(255, 145, 40)
+                               : LCD_RGBPACK(70, 235, 125));
+        else if (i == 4 &&
+                 (pending_snapshot_count || pending_playlist_count)) {
+            rb->snprintf(line, sizeof(line), "%d",
+                         pending_snapshot_count + pending_playlist_count);
+            text(286, y + 3, line, LCD_RGBPACK(255, 145, 40));
+        }
+    }
+    text(7, 229, "WHEEL  NAVIGATE       SELECT  OPEN",
+         LCD_RGBPACK(105, 125, 112));
 }
 
 static void draw_pending_edits(void)
@@ -2037,9 +2488,14 @@ static void draw_pending_edits(void)
                      entry->rating);
         text(19, y + 10, line, LCD_RGBPACK(105, 125, 112));
     }
-    if (pending_visible_count == 0)
+    if (pending_visible_count == 0 && pending_playlist_count == 0)
         text(7, 62, "NO CONFIRMED DEVICE EDITS YET", LCD_DARKGRAY);
-    text(7, 226, "APPEND-ONLY JOURNAL     MENU: BACK", LCD_LIGHTGRAY);
+    else {
+        rb->lcd_set_foreground(LCD_RGBPACK(166, 74, 15));
+        rb->lcd_fillrect(7, 207, 135, 25);
+        text(18, 214, "BURN LOCALLY", LCD_WHITE);
+    }
+    text(154, 214, "SELECT: BURN  MENU: BACK", LCD_LIGHTGRAY);
 }
 
 static void draw_index_status(void)
@@ -2064,7 +2520,8 @@ static void draw_index_status(void)
     rb->snprintf(line, sizeof(line), "%d PLAYLIST ADD REQUESTS",
                  pending_playlist_count);
     text(7, 142, line, LCD_RGBPACK(255, 145, 40));
-    text(7, 180, "REKORDBOX EXPORT REMAINS UNCHANGED", LCD_RGBPACK(145, 165, 151));
+    text(7, 180, "LOCAL BURN AVAILABLE IN PENDING EDITS",
+         LCD_RGBPACK(145, 165, 151));
     text(7, 226, "MENU: BACK", LCD_LIGHTGRAY);
 }
 
@@ -2212,6 +2669,15 @@ static void finish_confirmation(bool apply)
         } else {
             rb->splash(HZ * 2, "Could not queue playlist add");
         }
+    } else if (action == CONFIRM_GENRE) {
+        rb->strlcpy(selected_genre, confirm_genre,
+                    sizeof(selected_genre));
+        mode = MODE_METADATA;
+        save_snapshot = true;
+    } else if (action == CONFIRM_BURN) {
+        if (rbprep_burn_all())
+            rb->splash(HZ * 2, "Rekordbox edits burned locally");
+        refresh_pending_summary();
     }
     if (save_snapshot && !save_edit_snapshot())
         rb->splash(HZ * 2, "Edit applied, journal write failed");
@@ -2244,47 +2710,28 @@ static void draw_confirmation(void)
 
 static void draw_screen(void)
 {
-    char line[80];
-
     rb->lcd_set_background(LCD_BLACK);
     rb->lcd_set_drawmode(DRMODE_SOLID);
     if (mode == MODE_PLAYLISTS || mode == MODE_TRACKS ||
-        mode == MODE_LIBRARY || mode == MODE_SETTINGS ||
-        mode == MODE_PENDING || mode == MODE_INDEX) {
+        mode == MODE_LIBRARY || mode == MODE_USB || mode == MODE_SETTINGS ||
+        mode == MODE_PENDING || mode == MODE_INDEX || mode == MODE_GENRES) {
         rb->lcd_clear_display();
         if (mode == MODE_PLAYLISTS)
             draw_playlist_browser();
         else if (mode == MODE_TRACKS)
             draw_track_browser();
+        else if (mode == MODE_USB)
+            draw_usb_mode();
         else if (mode == MODE_SETTINGS)
             draw_settings();
         else if (mode == MODE_PENDING)
             draw_pending_edits();
         else if (mode == MODE_INDEX)
             draw_index_status();
-        else {
-            const char *items[] = {
-                "LIBRARY", "PLAYLISTS", "SETTINGS",
-                "PENDING EDITS", "INDEX STATUS", "EXIT TO ROCKBOX"
-            };
-            int i;
-            text(3, 3, "RB", LCD_RGBPACK(70, 235, 125));
-            text(23, 3, "LIBRARY", LCD_WHITE);
-            if (library_fd >= 0)
-                rb->snprintf(line, sizeof(line), "%lu TRACKS  INDEX ONLINE",
-                             (unsigned long)library_track_count);
-            else
-                rb->snprintf(line, sizeof(line), "RBPREP INDEX NOT FOUND");
-            text(10, 28, line, library_fd >= 0
-                 ? LCD_RGBPACK(70, 235, 125) : LCD_RGBPACK(255, 90, 70));
-            for (i = 0; i < 6; i++) {
-                if (i == selection) {
-                    rb->lcd_set_foreground(LCD_RGBPACK(25, 105, 175));
-                    rb->lcd_fillrect(0, 50 + i * 27, LCD_WIDTH, 25);
-                }
-                text(10, 56 + i * 27, items[i], LCD_WHITE);
-            }
-        }
+        else if (mode == MODE_GENRES)
+            draw_genre_picker();
+        else
+            draw_main_menu();
         if (confirm_active)
             draw_confirmation();
         rb->lcd_update();
@@ -2653,6 +3100,55 @@ static void toggle_playback(void)
     }
 }
 
+static void choose_genre(const char *name)
+{
+    rb->strlcpy(confirm_genre, name, sizeof(confirm_genre));
+    rb->snprintf(confirm_message, sizeof(confirm_message),
+                 "SET GENRE %.26s?", confirm_genre);
+    begin_confirmation(CONFIRM_GENRE);
+}
+
+static void add_genre_with_keyboard(void)
+{
+    char name[32] = "";
+    int start;
+    int end;
+
+    if (rb->kbd_input(name, sizeof(name), NULL) < 0) {
+        rb->lcd_setfont(FONT_SYSFIXED);
+        force_full_redraw = true;
+        return;
+    }
+    rb->lcd_setfont(FONT_SYSFIXED);
+    start = 0;
+    while (name[start] == ' ' || name[start] == '\t')
+        start++;
+    if (start > 0)
+        rb->memmove(name, name + start, rb->strlen(name + start) + 1);
+    end = rb->strlen(name);
+    while (end > 0 && (name[end - 1] == ' ' || name[end - 1] == '\t'))
+        name[--end] = '\0';
+    if (!name[0]) {
+        rb->splash(HZ, "Genre name is empty");
+    } else if (!append_custom_genre(name)) {
+        rb->splash(HZ * 2, "Could not save genre");
+    } else {
+        int i;
+        char candidate[32];
+        genre_selection = 0;
+        for (i = 0; i < genre_count; i++) {
+            if (genre_name_at(i, candidate, sizeof(candidate)) &&
+                !rb->strcasecmp(candidate, name)) {
+                genre_selection = i + 1;
+                break;
+            }
+        }
+        genre_top = MAX(0, genre_selection - RBPREP_LIST_ROWS + 1);
+        choose_genre(name);
+    }
+    force_full_redraw = true;
+}
+
 static void short_select(void)
 {
     if (mode == MODE_LIBRARY) {
@@ -2664,17 +3160,22 @@ static void short_select(void)
             mode = MODE_PLAYLISTS;
             force_full_redraw = true;
         } else if (selection == 2) {
-            mode = MODE_SETTINGS;
+            usb_selection = rb->global_settings->usb_audio != 0;
+            mode = MODE_USB;
             force_full_redraw = true;
         } else if (selection == 3) {
-            refresh_pending_summary();
-            mode = MODE_PENDING;
+            settings_selection = 0;
+            mode = MODE_SETTINGS;
             force_full_redraw = true;
         } else if (selection == 4) {
             refresh_pending_summary();
-            mode = MODE_INDEX;
+            mode = MODE_PENDING;
             force_full_redraw = true;
         } else if (selection == 5) {
+            refresh_pending_summary();
+            mode = MODE_INDEX;
+            force_full_redraw = true;
+        } else if (selection == 6) {
             rb->snprintf(confirm_message, sizeof(confirm_message),
                          "EXIT TO ROCKBOX?");
             begin_confirmation(CONFIRM_EXIT);
@@ -2699,12 +3200,35 @@ static void short_select(void)
     } else if (mode == MODE_TRACKS) {
         if (track_row_count > 0)
             play_track_row(track_selection);
+    } else if (mode == MODE_USB) {
+        apply_usb_choice(usb_selection);
+        rb->splash(HZ, usb_selection ? "USB DAC selected"
+                                     : "Data transfer selected");
+        force_full_redraw = true;
     } else if (mode == MODE_SETTINGS) {
-        waveform_half = !waveform_half;
+        if (settings_selection == 0)
+            visualizer_mode = !visualizer_mode;
+        else
+            waveform_half = !waveform_half;
         rebuild_waveform_height_lut();
         configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
                         ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
         force_full_redraw = true;
+    } else if (mode == MODE_PENDING) {
+        int changes = pending_snapshot_count + pending_playlist_count;
+        if (changes > 0) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "BURN %d DEVICE CHANGE%s?", changes,
+                         changes == 1 ? "" : "S");
+            begin_confirmation(CONFIRM_BURN);
+        }
+    } else if (mode == MODE_GENRES) {
+        char name[32];
+        if (genre_selection == 0) {
+            add_genre_with_keyboard();
+        } else if (genre_name_at(genre_selection - 1, name, sizeof(name))) {
+            choose_genre(name);
+        }
     } else if (mode == MODE_DECK) {
         enum rbprep_tool tool = active_tool();
         if (tool == TOOL_SEEK) {
@@ -2727,8 +3251,7 @@ static void short_select(void)
                 force_full_redraw = true;
             }
         } else if (tool == TOOL_WAVEFORM_STYLE) {
-            waveform_half = !waveform_half;
-            rebuild_waveform_height_lut();
+            visualizer_mode = !visualizer_mode;
             configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
                             ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
             force_full_redraw = true;
@@ -2775,7 +3298,20 @@ static void short_select(void)
     } else if (mode == MODE_METADATA) {
         enum rbprep_tool tool = active_tool();
         if (tool == TOOL_META_GENRE) {
-            rb->splash(HZ, "Genre keyboard: next pass");
+            int i;
+            char name[32];
+            genre_selection = 0;
+            genre_top = 0;
+            for (i = 0; i < genre_count; i++) {
+                if (genre_name_at(i, name, sizeof(name)) &&
+                    !rb->strcasecmp(name, selected_genre)) {
+                    genre_selection = i + 1;
+                    genre_top = MAX(0, genre_selection - 4);
+                    break;
+                }
+            }
+            mode = MODE_GENRES;
+            force_full_redraw = true;
         } else if (staged_tool == tool) {
             rb->snprintf(confirm_message, sizeof(confirm_message),
                          "KEEP METADATA CHANGE?");
@@ -2887,8 +3423,7 @@ static void adjust_active_tool(int direction)
     else if (tool == TOOL_PLAYLIST_MODE)
         playlist_playback = direction > 0;
     else if (tool == TOOL_WAVEFORM_STYLE) {
-        waveform_half = direction > 0;
-        rebuild_waveform_height_lut();
+        visualizer_mode = direction > 0;
         configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
                         ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
         force_full_redraw = true;
@@ -3049,9 +3584,11 @@ static void handle_escape_once(void)
     stop_editor_audio();
     if (mode == MODE_LIBRARY) {
         force_full_redraw = true;
-    } else if (mode == MODE_SETTINGS || mode == MODE_PENDING ||
-               mode == MODE_INDEX) {
+    } else if (mode == MODE_USB || mode == MODE_SETTINGS ||
+               mode == MODE_PENDING || mode == MODE_INDEX) {
         mode = MODE_LIBRARY;
+    } else if (mode == MODE_GENRES) {
+        mode = MODE_METADATA;
     } else if (mode == MODE_PLAYLISTS &&
                tree_parent != RBPREP_ROOT_NODE) {
         struct rbprep_node_record parent;
@@ -3130,14 +3667,19 @@ enum plugin_status plugin_start(const void *parameter)
     selected_title[0] = selected_artist[0] = selected_genre[0] = '\0';
     selected_key[0] = selected_extension[0] = '\0';
     selected_track_index = selected_track_id = -1;
+    settings_selection = genre_selection = genre_top = 0;
+    usb_selection = rb->global_settings->usb_audio != 0;
     configfile_load(RBPREP_CONFIG_FILE, rbprep_config,
                     ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
     waveform_half = !!waveform_half;
+    visualizer_mode = !!visualizer_mode;
     scrub_step_index = MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1,
                                   scrub_step_index));
     rebuild_waveform_height_lut();
     clear_analysis();
     open_library_index();
+    load_genre_rollup();
+    refresh_pending_summary();
     reset_play_clock(playhead, *rb->current_tick);
     overview_deadline = *rb->current_tick;
     hud_scroll_deadline = *rb->current_tick;
@@ -3168,6 +3710,8 @@ enum plugin_status plugin_start(const void *parameter)
             stop_editor_audio();
             if (library_fd >= 0)
                 rb->close(library_fd);
+            if (genre_fd >= 0)
+                rb->close(genre_fd);
             return PLUGIN_OK;
         }
 
@@ -3232,6 +3776,8 @@ enum plugin_status plugin_start(const void *parameter)
                 stop_editor_audio();
                 if (library_fd >= 0)
                     rb->close(library_fd);
+                if (genre_fd >= 0)
+                    rb->close(genre_fd);
                 return PLUGIN_USB_CONNECTED;
             }
             continue;
@@ -3351,7 +3897,7 @@ enum plugin_status plugin_start(const void *parameter)
             if (tool_menu_active && mode >= MODE_DECK)
                 browse_tool_menu(1);
             else if (mode == MODE_LIBRARY)
-                selection = MIN(5, selection + 1);
+                selection = MIN(6, selection + 1);
             else if (mode == MODE_PLAYLISTS && tree_child_count > 0) {
                 tree_selection = MIN(tree_child_count - 1,
                                      tree_selection + 1);
@@ -3363,13 +3909,14 @@ enum plugin_status plugin_start(const void *parameter)
                 if (track_selection >= track_top + RBPREP_LIST_ROWS)
                     track_top = track_selection - RBPREP_LIST_ROWS + 1;
             }
-            else if (mode == MODE_SETTINGS) {
-                waveform_half = 1;
-                rebuild_waveform_height_lut();
-                configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
-                                ARRAYLEN(rbprep_config),
-                                RBPREP_CONFIG_VERSION);
-                force_full_redraw = true;
+            else if (mode == MODE_USB)
+                usb_selection = 1;
+            else if (mode == MODE_SETTINGS)
+                settings_selection = MIN(1, settings_selection + 1);
+            else if (mode == MODE_GENRES) {
+                genre_selection = MIN(genre_count, genre_selection + 1);
+                if (genre_selection >= genre_top + RBPREP_LIST_ROWS)
+                    genre_top = genre_selection - RBPREP_LIST_ROWS + 1;
             } else if (mode != MODE_PENDING && mode != MODE_INDEX)
                 adjust_active_tool(1);
             break;
@@ -3387,13 +3934,14 @@ enum plugin_status plugin_start(const void *parameter)
                 track_selection = MAX(0, track_selection - 1);
                 if (track_selection < track_top)
                     track_top = track_selection;
-            } else if (mode == MODE_SETTINGS) {
-                waveform_half = 0;
-                rebuild_waveform_height_lut();
-                configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
-                                ARRAYLEN(rbprep_config),
-                                RBPREP_CONFIG_VERSION);
-                force_full_redraw = true;
+            } else if (mode == MODE_USB)
+                usb_selection = 0;
+            else if (mode == MODE_SETTINGS)
+                settings_selection = MAX(0, settings_selection - 1);
+            else if (mode == MODE_GENRES) {
+                genre_selection = MAX(0, genre_selection - 1);
+                if (genre_selection < genre_top)
+                    genre_top = genre_selection;
             } else if (mode != MODE_PENDING && mode != MODE_INDEX)
                 adjust_active_tool(-1);
             break;
@@ -3456,6 +4004,8 @@ enum plugin_status plugin_start(const void *parameter)
                 stop_editor_audio();
                 if (library_fd >= 0)
                     rb->close(library_fd);
+                if (genre_fd >= 0)
+                    rb->close(genre_fd);
                 return PLUGIN_USB_CONNECTED;
             }
             break;

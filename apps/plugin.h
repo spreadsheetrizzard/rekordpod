@@ -179,7 +179,7 @@ int plugin_open(const char *plugin, const char *parameter);
  * when this happens please take the opportunity to sort in
  * any new functions "waiting" at the end of the list.
  */
-#define PLUGIN_API_VERSION 284
+#define PLUGIN_API_VERSION 285
 
 /* 239 Marks the removal of ARCHOS HWCODEC and CHARCELL */
 
@@ -1045,6 +1045,16 @@ struct plugin_api {
     int (*gesture_flick_get_in_vp)(const struct gesture_event *gevt,
                                    const struct viewport *vp);
     int (*gesture_flick_get)(const struct gesture_event *gevt);
+#endif
+#ifdef USB_ENABLE_AUDIO
+    void (*usb_set_audio)(int value);
+#endif
+#ifdef USB_ENABLE_HID
+    void (*usb_set_hid)(bool enable);
+#endif
+#if !defined(SIMULATOR) && !defined(USB_NONE) && \
+    (defined(HAVE_USB_ADB) || defined(HAVE_USB_POWER))
+    void (*usb_set_mode)(int mode);
 #endif
 };
 

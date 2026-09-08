@@ -880,6 +880,16 @@ static const struct plugin_api rockbox_api = {
     gesture_flick_get_in_vp,
     gesture_flick_get,
 #endif
+#ifdef USB_ENABLE_AUDIO
+    usb_set_audio,
+#endif
+#ifdef USB_ENABLE_HID
+    usb_set_hid,
+#endif
+#if !defined(SIMULATOR) && !defined(USB_NONE) && \
+    (defined(HAVE_USB_ADB) || defined(HAVE_USB_POWER))
+    usb_set_mode,
+#endif
 };
 
 static int plugin_buffer_handle;

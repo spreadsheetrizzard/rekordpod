@@ -34,6 +34,7 @@ EDIT_MAGIC = b"RBE1"
 EDIT_VERSION = 1
 EDIT_JOURNAL = Path(".rockbox/rbprep/edits.rbe")
 PLAYLIST_JOURNAL = Path(".rockbox/rbprep/playlist-adds.rba")
+LOCAL_BURN_STATE = Path(".rockbox/rbprep/local-burn.rbs")
 PDB_PATH = Path("PIONEER/rekordbox/export.pdb")
 COLOR_RGB = (
     (255, 70, 70), (255, 145, 40), (250, 220, 45), (55, 235, 95),
@@ -89,10 +90,13 @@ def _cstring(data: bytes) -> str:
     return data.split(b"\0", 1)[0].decode("utf-8", "replace")
 
 
-def parse_edit_journal(path: Path) -> tuple[dict[int, EditSnapshot], int]:
+def parse_edit_journal(path: Path, start: int = 0) -> tuple[dict[int, EditSnapshot], int]:
     if not path.exists():
         return {}, 0
     data = path.read_bytes()
+    if start < 0 or start > len(data) or start % EDIT_RECORD_SIZE:
+        start = 0
+    data = data[start:]
     latest: dict[int, EditSnapshot] = {}
     valid = 0
     for offset in range(0, len(data) - EDIT_RECORD_SIZE + 1,
@@ -125,12 +129,15 @@ def parse_edit_journal(path: Path) -> tuple[dict[int, EditSnapshot], int]:
     return latest, valid
 
 
-def parse_playlist_journal(path: Path) -> tuple[list[PlaylistAdd], int]:
+def parse_playlist_journal(path: Path, start: int = 0) -> tuple[list[PlaylistAdd], int]:
     if not path.exists():
         return [], 0
+    data = path.read_bytes()
+    if start < 0 or start > len(data):
+        start = 0
     latest: dict[tuple[int, int], PlaylistAdd] = {}
     valid = 0
-    for line in path.read_text("utf-8", errors="replace").splitlines():
+    for line in data[start:].decode("utf-8", "replace").splitlines():
         parts = line.split("\t", 2)
         if len(parts) != 3:
             continue
@@ -310,6 +317,17 @@ def current_color_index(color_id: int) -> int:
     return color_id - 1 if 1 <= color_id <= 8 else 0
 
 
+def source_bpm_from_cache(volume: Path, track_id: int, fallback: int) -> int:
+    path = volume / f".rockbox/rbprep/tracks/{track_id:06d}.rbw"
+    try:
+        header = path.read_bytes()[:28]
+    except OSError:
+        return fallback
+    if len(header) == 28 and header[:4] == b"RBW3":
+        return max(1, struct.unpack_from("<H", header, 24)[0])
+    return fallback
+
+
 def plan_changes(volume: Path, snapshots: dict[int, EditSnapshot],
                  playlist_adds: list[PlaylistAdd]) -> tuple[
                      bytes, dict[Path, bytes], list[str], list[str]]:
@@ -356,7 +374,10 @@ def plan_changes(volume: Path, snapshots: dict[int, EditSnapshot],
             continue
         for path in analysis_files:
             original = path.read_bytes()
-            rewritten = rewrite_analysis(original, snapshot, track.tempo)
+            baseline_path = path.with_name(path.name + ".rbprep-bak")
+            baseline = baseline_path.read_bytes() if baseline_path.exists() else original
+            source_bpm = source_bpm_from_cache(volume, track_id, track.tempo)
+            rewritten = rewrite_analysis(baseline, snapshot, source_bpm)
             if rewritten != original:
                 analysis_outputs[path] = rewritten
                 changes.append(f"track {track_id}: analysis {path.suffix[1:]}")
@@ -424,6 +445,19 @@ def atomic_replace(path: Path, data: bytes) -> None:
             temporary.unlink()
 
 
+def read_local_burn_offsets(path: Path) -> tuple[int, int]:
+    if not path.exists():
+        return 0, 0
+    data = path.read_bytes()
+    if len(data) != 12 or data[:4] != b"RBL1":
+        return 0, 0
+    return struct.unpack_from("<II", data, 4)
+
+
+def local_burn_state(edit_size: int, playlist_size: int) -> bytes:
+    return struct.pack("<4sII", b"RBL1", edit_size, playlist_size)
+
+
 def compact_edit_journal(snapshots: dict[int, EditSnapshot]) -> bytes:
     return b"".join(snapshot.raw for snapshot in snapshots.values())
 
@@ -440,11 +474,14 @@ def run(args: argparse.Namespace) -> int:
     pdb_path = volume / PDB_PATH
     edit_path = volume / EDIT_JOURNAL
     playlist_path = volume / PLAYLIST_JOURNAL
+    burn_state_path = volume / LOCAL_BURN_STATE
     if not volume.is_dir() or not pdb_path.is_file():
         raise SystemExit(f"No rekordbox export found at {pdb_path}")
 
-    snapshots, edit_records = parse_edit_journal(edit_path)
-    playlist_adds, playlist_records = parse_playlist_journal(playlist_path)
+    edit_start, playlist_start = read_local_burn_offsets(burn_state_path)
+    snapshots, edit_records = parse_edit_journal(edit_path, edit_start)
+    playlist_adds, playlist_records = parse_playlist_journal(
+        playlist_path, playlist_start)
     print(
         f"Journal: {edit_records} edit snapshots -> {len(snapshots)} tracks; "
         f"{playlist_records} playlist requests -> {len(playlist_adds)} unique."
@@ -455,6 +492,7 @@ def run(args: argparse.Namespace) -> int:
         "apply": bool(args.apply), "snapshot_records": edit_records,
         "unique_tracks": len(snapshots), "playlist_records": playlist_records,
         "unique_playlist_adds": len(playlist_adds),
+        "local_burn_offsets": [edit_start, playlist_start],
         "net_changes": changes, "warnings": warnings,
         "analysis_files": [str(path.relative_to(volume)) for path in analysis],
     }
@@ -466,13 +504,25 @@ def run(args: argparse.Namespace) -> int:
     if not args.apply:
         print(f"Dry run: {len(changes)} net change(s); nothing was written.")
         return 0
+    edit_size = edit_path.stat().st_size if edit_path.exists() else 0
+    playlist_size = playlist_path.stat().st_size if playlist_path.exists() else 0
     if not changes:
+        if warnings:
+            print("No writable changes were applied; unresolved records remain "
+                  "pending.", file=sys.stderr)
+            return 1
+        atomic_replace(burn_state_path,
+                       local_burn_state(edit_size, playlist_size))
         print("The Rekordbox export already matches the newest RBPrep state.")
         return 0
 
     replacements: dict[Path, bytes] = {pdb_path: pdb_bytes, **analysis}
-    replacements[edit_path] = compact_edit_journal(snapshots)
-    replacements[playlist_path] = compact_playlist_journal(playlist_adds)
+    all_snapshots, _ = parse_edit_journal(edit_path)
+    all_playlist_adds, _ = parse_playlist_journal(playlist_path)
+    replacements[edit_path] = compact_edit_journal(all_snapshots)
+    replacements[playlist_path] = compact_playlist_journal(all_playlist_adds)
+    replacements[burn_state_path] = local_burn_state(
+        len(replacements[edit_path]), len(replacements[playlist_path]))
     original = {path: path.read_bytes() if path.exists() else None
                 for path in replacements}
     backup_sources = [path for path, data in original.items() if data is not None]

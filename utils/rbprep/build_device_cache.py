@@ -186,6 +186,19 @@ def build_index(connection: sqlite3.Connection) -> bytes:
     return header + track_records + node_records + member_records + strings.data
 
 
+def build_genre_index(connection: sqlite3.Connection) -> bytes:
+    """Build the compact alphabetical rollup used by the device picker."""
+    names = [str(row[0]).strip() for row in connection.execute(
+        "SELECT DISTINCT genre FROM tracks WHERE TRIM(genre) <> '' "
+        "ORDER BY genre COLLATE NOCASE"
+    )]
+    strings = StringTable()
+    offsets = b"".join(struct.pack("<I", strings.add(name)) for name in names)
+    header = struct.pack("<4sHHII", b"RBG1", 1, 16, len(names),
+                         len(strings.data))
+    return header + offsets + strings.data
+
+
 def cue_color(value: object) -> int:
     return CUE_COLORS.get(str(value or "").upper(), 0)
 
@@ -255,6 +268,7 @@ def build(args: argparse.Namespace) -> None:
         "ORDER BY CAST(rekordbox_track_id AS INTEGER)"
     ).fetchall()
     index = build_index(connection)
+    genres = build_genre_index(connection)
 
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -273,6 +287,7 @@ def build(args: argparse.Namespace) -> None:
                 if not item.filename.startswith(".rockbox/rbprep/"):
                     target.writestr(item, source.read(item.filename))
             target.writestr(zip_info(".rockbox/rbprep/library.rbi"), index)
+            target.writestr(zip_info(".rockbox/rbprep/genres.rbg"), genres)
             for current, (stable_key, track_id, bpm, rating, color) in enumerate(
                 tracks, 1
             ):
