@@ -36,6 +36,7 @@ struct rbprep_pdb_track {
 };
 
 static unsigned char rbprep_burn_page[RBPREP_PDB_PAGE_MAX];
+static char rbprep_burn_failure_detail[80];
 
 static uint16_t burn_be16(const unsigned char *p)
 {
@@ -218,6 +219,71 @@ static int pdb_present_count(const unsigned char *page, int page_size,
                 count++;
     }
     return count;
+}
+
+static bool pdb_validate_structure(struct rbprep_pdb *pdb)
+{
+    off_t file_size = rb->filesize(pdb->fd);
+    uint32_t file_pages;
+    uint32_t table_index;
+
+    if (file_size < (off_t)pdb->page_size ||
+        file_size % pdb->page_size != 0)
+        return false;
+    file_pages = file_size / pdb->page_size;
+    for (table_index = 0; table_index < pdb->table_count; table_index++) {
+        unsigned char table[16];
+        uint32_t type;
+        uint32_t page;
+        uint32_t last;
+        uint32_t guard = 0;
+
+        if (!burn_read_at(pdb->fd, 0x1c + table_index * 16,
+                          table, sizeof(table)))
+            return false;
+        type = read_u32(table);
+        page = read_u32(table + 8);
+        last = read_u32(table + 12);
+        if (page >= file_pages || last >= file_pages)
+            return false;
+        while (guard++ <= file_pages) {
+            int slots;
+            int used;
+            int slot;
+            uint32_t next;
+
+            if (page >= file_pages ||
+                !burn_read_at(pdb->fd, page * pdb->page_size,
+                              rbprep_burn_page, pdb->page_size) ||
+                read_u32(rbprep_burn_page + 4) != page ||
+                read_u32(rbprep_burn_page + 8) != type)
+                return false;
+            next = read_u32(rbprep_burn_page + 0x0c);
+            if (!(rbprep_burn_page[0x1b] & 0x40)) {
+                slots = pdb_slot_count(rbprep_burn_page);
+                used = read_u16(rbprep_burn_page + 0x1e);
+                if (slots < 0 || slots > 511 || used < 0 ||
+                    0x28 + used + pdb_directory_bytes(slots) >
+                    (int)pdb->page_size)
+                    return false;
+                for (slot = 0; slot < slots; slot++) {
+                    if (pdb_row_present(rbprep_burn_page,
+                                        pdb->page_size, slot) &&
+                        pdb_row_heap_offset(rbprep_burn_page,
+                                            pdb->page_size, slot) >= used)
+                        return false;
+                }
+            }
+            if (page == last)
+                break;
+            if (next >= file_pages || next == page)
+                return false;
+            page = next;
+        }
+        if (page != last || guard > file_pages + 1)
+            return false;
+    }
+    return true;
 }
 
 static bool pdb_next_page(struct rbprep_pdb *pdb, uint32_t page,
@@ -879,8 +945,19 @@ static int pdb_playlist_entry_index(struct rbprep_pdb *pdb, uint32_t track,
     return maximum;
 }
 
-static bool pdb_add_playlist_entry(struct rbprep_pdb *pdb, uint32_t track,
-                                   uint32_t playlist)
+enum rbprep_playlist_add_result {
+    PLAYLIST_ADD_OK,
+    PLAYLIST_ADD_TRACK_MISSING,
+    PLAYLIST_ADD_PLAYLIST_MISSING,
+    PLAYLIST_ADD_IS_FOLDER,
+    PLAYLIST_ADD_SCAN_FAILED,
+    PLAYLIST_ADD_APPEND_FAILED,
+    PLAYLIST_ADD_VERIFY_FAILED
+};
+
+static enum rbprep_playlist_add_result
+pdb_add_playlist_entry(struct rbprep_pdb *pdb, uint32_t track,
+                       uint32_t playlist)
 {
     unsigned char row[12];
     bool folder;
@@ -888,18 +965,25 @@ static bool pdb_add_playlist_entry(struct rbprep_pdb *pdb, uint32_t track,
     int maximum;
     struct rbprep_pdb_track ignored;
 
-    if (!pdb_find_track(pdb, track, &ignored) ||
-        !pdb_playlist_exists(pdb, playlist, &folder) || folder)
-        return false;
+    if (!pdb_find_track(pdb, track, &ignored))
+        return PLAYLIST_ADD_TRACK_MISSING;
+    if (!pdb_playlist_exists(pdb, playlist, &folder))
+        return PLAYLIST_ADD_PLAYLIST_MISSING;
+    if (folder)
+        return PLAYLIST_ADD_IS_FOLDER;
     maximum = pdb_playlist_entry_index(pdb, track, playlist, &present);
     if (maximum < 0)
-        return false;
+        return PLAYLIST_ADD_SCAN_FAILED;
     if (present)
-        return true;
+        return PLAYLIST_ADD_OK;
     write_u32(row, maximum + 1);
     write_u32(row + 4, track);
     write_u32(row + 8, playlist);
-    return pdb_append_row(pdb, 8, row, sizeof(row), sizeof(row));
+    if (!pdb_append_row(pdb, 8, row, sizeof(row), sizeof(row)))
+        return PLAYLIST_ADD_APPEND_FAILED;
+    maximum = pdb_playlist_entry_index(pdb, track, playlist, &present);
+    return maximum >= 0 && present ? PLAYLIST_ADD_OK
+                                   : PLAYLIST_ADD_VERIFY_FAILED;
 }
 
 static bool burn_record_is_latest(int fd, uint32_t track_id, off_t after)
@@ -1190,13 +1274,16 @@ static bool burn_analysis_for_track(const struct rbprep_pdb_track *track,
 }
 
 static void burn_finish_analysis_files(struct rbprep_pdb *pdb,
-                                       bool restore)
+                                       uint32_t edit_offset, bool restore)
 {
     unsigned char record[RBPREP_EDIT_RECORD_SIZE];
     int fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
 
     if (fd < 0)
         return;
+    if (edit_offset > (uint32_t)rb->filesize(fd))
+        edit_offset = 0;
+    rb->lseek(fd, edit_offset, SEEK_SET);
     while (rb->read(fd, record, sizeof(record)) == sizeof(record)) {
         off_t after = rb->lseek(fd, 0, SEEK_CUR);
         struct rbprep_pdb_track track;
@@ -1223,39 +1310,114 @@ static void burn_finish_analysis_files(struct rbprep_pdb *pdb,
     rb->close(fd);
 }
 
-static bool burn_playlist_journal(struct rbprep_pdb *pdb)
+static bool burn_playlist_line(struct rbprep_pdb *pdb, char *line,
+                               int *completed, int total)
+{
+    char *first = rb->strchr(line, '\t');
+    char *second = first ? rb->strchr(first + 1, '\t') : NULL;
+    uint32_t track;
+    uint32_t requested;
+    uint32_t playlist;
+    enum rbprep_playlist_add_result result;
+    const char *reason = "unknown";
+
+    if (!line[0])
+        return true;
+    if (!first || !second) {
+        rb->strlcpy(rbprep_burn_failure_detail,
+                    "malformed playlist request",
+                    sizeof(rbprep_burn_failure_detail));
+        return false;
+    }
+    *first = *second = '\0';
+    track = rb->strtoul(line, NULL, 10);
+    requested = rb->strtoul(first + 1, NULL, 10);
+    playlist = requested;
+    if (!track || !requested ||
+        !pdb_resolve_playlist(pdb, requested, second + 1, &playlist)) {
+        rb->snprintf(rbprep_burn_failure_detail,
+                     sizeof(rbprep_burn_failure_detail),
+                     "playlist %lu unresolved",
+                     (unsigned long)requested);
+        return false;
+    }
+    rb->splash_progress(MIN(*completed, total), total,
+                        "Adding to %.28s", second + 1);
+    result = pdb_add_playlist_entry(pdb, track, playlist);
+    if (result == PLAYLIST_ADD_OK) {
+        (*completed)++;
+        return true;
+    }
+    if (result == PLAYLIST_ADD_TRACK_MISSING)
+        reason = "track missing";
+    else if (result == PLAYLIST_ADD_PLAYLIST_MISSING)
+        reason = "playlist missing";
+    else if (result == PLAYLIST_ADD_IS_FOLDER)
+        reason = "destination is folder";
+    else if (result == PLAYLIST_ADD_SCAN_FAILED)
+        reason = "entry scan failed";
+    else if (result == PLAYLIST_ADD_APPEND_FAILED)
+        reason = "page append failed";
+    else if (result == PLAYLIST_ADD_VERIFY_FAILED)
+        reason = "read-back failed";
+    rb->snprintf(rbprep_burn_failure_detail,
+                 sizeof(rbprep_burn_failure_detail),
+                 "track %lu / list %lu: %s",
+                 (unsigned long)track, (unsigned long)playlist, reason);
+    return false;
+}
+
+static bool burn_playlist_journal(struct rbprep_pdb *pdb,
+                                  uint32_t playlist_offset,
+                                  int *completed, int total)
 {
     char line[160];
     int length = 0;
+    bool overflow = false;
     unsigned char value;
     int fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
 
     if (fd < 0)
         return true;
+    if (playlist_offset > (uint32_t)rb->filesize(fd))
+        playlist_offset = 0;
+    if (rb->lseek(fd, playlist_offset, SEEK_SET) < 0) {
+        rb->close(fd);
+        rb->strlcpy(rbprep_burn_failure_detail,
+                    "playlist journal seek",
+                    sizeof(rbprep_burn_failure_detail));
+        return false;
+    }
     while (rb->read(fd, &value, 1) == 1) {
         if (value == '\n') {
-            char *first;
-            char *second;
-            uint32_t track;
-            uint32_t playlist;
             line[length] = '\0';
-            first = rb->strchr(line, '\t');
-            second = first ? rb->strchr(first + 1, '\t') : NULL;
-            if (first && second) {
-                *first = *second = '\0';
-                track = rb->strtoul(line, NULL, 10);
-                playlist = rb->strtoul(first + 1, NULL, 10);
-                if (!pdb_resolve_playlist(pdb, playlist, second + 1,
-                                          &playlist) ||
-                    !pdb_add_playlist_entry(pdb, track, playlist)) {
-                    rb->close(fd);
-                    return false;
-                }
+            if (overflow ||
+                !burn_playlist_line(pdb, line, completed, total)) {
+                if (overflow)
+                    rb->strlcpy(rbprep_burn_failure_detail,
+                                "playlist request too long",
+                                sizeof(rbprep_burn_failure_detail));
+                rb->close(fd);
+                return false;
             }
             length = 0;
+            overflow = false;
         } else if (value != '\r' && length + 1 < (int)sizeof(line)) {
             line[length++] = value;
+        } else if (value != '\r') {
+            overflow = true;
         }
+    }
+    line[length] = '\0';
+    if (overflow ||
+        (length > 0 &&
+         !burn_playlist_line(pdb, line, completed, total))) {
+        if (overflow)
+            rb->strlcpy(rbprep_burn_failure_detail,
+                        "playlist request too long",
+                        sizeof(rbprep_burn_failure_detail));
+        rb->close(fd);
+        return false;
     }
     rb->close(fd);
     return true;
@@ -1267,12 +1429,16 @@ static bool rbprep_burn_all(void)
     unsigned char record[RBPREP_EDIT_RECORD_SIZE];
     unsigned char *memory;
     size_t memory_size;
+    uint32_t edit_offset;
+    uint32_t playlist_offset;
     int fd;
     int completed = 0;
-    int total = MAX(1, pending_snapshot_count);
+    int total = MAX(1, pending_snapshot_count + pending_playlist_count);
     bool success = false;
     const char *failure = "initialization";
 
+    rbprep_burn_failure_detail[0] = '\0';
+    read_burn_offsets(&edit_offset, &playlist_offset);
     stop_editor_audio();
     /* The analysis transaction needs two simultaneous copies of the largest
        ANLZ file. Explicitly release playback's codec/buffering allocation
@@ -1308,6 +1474,15 @@ static bool rbprep_burn_all(void)
 
     fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
     if (fd >= 0) {
+        if (edit_offset > (uint32_t)rb->filesize(fd) ||
+            edit_offset % RBPREP_EDIT_RECORD_SIZE)
+            edit_offset = 0;
+        if (rb->lseek(fd, edit_offset, SEEK_SET) < 0) {
+            failure = "edit journal seek";
+            rb->close(fd);
+            rb->close(pdb.fd);
+            goto done;
+        }
         while (rb->read(fd, record, sizeof(record)) == sizeof(record)) {
             off_t after = rb->lseek(fd, 0, SEEK_CUR);
             struct rbprep_pdb_track track;
@@ -1323,7 +1498,7 @@ static bool rbprep_burn_all(void)
             if (!pdb_patch_snapshot(&pdb, record, &track)) {
                 failure = "track lookup/PDB";
                 rb->close(fd);
-                burn_finish_analysis_files(&pdb, true);
+                burn_finish_analysis_files(&pdb, edit_offset, true);
                 rb->close(pdb.fd);
                 goto done;
             }
@@ -1331,7 +1506,7 @@ static bool rbprep_burn_all(void)
                                          memory, memory_size)) {
                 failure = "ANLZ rewrite";
                 rb->close(fd);
-                burn_finish_analysis_files(&pdb, true);
+                burn_finish_analysis_files(&pdb, edit_offset, true);
                 rb->close(pdb.fd);
                 goto done;
             }
@@ -1339,9 +1514,9 @@ static bool rbprep_burn_all(void)
         }
         rb->close(fd);
     }
-    if (!burn_playlist_journal(&pdb)) {
+    if (!burn_playlist_journal(&pdb, playlist_offset, &completed, total)) {
         failure = "playlist table";
-        burn_finish_analysis_files(&pdb, true);
+        burn_finish_analysis_files(&pdb, edit_offset, true);
         rb->close(pdb.fd);
         goto done;
     }
@@ -1349,26 +1524,38 @@ static bool rbprep_burn_all(void)
         unsigned char raw[4];
         if (!burn_read_at(pdb.fd, 0x14, raw, 4)) {
             failure = "PDB sequence read";
-            burn_finish_analysis_files(&pdb, true);
+            burn_finish_analysis_files(&pdb, edit_offset, true);
             rb->close(pdb.fd);
             goto done;
         }
         write_u32(raw, read_u32(raw) + 1);
         if (!burn_write_at(pdb.fd, 0x14, raw, 4)) {
             failure = "PDB sequence write";
-            burn_finish_analysis_files(&pdb, true);
+            burn_finish_analysis_files(&pdb, edit_offset, true);
             rb->close(pdb.fd);
             goto done;
         }
+    }
+    if (!pdb_validate_structure(&pdb)) {
+        failure = "PDB structure";
+        burn_finish_analysis_files(&pdb, edit_offset, true);
+        rb->close(pdb.fd);
+        goto done;
     }
     rb->close(pdb.fd);
     if (!pdb_open(&pdb, RBPREP_PDB_NEW)) {
         failure = "PDB validation";
         struct rbprep_pdb original;
         if (pdb_open(&original, RBPREP_PDB)) {
-            burn_finish_analysis_files(&original, true);
+            burn_finish_analysis_files(&original, edit_offset, true);
             rb->close(original.fd);
         }
+        goto done;
+    }
+    if (!pdb_validate_structure(&pdb)) {
+        failure = "PDB validation";
+        burn_finish_analysis_files(&pdb, edit_offset, true);
+        rb->close(pdb.fd);
         goto done;
     }
     rb->close(pdb.fd);
@@ -1377,7 +1564,7 @@ static bool rbprep_burn_all(void)
         failure = "PDB commit";
         struct rbprep_pdb original;
         if (pdb_open(&original, RBPREP_PDB)) {
-            burn_finish_analysis_files(&original, true);
+            burn_finish_analysis_files(&original, edit_offset, true);
             rb->close(original.fd);
         }
         goto done;
@@ -1386,13 +1573,13 @@ static bool rbprep_burn_all(void)
         failure = "PDB reopen";
         struct rbprep_pdb original;
         if (pdb_open(&original, RBPREP_PDB_PREV)) {
-            burn_finish_analysis_files(&original, true);
+            burn_finish_analysis_files(&original, edit_offset, true);
             rb->close(original.fd);
         }
         burn_restore_previous(RBPREP_PDB, RBPREP_PDB_PREV);
         goto done;
     }
-    burn_finish_analysis_files(&pdb, false);
+    burn_finish_analysis_files(&pdb, edit_offset, false);
     rb->close(pdb.fd);
     rb->remove(RBPREP_PDB_PREV);
     {
@@ -1416,8 +1603,13 @@ static bool rbprep_burn_all(void)
 done:
     rb->remove(RBPREP_PDB_NEW);
     rb->plugin_release_audio_buffer();
-    if (!success)
-        rb->splashf(HZ * 3, "BURN FAILED: %s", failure);
+    if (!success) {
+        if (rbprep_burn_failure_detail[0])
+            rb->splashf(HZ * 4, "BURN FAILED: %s",
+                        rbprep_burn_failure_detail);
+        else
+            rb->splashf(HZ * 3, "BURN FAILED: %s", failure);
+    }
     restore_black_canvas();
     return success;
 }

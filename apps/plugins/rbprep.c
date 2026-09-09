@@ -2018,11 +2018,28 @@ static void draw_turntable(void)
     arm_mid1_y = ((RBPREP_WAVE_TOP + 30) * 2 + stylus_y) / 3;
     arm_mid2_x = (192 + stylus_x * 2) / 3 - 5;
     arm_mid2_y = (RBPREP_WAVE_TOP + 30 + stylus_y * 2) / 3;
+    /* A three-pixel brushed-metal tube reads much more like the curved arm
+       on a real deck than a single, computer-perfect line. */
+    rb->lcd_set_foreground(LCD_RGBPACK(67, 73, 69));
+    rb->lcd_drawline(192, RBPREP_WAVE_TOP + 31,
+                     arm_mid1_x, arm_mid1_y + 1);
+    rb->lcd_drawline(arm_mid1_x, arm_mid1_y + 1,
+                     arm_mid2_x, arm_mid2_y + 1);
+    rb->lcd_drawline(arm_mid2_x, arm_mid2_y + 1,
+                     stylus_x, stylus_y + 1);
     rb->lcd_set_foreground(LCD_RGBPACK(178, 186, 181));
     rb->lcd_drawline(192, RBPREP_WAVE_TOP + 30, arm_mid1_x, arm_mid1_y);
     rb->lcd_drawline(arm_mid1_x, arm_mid1_y, arm_mid2_x, arm_mid2_y);
     rb->lcd_drawline(arm_mid2_x, arm_mid2_y, stylus_x, stylus_y);
-    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_drawline(192, RBPREP_WAVE_TOP + 29,
+                     arm_mid1_x, arm_mid1_y - 1);
+    rb->lcd_drawline(arm_mid1_x, arm_mid1_y - 1,
+                     arm_mid2_x, arm_mid2_y - 1);
+    rb->lcd_drawline(arm_mid2_x, arm_mid2_y - 1,
+                     stylus_x, stylus_y - 1);
+    rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
+    xlcd_fillcircle(arm_mid1_x, arm_mid1_y, 1);
+    xlcd_fillcircle(arm_mid2_x, arm_mid2_y, 1);
     rb->lcd_drawline(stylus_x - 2, stylus_y - 1,
                      stylus_x + 2, stylus_y + 2);
     rb->lcd_drawpixel(stylus_x, stylus_y + 3);
@@ -2048,26 +2065,27 @@ static void draw_turntable(void)
     if (lamp_phase & 1)
         xlcd_drawcircle(164, RBPREP_WAVE_TOP + 20, 5);
 
-    /* Rectangular transport in the lower-left deck corner. */
+    /* Compact transport in clear chassis space below-left of the platter. */
     {
         bool playing = (rb->audio_status() & AUDIO_STATUS_PLAY) &&
                        !(rb->audio_status() & AUDIO_STATUS_PAUSE);
-        int button_y = RBPREP_WAVE_BOTTOM - 22;
+        int button_x = 4;
+        int button_y = RBPREP_WAVE_BOTTOM - 14;
 
         rb->lcd_set_foreground(playing ? LCD_RGBPACK(12, 49, 29)
                                       : LCD_RGBPACK(11, 14, 12));
-        rb->lcd_fillrect(8, button_y, 42, 17);
+        rb->lcd_fillrect(button_x, button_y, 25, 11);
         rb->lcd_set_foreground(RBPREP_GREEN);
-        rb->lcd_drawrect(8, button_y, 42, 17);
-        rb->lcd_fillrect(8, button_y, 4, 17);
+        rb->lcd_drawrect(button_x, button_y, 25, 11);
+        rb->lcd_fillrect(button_x, button_y, 3, 11);
         rb->lcd_set_foreground(LCD_WHITE);
         if (playing) {
-            rb->lcd_fillrect(26, button_y + 4, 3, 9);
-            rb->lcd_fillrect(33, button_y + 4, 3, 9);
+            rb->lcd_fillrect(button_x + 10, button_y + 3, 2, 6);
+            rb->lcd_fillrect(button_x + 15, button_y + 3, 2, 6);
         } else {
-            xlcd_filltriangle(25, button_y + 3,
-                              25, button_y + 13,
-                              36, button_y + 8);
+            xlcd_filltriangle(button_x + 10, button_y + 2,
+                              button_x + 10, button_y + 8,
+                              button_x + 18, button_y + 5);
         }
     }
 
@@ -3472,11 +3490,11 @@ static void draw_beat_phase(void)
     }
 
     for (i = 0; i < 4; i++) {
-        int x = 238 + i * 8;
+        int x = 246 + i * 7;
         rb->lcd_set_foreground(i + 1 == beat
                               ? LCD_RGBPACK(70, 235, 125)
                               : LCD_RGBPACK(35, 53, 42));
-        rb->lcd_fillrect(x, 71, 6, 7);
+        rb->lcd_fillrect(x, 71, 5, 7);
     }
 }
 
@@ -3708,10 +3726,10 @@ static void draw_tool_indicators(void)
                                    : LCD_RGBPACK(82, 87, 84);
 
     draw_beat_phase();
-    text(272, 69, "Q",
+    text(280, 69, "Q",
          quantize ? RBPREP_GREEN
                   : LCD_RGBPACK(105, 115, 108));
-    text(288, 69, "CUE", color);
+    text(294, 69, "CUE", color);
 }
 
 static void draw_tool_row(void)
@@ -4034,8 +4052,10 @@ static bool append_playlist_journal(int node_index)
     int i;
     uint32_t playlist_id;
 
-    if (!read_node_record(node_index, &node) ||
+    if (!read_node_record(node_index, &node) || node.kind == 0 ||
         !read_index_string(node.name_offset, name, sizeof(name)))
+        return false;
+    if (library_index_version >= 2 && !node.source_id)
         return false;
     playlist_id = node.source_id ? node.source_id : (uint32_t)node_index;
     for (i = 0; i < pending_playlist_count; i++) {
@@ -4591,13 +4611,157 @@ static void choose_genre(const char *name)
     begin_confirmation(CONFIRM_GENRE);
 }
 
+static void keyboard_key_name(int key, char *label, size_t size)
+{
+    static const char characters[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.&'/#";
+    int character_count = sizeof(characters) - 1;
+
+    if (key < character_count)
+        rb->snprintf(label, size, "%c", characters[key]);
+    else if (key == character_count)
+        rb->strlcpy(label, "SPACE", size);
+    else if (key == character_count + 1)
+        rb->strlcpy(label, "BACKSPACE", size);
+    else
+        rb->strlcpy(label, "DONE", size);
+}
+
+static void keyboard_remove_last(char *value)
+{
+    size_t length = rb->strlen(value);
+
+    if (!length)
+        return;
+    do {
+        length--;
+    } while (length > 0 && ((unsigned char)value[length] & 0xc0) == 0x80);
+    value[length] = '\0';
+}
+
+static void draw_rbprep_keyboard(const char *title, const char *value,
+                                 int selected_key)
+{
+    static const char characters[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.&'/#";
+    int key_count = sizeof(characters) - 1 + 3;
+    int previous = (selected_key + key_count - 1) % key_count;
+    int next = (selected_key + 1) % key_count;
+    char active[20];
+    char neighbor[20];
+    char shown[48];
+    const char *visible = value;
+    size_t value_length = rb->strlen(value);
+    int width;
+    int start = 0;
+
+    draw_blade_shell(title, RBPREP_GREEN);
+    rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
+    rb->lcd_fillrect(8, 31, LCD_WIDTH - 16, 36);
+    rb->lcd_set_foreground(RBPREP_GREEN_DIM);
+    rb->lcd_drawrect(8, 31, LCD_WIDTH - 16, 36);
+
+    if (value_length >= sizeof(shown)) {
+        visible = value + value_length - sizeof(shown) + 1;
+        while (*visible && ((unsigned char)*visible & 0xc0) == 0x80)
+            visible++;
+    }
+    rb->strlcpy(shown, visible, sizeof(shown));
+    rb->lcd_getstringsize(shown, &width, NULL);
+    while (shown[start] && width > LCD_WIDTH - 34) {
+        start++;
+        while (shown[start] &&
+               ((unsigned char)shown[start] & 0xc0) == 0x80)
+            start++;
+        rb->lcd_getstringsize(shown + start, &width, NULL);
+    }
+    text(15, 43, shown + start, LCD_WHITE);
+    rb->lcd_set_foreground(RBPREP_GREEN);
+    rb->lcd_vline(MIN(LCD_WIDTH - 17, 17 + width), 41, 57);
+
+    keyboard_key_name(previous, neighbor, sizeof(neighbor));
+    centered_text(8, 82, 88, neighbor, LCD_RGBPACK(72, 91, 79));
+    keyboard_key_name(next, neighbor, sizeof(neighbor));
+    centered_text(LCD_WIDTH - 90, 82, 88, neighbor,
+                  LCD_RGBPACK(72, 91, 79));
+    draw_blade_selection(104, 30, RBPREP_GREEN);
+    keyboard_key_name(selected_key, active, sizeof(active));
+    centered_text(7, LCD_WIDTH - 14, 113, active, LCD_WHITE);
+
+    rb->lcd_set_foreground(LCD_RGBPACK(8, 16, 11));
+    rb->lcd_fillrect(0, 169, LCD_WIDTH, LCD_HEIGHT - 169);
+    text(10, 176, "WHEEL: PICK CHARACTER", RBPREP_GREEN);
+    text(10, 191, "SELECT: TYPE     LEFT: BACKSPACE", LCD_WHITE);
+    text(10, 206, "RIGHT: SPACE     PLAY: DONE", LCD_WHITE);
+    text(10, 221, "MENU: CANCEL", LCD_RGBPACK(155, 174, 161));
+    rb->lcd_update();
+}
+
+static bool rbprep_keyboard(char *value, size_t size, const char *title)
+{
+    static const char characters[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.&'/#";
+    int character_count = sizeof(characters) - 1;
+    int key_count = character_count + 3;
+    int selected_key = 0;
+
+    while (true) {
+        int button;
+        int base;
+        size_t length;
+
+        draw_rbprep_keyboard(title, value, selected_key);
+        button = rb->button_get(true);
+        if (button & BUTTON_REL)
+            continue;
+        base = button & ~BUTTON_REPEAT;
+        if (base == BUTTON_SCROLL_FWD) {
+            selected_key = (selected_key + 1) % key_count;
+        } else if (base == BUTTON_SCROLL_BACK) {
+            selected_key = (selected_key + key_count - 1) % key_count;
+        } else if (base == BUTTON_LEFT) {
+            keyboard_remove_last(value);
+        } else if (base == BUTTON_RIGHT) {
+            length = rb->strlen(value);
+            if (length + 1 < size) {
+                value[length] = ' ';
+                value[length + 1] = '\0';
+            }
+        } else if (base == BUTTON_PLAY) {
+            return true;
+        } else if (base == BUTTON_MENU) {
+            return false;
+        } else if (base == BUTTON_SELECT && !(button & BUTTON_REPEAT)) {
+            if (selected_key < character_count) {
+                length = rb->strlen(value);
+                if (length + 1 < size) {
+                    value[length] = characters[selected_key];
+                    value[length + 1] = '\0';
+                }
+            } else if (selected_key == character_count) {
+                length = rb->strlen(value);
+                if (length + 1 < size) {
+                    value[length] = ' ';
+                    value[length + 1] = '\0';
+                }
+            } else if (selected_key == character_count + 1) {
+                keyboard_remove_last(value);
+            } else {
+                return true;
+            }
+        } else if (rb->default_event_handler(button) == SYS_USB_CONNECTED) {
+            return false;
+        }
+    }
+}
+
 static void add_genre_with_keyboard(void)
 {
     char name[32] = "";
     int start;
     int end;
 
-    if (rb->kbd_input(name, sizeof(name), NULL) < 0) {
+    if (!rbprep_keyboard(name, sizeof(name), "ADD GENRE")) {
         rb->lcd_setfont(FONT_SYSFIXED);
         restore_black_canvas();
         return;
@@ -4639,7 +4803,7 @@ static void edit_collection_search(void)
     int end;
 
     rb->strlcpy(query, track_search, sizeof(query));
-    if (rb->kbd_input(query, sizeof(query), NULL) < 0) {
+    if (!rbprep_keyboard(query, sizeof(query), "SEARCH COLLECTION")) {
         rb->lcd_setfont(FONT_SYSFIXED);
         restore_black_canvas();
         return;

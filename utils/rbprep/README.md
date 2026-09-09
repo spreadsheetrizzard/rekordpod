@@ -46,8 +46,10 @@ snapshots and playlist-add requests: SELECT opens the referenced track, hold
 SELECT confirms deletion of the selected request, and PLAY opens the local-burn
 confirmation. Local burn stops playback to reserve a transaction workspace,
 keeps persistent `.rbprep-bak` originals, resolves old node-based playlist
-journals by stable ID or unique name, and reports the exact PDB/ANLZ transaction
-stage if it must roll back.
+journals by stable ID or unique name, and consumes only the journal tail after
+the last successful burn marker. Playlist rows are read back immediately and
+every DeviceSQL page chain is checked before commit; a failure names the exact
+track/list pair and rolls the transaction back.
 
 The deck offers four signal-oriented views: the detailed RGB waveform; a
 boombox whose woofers follow the live sub-120 Hz envelope and whose chromatic
@@ -74,7 +76,15 @@ animated `rekordpod` wordmark using the bundled Adobe Helvetica font. Holding
 MENU during boot bypasses RBPrep, and RBPrep's Exit to Rockbox item returns to
 the ordinary root menu without relaunching it. Main and browser selections use
 rounded capsule geometry; the main menu is icon-first and the playlist tree has
-separate folder and playlist glyphs.
+separate folder and playlist glyphs. Search and Add Genre use an RBPrep wheel
+keyboard with selectable Space, Backspace, and Done keys plus direct LEFT,
+RIGHT, PLAY, and MENU shortcuts.
+
+Local burn updates the traditional Rekordbox Device Library (`export.pdb`) and
+its DAT/EXT analysis files. Those changes are intended for players that browse
+the traditional Device Library. Hardware that reads only OneLibrary / Device
+Library Plus needs a matching Plus-library update; RBPrep does not write that
+second database yet.
 
 `apply_device_edits.py` is the explicit write-back step. It keeps only the
 newest full snapshot per track, diffs that state against the current DeviceSQL
