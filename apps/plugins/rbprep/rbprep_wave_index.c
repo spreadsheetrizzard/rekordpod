@@ -463,8 +463,12 @@ bool rbprep_wave_index_range_peak(const struct rbprep_wave_index *index,
         else
             break;
     }
+    /* During active playback the UI never touches the raw RBW stream. For a
+       zoom level finer than the smallest summary bucket, repeat that 16-point
+       bucket across adjacent pixels. Paused/scrubbed views may replace it
+       with exact raw detail without competing with Rockbox's codec reads. */
     if (level < 0)
-        return false;
+        level = 0;
     first = begin / level_blocks[level];
     last = (end - 1) / level_blocks[level];
     if (last >= index->level_counts[level])

@@ -261,6 +261,7 @@ static unsigned char waveform_height_lut[256];
 static int waveform_column_first;
 static int waveform_column_span;
 static bool waveform_columns_valid;
+static bool waveform_columns_exact;
 static int waveform_points;
 static int beat_count;
 static int beat_search_hint;
@@ -326,6 +327,9 @@ static int theme_body = LCD_RGBPACK(220, 224, 221);
 static int theme_body_shadow = LCD_RGBPACK(70, 76, 72);
 static int theme_wheel = LCD_RGBPACK(25, 28, 26);
 static int theme_wheel_outline = LCD_RGBPACK(145, 153, 148);
+static int main_wheel_phase;
+static int main_wheel_direction;
+static long main_wheel_deadline;
 static int scrub_step_index = 4;
 static int settings_selection;
 static int usb_selection;
@@ -834,7 +838,9 @@ static char *save_on_load_styles[] = { "immediate", "next track" };
 static char *auto_burn_styles[] = { "off", "next track load" };
 static char *off_on_styles[] = { "off", "on" };
 static char *turntable_arm_styles[] = { "straight", "s-shaped" };
-static char *turntable_headshell_styles[] = { "technics", "ipod body" };
+static char *turntable_headshell_styles[] = {
+    "technics", "ortofon concorde", "shure m44", "ipod body", "phase"
+};
 static const char *track_sort_names[] = {
     "TITLE", "BPM", "YEAR", "KEY", "COMMENTS", "TAGS", "IMPORTED"
 };
@@ -884,7 +890,8 @@ static const struct configdata rbprep_config[] = {
       "wheel brightness", NULL },
     { TYPE_ENUM, 0, 1, { .int_p = &turntable_arm_style },
       "turntable arm", turntable_arm_styles },
-    { TYPE_ENUM, 0, 1, { .int_p = &turntable_headshell_style },
+    { TYPE_ENUM, 0, ARRAYLEN(turntable_headshell_styles) - 1,
+      { .int_p = &turntable_headshell_style },
       "turntable headshell", turntable_headshell_styles },
     { TYPE_INT, 0, INT_MAX, { .int_p = &favorite_playlist_ids[0] },
       "favorite playlist 1", NULL },
@@ -3127,14 +3134,18 @@ static void draw_loop_zone(int first, int span)
 
 static void rebuild_waveform_columns(int first, int span)
 {
+    int audio_status = rb->audio_status();
+    bool transport_active = (audio_status & AUDIO_STATUS_PLAY) &&
+                            !(audio_status & AUDIO_STATUS_PAUSE);
     int samples_per_column = (span + RBPREP_DECK_WIDTH - 1) /
                              RBPREP_DECK_WIDTH;
-    bool exact = span <= (int)rbprep_wave_resident_points(&wave_reader) &&
+    bool exact = !transport_active &&
+                 span <= (int)rbprep_wave_resident_points(&wave_reader) &&
                  samples_per_column < 16;
     int x;
 
     if (waveform_columns_valid && first == waveform_column_first &&
-        span == waveform_column_span)
+        span == waveform_column_span && exact == waveform_columns_exact)
         return;
 
     for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
@@ -3198,6 +3209,7 @@ static void rebuild_waveform_columns(int first, int span)
     }
     waveform_column_first = first;
     waveform_column_span = span;
+    waveform_columns_exact = exact;
     waveform_columns_valid = true;
 }
 
@@ -3716,12 +3728,23 @@ static void draw_turntable(void)
                                cue_palette[hotcue_colors[slot] & 7]);
     }
 
-    /* No record label masks the scope: only a pin-sized spindle interrupts
-       the continuous horizontal trace through the platter center. */
-    rb->lcd_set_foreground(LCD_BLACK);
-    xlcd_fillcircle(cx, cy, 2);
-    rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
-    rb->lcd_drawpixel(cx, cy);
+    /* No record label masks the scope. A normal pickup gets a pin-sized
+       spindle; Phase mode parks its remote visibly over the spindle. */
+    if (turntable_headshell_style == 4) {
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_fillrect(cx - 4, cy - 10, 9, 20);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_drawrect(cx - 3, cy - 9, 7, 18);
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        rb->lcd_fillrect(cx - 1, cy - 6, 3, 9);
+        rb->lcd_set_foreground(LCD_RGBPACK(255, 55, 45));
+        rb->lcd_drawpixel(cx, cy + 6);
+    } else {
+        rb->lcd_set_foreground(LCD_BLACK);
+        xlcd_fillcircle(cx, cy, 2);
+        rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
+        rb->lcd_drawpixel(cx, cy);
+    }
 
     /* A real tonearm moves inward over the full side.  The stylus follows a
        fixed pickup angle while its groove radius falls from 56 to 34 pixels. */
@@ -3731,11 +3754,15 @@ static void draw_turntable(void)
     groove_radius = 56 - progress_x1000 * 22 / 1000;
     stylus_x = cx + cosine[7] * groove_radius / 256;
     stylus_y = cy + sine[7] * groove_radius / 256;
+    if (turntable_headshell_style == 4) {
+        stylus_x = 209;
+        stylus_y = RBPREP_WAVE_TOP + 72;
+    }
     arm_mid1_x = (192 * 2 + stylus_x) / 3;
     arm_mid1_y = ((RBPREP_WAVE_TOP + 30) * 2 + stylus_y) / 3;
     arm_mid2_x = (192 + stylus_x * 2) / 3;
     arm_mid2_y = (RBPREP_WAVE_TOP + 30 + stylus_y * 2) / 3;
-    if (turntable_arm_style) {
+    if (turntable_arm_style && turntable_headshell_style != 4) {
         arm_mid1_x += 5;
         arm_mid2_x -= 5;
     }
@@ -3761,32 +3788,59 @@ static void draw_turntable(void)
     rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
     xlcd_fillcircle(arm_mid1_x, arm_mid1_y, 1);
     xlcd_fillcircle(arm_mid2_x, arm_mid2_y, 1);
-    /* Black keyline around the headshell and diamond keeps the pickup
-       readable where it crosses a bright waveform or cue flag. */
-    rb->lcd_set_foreground(LCD_BLACK);
-    rb->lcd_drawline(stylus_x - 3, stylus_y - 2,
-                     stylus_x + 3, stylus_y + 2);
-    rb->lcd_drawline(stylus_x - 3, stylus_y - 1,
-                     stylus_x + 3, stylus_y + 3);
-    rb->lcd_drawline(stylus_x - 1, stylus_y + 2,
-                     stylus_x, stylus_y + 5);
-    if (turntable_headshell_style) {
-        rb->lcd_set_foreground(theme_body_shadow);
-        rb->lcd_drawline(stylus_x - 3, stylus_y - 1,
+    /* High-contrast pickup silhouettes remain readable over the black record
+       and bright scope. Phase has no cartridge: the arm sits on its rest. */
+    if (turntable_headshell_style == 0) {
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_drawline(stylus_x - 5, stylus_y - 3,
+                         stylus_x + 4, stylus_y + 3);
+        rb->lcd_drawline(stylus_x - 5, stylus_y - 2,
+                         stylus_x + 4, stylus_y + 4);
+        rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
+        rb->lcd_drawline(stylus_x - 4, stylus_y - 2,
                          stylus_x + 3, stylus_y + 3);
         rb->lcd_drawline(stylus_x - 3, stylus_y - 2,
                          stylus_x + 3, stylus_y + 2);
+    } else if (turntable_headshell_style == 1) {
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_drawline(stylus_x - 6, stylus_y - 4,
+                         stylus_x + 3, stylus_y + 3);
+        rb->lcd_drawline(stylus_x - 6, stylus_y - 3,
+                         stylus_x + 3, stylus_y + 4);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_drawline(stylus_x - 5, stylus_y - 3,
+                         stylus_x + 2, stylus_y + 3);
+        rb->lcd_drawline(stylus_x - 4, stylus_y - 3,
+                         stylus_x + 2, stylus_y + 2);
+        rb->lcd_set_foreground(LCD_RGBPACK(255, 65, 45));
+        xlcd_fillcircle(stylus_x + 2, stylus_y + 3, 1);
+    } else if (turntable_headshell_style == 2) {
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_fillrect(stylus_x - 5, stylus_y - 4, 10, 8);
+        rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
+        rb->lcd_fillrect(stylus_x - 4, stylus_y - 3, 8, 6);
+        rb->lcd_set_foreground(LCD_RGBPACK(55, 65, 59));
+        rb->lcd_hline(stylus_x - 3, stylus_x + 3, stylus_y);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_drawpixel(stylus_x + 4, stylus_y + 3);
+    } else if (turntable_headshell_style == 3) {
+        rb->lcd_set_foreground(theme_body_shadow);
+        xlcd_fillcircle(stylus_x - 1, stylus_y, 5);
         rb->lcd_set_foreground(theme_body);
-        rb->lcd_drawline(stylus_x - 2, stylus_y - 1,
-                         stylus_x + 2, stylus_y + 2);
-        xlcd_fillcircle(stylus_x - 2, stylus_y - 1, 1);
+        xlcd_fillcircle(stylus_x - 1, stylus_y, 4);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_drawline(stylus_x - 3, stylus_y - 2,
+                         stylus_x + 3, stylus_y + 2);
     } else {
-        rb->lcd_set_foreground(LCD_RGBPACK(205, 211, 207));
-        rb->lcd_drawline(stylus_x - 2, stylus_y - 1,
-                         stylus_x + 2, stylus_y + 2);
+        rb->lcd_set_foreground(LCD_RGBPACK(105, 116, 109));
+        rb->lcd_drawrect(stylus_x - 4, stylus_y - 4, 9, 10);
+        rb->lcd_vline(stylus_x + 4, stylus_y - 1, stylus_y + 8);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_hline(stylus_x - 2, stylus_x + 2, stylus_y - 2);
     }
     rb->lcd_set_foreground(LCD_BLACK);
-    rb->lcd_drawpixel(stylus_x, stylus_y + 4);
+    if (turntable_headshell_style != 4)
+        rb->lcd_drawpixel(stylus_x, stylus_y + 4);
     rb->lcd_set_foreground(LCD_RGBPACK(115, 124, 119));
     xlcd_fillcircle(192, RBPREP_WAVE_TOP + 30, 10);
     rb->lcd_set_foreground(LCD_BLACK);
@@ -4131,6 +4185,7 @@ static void clear_analysis(void)
     rbprep_wave_index_close(&wave_index);
     waveform_points = 0;
     waveform_columns_valid = false;
+    waveform_columns_exact = false;
     rb->memset(overview_waveform, 0, sizeof(overview_waveform));
     beat_count = 0;
     beat_search_hint = 0;
@@ -6816,7 +6871,7 @@ static void draw_settings(void)
         "ASK EACH TIME", "SAVE & LOAD",
         click_sound ? "ON" : "OFF", "HSB", "HSB", "HSB",
         turntable_arm_style ? "S-SHAPED" : "STRAIGHT",
-        turntable_headshell_style ? "IPOD BODY" : "TECHNICS"
+        turntable_headshell_styles[turntable_headshell_style]
     };
     const char *description;
 
@@ -6865,7 +6920,7 @@ static void draw_settings(void)
          ? "Color of the boot record, wheel and record motifs"
          : settings_selection == 9
          ? "Choose a straight or classic S-shaped pickup arm"
-         : "Technics pickup or a headshell matching iPod body color";
+         : "Technics, Concorde, M44, iPod shell, or wireless Phase";
     rb->lcd_set_foreground(LCD_RGBPACK(13, 19, 16));
     rb->lcd_fillrect(8, 198, LCD_WIDTH - 16, 22);
     text(13, 204, description, LCD_RGBPACK(145, 165, 151));
@@ -7001,58 +7056,89 @@ static void draw_main_menu_fx(void)
         0, 98, 181, 237, 256, 237, 181, 98,
         0, -98, -181, -237, -256, -237, -181, -98
     };
-    long frame = *rb->current_tick / MAX(1, HZ / 20);
-    int cx = 282;
-    int cy = 128;
+    int cx = 246;
+    int cy = 130;
     int point;
-    int band;
-    int scan_y = 38 + (frame * 3) % 178;
 
-    /* A live neon record tunnel gives the otherwise-static launcher its own
-       identity. It stays in the unused right rail so menu text remains crisp. */
-    rb->lcd_set_foreground(LCD_RGBPACK(2, 18, 11));
-    rb->lcd_fillrect(226, 37, LCD_WIDTH - 226, 181);
-    rb->lcd_set_foreground(LCD_RGBPACK(10, 48, 29));
-    xlcd_drawcircle(cx, cy, 70);
+    if (main_wheel_direction != 0) {
+        if (TIME_BEFORE(*rb->current_tick, main_wheel_deadline))
+            main_wheel_phase = (main_wheel_phase +
+                                main_wheel_direction + 16) & 15;
+        else
+            main_wheel_direction = 0;
+    }
+
+    /* One complete CDJ jog wheel occupies the right half—no backing panel,
+       scanner or decorative footer competes with the menu. */
+    rb->lcd_set_foreground(LCD_BLACK);
+    xlcd_fillcircle(cx, cy, 70);
     rb->lcd_set_foreground(RBPREP_GREEN_DIM);
+    xlcd_drawcircle(cx, cy, 69);
+    rb->lcd_set_foreground(theme_wheel_outline);
+    xlcd_drawcircle(cx, cy, 66);
+    rb->lcd_set_foreground(theme_wheel);
+    xlcd_fillcircle(cx, cy, 61);
+    rb->lcd_set_foreground(LCD_RGBPACK(40, 48, 43));
     xlcd_drawcircle(cx, cy, 58);
-    rb->lcd_set_foreground(LCD_RGBPACK(20, 86, 105));
-    xlcd_drawcircle(cx, cy, 45);
-    rb->lcd_set_foreground(LCD_RGBPACK(91, 31, 104));
-    xlcd_drawcircle(cx, cy, 31);
-    rb->lcd_set_foreground(LCD_RGBPACK(6, 22, 14));
-    xlcd_fillcircle(cx, cy, 18);
-    rb->lcd_set_foreground(LCD_WHITE);
-    xlcd_fillcircle(cx, cy, 2);
+    xlcd_drawcircle(cx, cy, 53);
+    rb->lcd_set_foreground(RBPREP_GREEN_DIM);
+    xlcd_drawcircle(cx, cy, 42);
     for (point = 0; point < 16; point++) {
-        int angle = (point + frame) & 15;
-        int x = cx + orbit_x[angle] * 65 / 256;
-        int y = cy + orbit_y[angle] * 65 / 256;
-        int color = point % 4 == 0 ? LCD_WHITE
-                  : point & 1 ? LCD_RGBPACK(40, 225, 255)
-                              : RBPREP_GREEN;
+        int angle = (point + main_wheel_phase) & 15;
+        int x = cx + orbit_x[angle] * 63 / 256;
+        int y = cy + orbit_y[angle] * 63 / 256;
 
-        rb->lcd_set_foreground(color);
-        if (((point + frame) & 3) == 0)
+        rb->lcd_set_foreground(point % 4 == 0 ? LCD_WHITE
+                                              : RBPREP_GREEN);
+        if ((point & 3) == 0)
             xlcd_fillcircle(x, y, 2);
         else
             rb->lcd_drawpixel(x, y);
     }
-    rb->lcd_set_foreground((frame & 1) ? RBPREP_GREEN_DIM
-                                      : LCD_RGBPACK(16, 54, 35));
-    rb->lcd_hline(226, LCD_WIDTH - 1, scan_y);
+    point = main_wheel_phase;
+    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_drawline(cx, cy,
+        cx + orbit_x[point] * 49 / 256,
+        cy + orbit_y[point] * 49 / 256);
+    rb->lcd_set_foreground(LCD_RGBPACK(5, 14, 10));
+    xlcd_fillcircle(cx, cy, 22);
+    rb->lcd_set_foreground(RBPREP_GREEN);
+    xlcd_drawcircle(cx, cy, 22);
+    rb->lcd_set_foreground(LCD_RGBPACK(35, 205, 255));
+    xlcd_drawcircle(cx, cy, 16);
+    centered_text(cx - 20, 40, cy - 5, "CDJ", LCD_WHITE);
+    rb->lcd_set_foreground(LCD_WHITE);
+    xlcd_fillcircle(cx, cy + 9, 2);
+}
 
-    /* OP-1-like activity teeth form a compact animated footer meter. */
-    for (band = 0; band < 24; band++) {
-        int height = 2 + ((band * 7 + frame * 3) % 13);
-        int x = 8 + band * 9;
-        rb->lcd_set_foreground((band + frame) % 7 == 0
-                               ? LCD_WHITE
-                               : band & 1 ? RBPREP_GREEN
-                                          : LCD_RGBPACK(35, 155, 205));
-        rb->lcd_vline(x, 222 - height, 222);
-        rb->lcd_vline(x + 1, 222 - height / 2, 222);
-    }
+static void draw_main_selection(int y, int height)
+{
+    const int left = 7;
+    const int right = 174;
+    int radius = height / 2;
+    int center_y = y + radius;
+    int fill = hsb_rgb(accent_hue,
+                       MIN(100, accent_saturation + 10),
+                       MAX(12, accent_brightness * 34 / 100));
+
+    rb->lcd_set_foreground(fill);
+    xlcd_fillcircle(left + radius, center_y, radius);
+    xlcd_fillcircle(right - radius, center_y, radius);
+    rb->lcd_fillrect(left + radius, y,
+                     right - left - radius * 2 + 1, height + 1);
+    rb->lcd_set_foreground(theme_accent);
+    rb->lcd_hline(left + radius, right - radius, y + 1);
+}
+
+static void navigate_main_menu(int direction)
+{
+    int next = MAX(0, MIN(7, selection + direction));
+
+    if (next == selection)
+        return;
+    selection = next;
+    main_wheel_direction = direction > 0 ? 1 : -1;
+    main_wheel_deadline = *rb->current_tick + MAX(1, HZ * 2 / 5);
 }
 
 static void draw_main_menu(void)
@@ -7085,21 +7171,10 @@ static void draw_main_menu(void)
     for (i = 0; i < (int)ARRAYLEN(items); i++) {
         int y = 42 + i * 23;
         bool selected = i == selection;
-        if (selected) {
-            int sweep = (*rb->current_tick / MAX(1, HZ / 30) * 9) %
-                        (LCD_WIDTH - 18);
-            draw_blade_selection(y - 2, 20, RBPREP_GREEN);
-            rb->lcd_set_foreground(LCD_RGBPACK(60, 255, 145));
-            rb->lcd_hline(10, LCD_WIDTH - 10, y - 1);
-            rb->lcd_set_foreground(LCD_WHITE);
-            rb->lcd_fillrect(9 + sweep, y - 2, 5, 2);
-        }
+        if (selected)
+            draw_main_selection(y - 2, 20);
         draw_main_glyph(20, y + 7, i, selected);
         text(42, y + 3, items[i], selected ? LCD_WHITE : RBPREP_MENU_TEXT);
-        if (i == 4)
-            text(246, y + 3, usb_selection == 2 ? "DAC" :
-                 usb_selection == 1 ? "DATA" : "POWER",
-                 usb_selection ? LCD_WHITE : RBPREP_GREEN);
     }
     text(7, 229, "WHEEL  NAVIGATE       SELECT  OPEN",
          LCD_RGBPACK(105, 125, 112));
@@ -8607,7 +8682,9 @@ static void short_select(void)
         } else if (settings_selection == 9) {
             turntable_arm_style = !turntable_arm_style;
         } else {
-            turntable_headshell_style = !turntable_headshell_style;
+            turntable_headshell_style =
+                (turntable_headshell_style + 1) %
+                ARRAYLEN(turntable_headshell_styles);
         }
         rebuild_waveform_height_lut();
         mark_rbprep_config_dirty();
@@ -10155,10 +10232,15 @@ enum plugin_status plugin_start(const void *parameter)
     wheel_saturation = MAX(0, MIN(100, wheel_saturation));
     wheel_brightness = MAX(5, MIN(100, wheel_brightness));
     turntable_arm_style = !!turntable_arm_style;
-    turntable_headshell_style = !!turntable_headshell_style;
+    turntable_headshell_style = MAX(0,
+        MIN((int)ARRAYLEN(turntable_headshell_styles) - 1,
+            turntable_headshell_style));
     update_theme_colors();
     mode = MODE_LIBRARY;
     selection = 0;
+    main_wheel_phase = 0;
+    main_wheel_direction = 0;
+    main_wheel_deadline = *rb->current_tick;
     playhead = 0;
     zoom = 1;
     grid_offset = 0;
@@ -10316,7 +10398,8 @@ enum plugin_status plugin_start(const void *parameter)
            menus remain event-driven while the deck keeps its timecode clock. */
         if (!display_locked &&
             !TIME_BEFORE(*rb->current_tick, frame_deadline) &&
-            (force_full_redraw || mode == MODE_LIBRARY ||
+            (force_full_redraw ||
+             (mode == MODE_LIBRARY && main_wheel_direction != 0) ||
              mode >= MODE_DECK || redraw)) {
             draw_screen();
             redraw = false;
@@ -10327,6 +10410,9 @@ enum plugin_status plugin_start(const void *parameter)
         }
         if (!display_locked && selected_track_id >= 0 &&
             seek_state == SEEK_IDLE && rb->button_status() == BUTTON_NONE &&
+            (!((rb->audio_status() & AUDIO_STATUS_PLAY) &&
+               !(rb->audio_status() & AUDIO_STATUS_PAUSE)) ||
+             !wave_index.valid) &&
             rbprep_wave_index_service(&wave_index)) {
             waveform_columns_valid = false;
             overview_dirty = true;
@@ -10641,7 +10727,7 @@ enum plugin_status plugin_start(const void *parameter)
             else if (mode == MODE_MACRO_VALUE)
                 adjust_macro_value(1, false);
             else if (mode == MODE_LIBRARY)
-                selection = MIN(7, selection + 1);
+                navigate_main_menu(1);
             else if (mode == MODE_PLAYLISTS &&
                      playlist_browser_count() > 0) {
                 tree_selection = MIN(playlist_browser_count() - 1,
@@ -10697,7 +10783,7 @@ enum plugin_status plugin_start(const void *parameter)
             else if (mode == MODE_MACRO_VALUE)
                 adjust_macro_value(-1, false);
             else if (mode == MODE_LIBRARY)
-                selection = MAX(0, selection - 1);
+                navigate_main_menu(-1);
             else if (mode == MODE_PLAYLISTS) {
                 tree_selection = MAX(0, tree_selection - 1);
                 if (tree_selection < tree_top)
