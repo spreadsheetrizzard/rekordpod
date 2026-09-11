@@ -83,6 +83,8 @@
 #define RBPREP_PENDING_ROWS 8
 #define RBPREP_PENDING_MAX 64
 #define RBPREP_SPECTRUM_BANDS 20
+#define RBPREP_CHROMA_BANDS 12
+#define RBPREP_SPECTRUM_HISTORY 16
 #define RBPREP_PCM_FRAMES 1024
 #define RBPREP_GREEN theme_accent
 #define RBPREP_GREEN_DIM theme_accent_dim
@@ -135,7 +137,8 @@ enum rbprep_mode {
     MODE_LIST,
     MODE_PNAV,
     MODE_VISUALIZER,
-    MODE_MACRO
+    MODE_MACRO,
+    MODE_VISUALIZER_TWO
 };
 
 enum rbprep_color_target {
@@ -186,7 +189,11 @@ enum rbprep_tool {
     TOOL_PLAYLIST_NEXT = 36,
     TOOL_RESTART_PLAYBACK = 37,
     TOOL_RELOAD_TRACK = 38,
-    TOOL_COUNT = 39
+    TOOL_VIS_CANYON = 39,
+    TOOL_VIS_ORBIT = 40,
+    TOOL_VIS_REACTOR = 41,
+    TOOL_VIS_HARMONIC = 42,
+    TOOL_COUNT = 43
 };
 
 enum rbprep_confirm_action {
@@ -299,6 +306,7 @@ static int cue_tool;
 static int loop_tool;
 static int metadata_tool;
 static int visualizer_tool;
+static int visualizer_two_tool;
 static int list_tool;
 static int pnav_tool;
 static int macro_tool;
@@ -364,6 +372,11 @@ static volatile unsigned long pcm_sample_rate = 44100;
 static unsigned int spectrum_generation;
 static long spectrum_deadline;
 static unsigned char spectrum_levels[RBPREP_SPECTRUM_BANDS];
+static unsigned char chroma_levels[RBPREP_CHROMA_BANDS];
+static unsigned char spectrum_history[RBPREP_SPECTRUM_HISTORY]
+                                     [RBPREP_SPECTRUM_BANDS];
+static int spectrum_history_head = -1;
+static unsigned int spectrum_history_generation;
 static unsigned char spectrum_bass;
 static unsigned char spectrum_bass_hit;
 static int bass_frequency_x10;
@@ -809,7 +822,7 @@ static const char *mode_names[] = {
     "INDEX", "GENRES", "PLAYLIST MANAGER", "ACCENT", "WORKFLOW MANAGER",
     "WORKFLOW EDITOR", "TOOL PICKER", "DEFAULT VALUE", "PLAYBACK", "TEMPO",
     "BEATGRID", "HOT CUES", "LOOP", "METADATA", "LIST", "PLAYLIST NAV",
-    "VISUALIZER", "WORKFLOWS"
+    "VISUALIZER", "WORKFLOWS", "VISUALIZER II"
 };
 
 static const char * const tool_names[TOOL_COUNT] = {
@@ -821,7 +834,8 @@ static const char * const tool_names[TOOL_COUNT] = {
     "CUE COLOR", "CUE DELETE", "LOOP SIZE", "LOOP IN", "LOOP OUT",
     "LOOP ACTIVE", "RATING", "TRACK COLOR", "YEAR", "GENRE",
     "BURN TRACK", "BURN ALL", "PREV TRACK", "NEXT TRACK",
-    "RESTART", "RELOAD"
+    "RESTART", "RELOAD", "SPECTRAL CANYON", "STEREO ORBIT",
+    "BEAT REACTOR", "HARMONIC CONSTELLATION"
 };
 
 /* On-disk workflow identities are deliberately independent of enum order.
@@ -867,11 +881,17 @@ static const uint16_t macro_tool_storage_ids[TOOL_COUNT] = {
     [TOOL_PLAYLIST_NEXT]     = 0x0124,
     [TOOL_RESTART_PLAYBACK]  = 0x0125,
     [TOOL_RELOAD_TRACK]      = 0x0126,
+    [TOOL_VIS_CANYON]        = 0x0127,
+    [TOOL_VIS_ORBIT]         = 0x0128,
+    [TOOL_VIS_REACTOR]       = 0x0129,
+    [TOOL_VIS_HARMONIC]      = 0x012a,
 };
 
 static char *waveform_styles[] = { "full", "half" };
 static char *visualizer_styles[] = {
-    "rgb waveform", "boombox bass", "20-band EQ", "Oscillo-Turntable"
+    "rgb waveform", "boombox bass", "20-band EQ", "Oscillo-Turntable",
+    "spectral canyon", "stereo orbit", "beat reactor",
+    "harmonic constellation"
 };
 static char *rpm_styles[] = { "33", "45", "78" };
 /* All values share a denominator of three: 33 1/3, 45 and 78 RPM. */
@@ -1089,6 +1109,9 @@ static const struct rbprep_tool_page tool_pages[] = {
     { MODE_VISUALIZER, "VISUAL", 4,
       { TOOL_WAVEFORM_STYLE, TOOL_VIS_BOOMBOX, TOOL_VIS_EQ,
         TOOL_VIS_TURNTABLE } },
+    { MODE_VISUALIZER_TWO, "REACTR", 4,
+      { TOOL_VIS_CANYON, TOOL_VIS_ORBIT, TOOL_VIS_REACTOR,
+        TOOL_VIS_HARMONIC } },
     { MODE_MACRO, "MACROS", 3,
       { TOOL_MACRO_ONE, TOOL_MACRO_TWO, TOOL_KEYLOCK } }
 };
@@ -1268,6 +1291,10 @@ static void start_spectrum_capture(void)
     spectrum_deadline = *rb->current_tick;
     pcm_sample_rate = rb->mixer_get_frequency();
     rb->memset(spectrum_levels, 0, sizeof(spectrum_levels));
+    rb->memset(chroma_levels, 0, sizeof(chroma_levels));
+    rb->memset(spectrum_history, 0, sizeof(spectrum_history));
+    spectrum_history_head = -1;
+    spectrum_history_generation = 0;
     spectrum_bass = spectrum_bass_hit = 0;
     bass_frequency_x10 = 0;
     bass_note_index = -1;
@@ -3489,7 +3516,8 @@ static void update_bass_pitch(int frames)
     }
 }
 
-static void update_spectrum_levels(bool need_pitch)
+static void update_spectrum_levels(bool need_pitch, bool need_spectrum,
+                                   bool need_chroma)
 {
     static const int32_t coefficients_44100[RBPREP_SPECTRUM_BANDS] = {
         2097109, 2097068, 2096980, 2096819, 2096462, 2095822,
@@ -3503,7 +3531,19 @@ static void update_spectrum_levels(bool need_pitch)
         1957860, 1816187, 1558488, 1048576, 273733, -802545,
         -1482910, -1937516
     };
+    /* One chromatic octave at C5..B5. This is high enough for the 1024-frame
+       window to separate neighbouring notes, while still following the
+       harmonic body of typical program material. */
+    static const int32_t chroma_coefficients_44100[RBPREP_CHROMA_BANDS] = {
+        2091327, 2090614, 2089814, 2088916, 2087908, 2086777,
+        2085507, 2084083, 2082484, 2080690, 2078677, 2076418
+    };
+    static const int32_t chroma_coefficients_48000[RBPREP_CHROMA_BANDS] = {
+        2092235, 2091633, 2090957, 2090199, 2089348, 2088393,
+        2087321, 2086118, 2084769, 2083254, 2081554, 2079646
+    };
     const int32_t *coefficients;
+    const int32_t *chroma_coefficients;
     unsigned int generation;
     int capture;
     int frames;
@@ -3519,10 +3559,15 @@ static void update_spectrum_levels(bool need_pitch)
     if (generation == spectrum_generation) {
         if (!(rb->audio_status() & AUDIO_STATUS_PLAY) ||
             (rb->audio_status() & AUDIO_STATUS_PAUSE)) {
-            for (band = 0; band < RBPREP_SPECTRUM_BANDS; band++)
-                spectrum_levels[band] = spectrum_levels[band] * 7 / 8;
-            spectrum_bass = spectrum_bass * 7 / 8;
-            spectrum_bass_hit = spectrum_bass_hit * 3 / 4;
+            if (need_spectrum) {
+                for (band = 0; band < RBPREP_SPECTRUM_BANDS; band++)
+                    spectrum_levels[band] = spectrum_levels[band] * 7 / 8;
+                spectrum_bass = spectrum_bass * 7 / 8;
+                spectrum_bass_hit = spectrum_bass_hit * 3 / 4;
+            }
+            if (need_chroma)
+                for (band = 0; band < RBPREP_CHROMA_BANDS; band++)
+                    chroma_levels[band] = chroma_levels[band] * 7 / 8;
         }
         return;
     }
@@ -3541,57 +3586,93 @@ static void update_spectrum_levels(bool need_pitch)
     if (frames < 64)
         return;
 
-    for (i = 0; i < frames; i++) {
-        int weight = i <= frames / 2 ? i : frames - 1 - i;
-        int sample = ((int)pcm_snapshot[i * 2] +
-                      (int)pcm_snapshot[i * 2 + 1]) >> 1;
-        /* About a 110 Hz one-pole low pass at 44.1 kHz keeps the pitch
-           detector focused on the woofer range instead of upper harmonics. */
-        if (need_pitch) {
-            bass_filter_state += (sample - bass_filter_state) / 64;
-            pcm_pitch[i] = bass_filter_state >> 4;
-        }
-        pcm_mono[i] = (sample * weight / MAX(1, frames / 2)) >> 8;
-    }
-    coefficients = pcm_sample_rate >= 46000
-                 ? coefficients_48000 : coefficients_44100;
-    for (band = 0; band < RBPREP_SPECTRUM_BANDS; band++) {
-        int32_t s1 = 0;
-        int32_t s2 = 0;
-        int coefficient = coefficients[band];
-        int raw;
-
+    if (need_pitch || need_spectrum || need_chroma) {
         for (i = 0; i < frames; i++) {
-            int32_t s0 = pcm_mono[i] +
-                (int32_t)(((int64_t)coefficient * s1) >> 20) - s2;
-            s2 = s1;
-            s1 = s0;
+            int weight = i <= frames / 2 ? i : frames - 1 - i;
+            int sample = ((int)pcm_snapshot[i * 2] +
+                          (int)pcm_snapshot[i * 2 + 1]) >> 1;
+            /* About a 110 Hz one-pole low pass at 44.1 kHz keeps the pitch
+               detector focused on the woofer range instead of harmonics. */
+            if (need_pitch) {
+                bass_filter_state += (sample - bass_filter_state) / 64;
+                pcm_pitch[i] = bass_filter_state >> 4;
+            }
+            pcm_mono[i] = (sample * weight / MAX(1, frames / 2)) >> 8;
         }
-        {
-            int64_t signed_power = (int64_t)s1 * s1 +
-                (int64_t)s2 * s2 -
-                (((int64_t)coefficient * s1 >> 20) * s2);
-            raw = spectrum_power_level(signed_power > 0
-                                     ? signed_power : 0, frames);
+    }
+    if (need_spectrum) {
+        coefficients = pcm_sample_rate >= 46000
+                     ? coefficients_48000 : coefficients_44100;
+        for (band = 0; band < RBPREP_SPECTRUM_BANDS; band++) {
+            int32_t s1 = 0;
+            int32_t s2 = 0;
+            int coefficient = coefficients[band];
+            int raw;
+
+            for (i = 0; i < frames; i++) {
+                int32_t s0 = pcm_mono[i] +
+                    (int32_t)(((int64_t)coefficient * s1) >> 20) - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            {
+                int64_t signed_power = (int64_t)s1 * s1 +
+                    (int64_t)s2 * s2 -
+                    (((int64_t)coefficient * s1 >> 20) * s2);
+                raw = spectrum_power_level(signed_power > 0
+                                         ? signed_power : 0, frames);
+            }
+            if (raw > spectrum_levels[band])
+                spectrum_levels[band] =
+                    (spectrum_levels[band] + raw * 3) / 4;
+            else
+                spectrum_levels[band] =
+                    (spectrum_levels[band] * 7 + raw) / 8;
         }
-        if (raw > spectrum_levels[band])
-            spectrum_levels[band] =
-                (spectrum_levels[band] + raw * 3) / 4;
+
+        bass_raw = (spectrum_levels[0] + spectrum_levels[1] +
+                    spectrum_levels[2]) / 3;
+        if (bass_raw > spectrum_bass + 8)
+            spectrum_bass_hit = MIN(255, spectrum_bass_hit +
+                                    (bass_raw - spectrum_bass) * 3);
         else
-            spectrum_levels[band] =
-                (spectrum_levels[band] * 7 + raw) / 8;
+            spectrum_bass_hit = spectrum_bass_hit * 3 / 4;
+        spectrum_bass = (spectrum_bass * 3 + bass_raw) / 4;
+        if (need_pitch)
+            update_bass_pitch(frames);
     }
 
-    bass_raw = (spectrum_levels[0] + spectrum_levels[1] +
-                spectrum_levels[2]) / 3;
-    if (bass_raw > spectrum_bass + 8)
-        spectrum_bass_hit = MIN(255, spectrum_bass_hit +
-                                (bass_raw - spectrum_bass) * 3);
-    else
-        spectrum_bass_hit = spectrum_bass_hit * 3 / 4;
-    spectrum_bass = (spectrum_bass * 3 + bass_raw) / 4;
-    if (need_pitch)
-        update_bass_pitch(frames);
+    if (need_chroma) {
+        chroma_coefficients = pcm_sample_rate >= 46000
+                            ? chroma_coefficients_48000
+                            : chroma_coefficients_44100;
+        for (band = 0; band < RBPREP_CHROMA_BANDS; band++) {
+            int32_t s1 = 0;
+            int32_t s2 = 0;
+            int coefficient = chroma_coefficients[band];
+            int raw;
+
+            for (i = 0; i < frames; i++) {
+                int32_t s0 = pcm_mono[i] +
+                    (int32_t)(((int64_t)coefficient * s1) >> 20) - s2;
+                s2 = s1;
+                s1 = s0;
+            }
+            {
+                int64_t signed_power = (int64_t)s1 * s1 +
+                    (int64_t)s2 * s2 -
+                    (((int64_t)coefficient * s1 >> 20) * s2);
+                raw = spectrum_power_level(signed_power > 0
+                                         ? signed_power : 0, frames);
+            }
+            if (raw > chroma_levels[band])
+                chroma_levels[band] =
+                    (chroma_levels[band] + raw * 3) / 4;
+            else
+                chroma_levels[band] =
+                    (chroma_levels[band] * 7 + raw) / 8;
+        }
+    }
 }
 
 static void draw_boombox(void)
@@ -3756,6 +3837,408 @@ static void draw_twenty_band_eq(void)
             text(x - 1, RBPREP_WAVE_BOTTOM - 12,
                  spectrum_labels[band], LCD_RGBPACK(105, 125, 112));
     }
+}
+
+static int visual_beat_phase(int *beat_number)
+{
+    int period = beat_period_ms();
+    int start;
+    int elapsed;
+
+    if (imported_grid_resident()) {
+        int index = current_beat_index(playhead);
+        int end;
+
+        if (index < 0) {
+            if (beat_number)
+                *beat_number = 1;
+            return 0;
+        }
+        start = adjusted_beat_time(index);
+        end = index + 1 < beat_count
+            ? adjusted_beat_time(index + 1) : start + period;
+        if (beat_number)
+            *beat_number = adjusted_beat_number(index);
+        return MAX(0, MIN(255,
+            (long long)(playhead - start) * 256 / MAX(1, end - start)));
+    }
+
+    start = grid_phase_ms + grid_offset;
+    elapsed = playhead - start;
+    if (elapsed < 0) {
+        if (beat_number)
+            *beat_number = 1;
+        return 0;
+    }
+    if (beat_number)
+        *beat_number = (elapsed / period & 3) + 1;
+    return (long long)(elapsed % period) * 256 / period;
+}
+
+static void capture_spectrum_history(void)
+{
+    if (spectrum_history_generation == spectrum_generation)
+        return;
+    spectrum_history_head =
+        (spectrum_history_head + 1) % RBPREP_SPECTRUM_HISTORY;
+    rb->memcpy(spectrum_history[spectrum_history_head], spectrum_levels,
+               sizeof(spectrum_levels));
+    spectrum_history_generation = spectrum_generation;
+}
+
+static void draw_spectral_canyon(void)
+{
+    const int center = RBPREP_DECK_WIDTH / 2;
+    const int horizon = RBPREP_WAVE_TOP + 19;
+    const int floor = RBPREP_WAVE_BOTTOM - 15;
+    int beat_number;
+    int beat_phase = visual_beat_phase(&beat_number);
+    int row;
+    int band;
+
+    capture_spectrum_history();
+    text(5, RBPREP_WAVE_TOP + 3, "SPECTRAL CANYON",
+         LCD_RGBPACK(120, 255, 218));
+
+    /* Static perspective rails establish frequency lanes without requiring
+       a framebuffer or another history surface. */
+    for (band = 0; band < RBPREP_SPECTRUM_BANDS; band += 2) {
+        int near_x = 4 + band * (RBPREP_DECK_WIDTH - 9) /
+                           (RBPREP_SPECTRUM_BANDS - 1);
+        int far_x = center - 51 + band * 102 /
+                              (RBPREP_SPECTRUM_BANDS - 1);
+
+        rb->lcd_set_foreground(LCD_RGBPACK(7, 31, 23));
+        rb->lcd_drawline(far_x, horizon, near_x, floor);
+    }
+
+    /* Beat-locked runway gates travel toward the listener. Downbeats are
+       white; the remaining beats retain the selected accent colour. */
+    for (row = 0; row < 4; row++) {
+        int travel = (beat_phase + row * 64) & 255;
+        int y = horizon + travel * (floor - horizon) / 255;
+        int half = 51 + travel * (center - 55) / 255;
+
+        rb->lcd_set_foreground(((beat_number - 1 + row) & 3) == 0
+                              ? LCD_WHITE : RBPREP_GREEN_DIM);
+        rb->lcd_hline(center - half, center + half, y);
+    }
+
+    /* Old spectra occupy the horizon; the newest ridge fills the foreground.
+       Sixteen by twenty bytes is the complete scrolling history. */
+    for (row = 0; row < RBPREP_SPECTRUM_HISTORY; row++) {
+        int history = spectrum_history_head < 0 ? 0 :
+            (spectrum_history_head + 1 + row) % RBPREP_SPECTRUM_HISTORY;
+        int baseline = horizon + 5 + row * (floor - horizon - 5) /
+                                      (RBPREP_SPECTRUM_HISTORY - 1);
+        int half = 52 + row * (center - 57) /
+                          (RBPREP_SPECTRUM_HISTORY - 1);
+        int previous_x = center - half;
+        int previous_y = baseline;
+        int color = row > 12 ? LCD_RGBPACK(125, 255, 220)
+                  : row > 7 ? RBPREP_GREEN
+                            : LCD_RGBPACK(15, 88, 68);
+
+        for (band = 0; band < RBPREP_SPECTRUM_BANDS; band++) {
+            int x = center - half + band * half * 2 /
+                                      (RBPREP_SPECTRUM_BANDS - 1);
+            int lift = spectrum_history[history][band] * (4 + row / 2) /
+                       255;
+            int y = baseline - lift;
+
+            rb->lcd_set_foreground(color);
+            if (band > 0)
+                rb->lcd_drawline(previous_x, previous_y, x, y);
+            if (row > 10 && lift > 2)
+                rb->lcd_vline(x, y, baseline);
+            previous_x = x;
+            previous_y = y;
+        }
+    }
+}
+
+static void draw_stereo_orbit(void)
+{
+    const int cx = RBPREP_DECK_WIDTH / 2;
+    const int cy = RBPREP_WAVE_TOP + 70;
+    const int radius = 58;
+    uint64_t mono_energy = 0;
+    uint64_t side_energy = 0;
+    int previous_x = cx;
+    int previous_y = cy;
+    int correlation = 0;
+    int point;
+    char line[24];
+
+    text(5, RBPREP_WAVE_TOP + 3, "STEREO ORBIT",
+         LCD_RGBPACK(105, 225, 255));
+    rb->lcd_set_foreground(LCD_RGBPACK(18, 48, 43));
+    xlcd_drawcircle(cx, cy, radius);
+    xlcd_drawcircle(cx, cy, radius - 1);
+    rb->lcd_hline(cx - radius, cx + radius, cy);
+    rb->lcd_vline(cx, cy - radius, cy + radius);
+    rb->lcd_set_foreground(LCD_RGBPACK(45, 78, 69));
+    xlcd_drawcircle(cx, cy, radius / 2);
+
+    if (pcm_snapshot_frames < 2) {
+        centered_text(0, RBPREP_DECK_WIDTH, cy - 4,
+                      "WAITING FOR AUDIO", LCD_LIGHTGRAY);
+    } else {
+        for (point = 0; point < 96; point++) {
+            int frame = (long long)point * (pcm_snapshot_frames - 1) / 95;
+            int left = pcm_snapshot[frame * 2];
+            int right = pcm_snapshot[frame * 2 + 1];
+            int side = left - right;
+            int mono = left + right;
+            int x = cx + (long long)side * (radius - 3) / 65536;
+            int y = cy - (long long)mono * (radius - 3) / 65536;
+
+            mono_energy += ABS(mono);
+            side_energy += ABS(side);
+            rb->lcd_set_foreground((point & 7) == 0
+                                  ? LCD_WHITE
+                                  : point & 1
+                                  ? RBPREP_GREEN
+                                  : LCD_RGBPACK(45, 205, 255));
+            if (point > 0)
+                rb->lcd_drawline(previous_x, previous_y, x, y);
+            previous_x = x;
+            previous_y = y;
+        }
+        if (mono_energy + side_energy > 0)
+            correlation = ((int64_t)mono_energy - (int64_t)side_energy) * 100 /
+                          (int64_t)(mono_energy + side_energy);
+    }
+
+    rb->lcd_set_foreground(LCD_RGBPACK(28, 49, 42));
+    rb->lcd_drawrect(52, RBPREP_WAVE_BOTTOM - 15, 194, 8);
+    rb->lcd_vline(cx, RBPREP_WAVE_BOTTOM - 17,
+                  RBPREP_WAVE_BOTTOM - 5);
+    rb->lcd_set_foreground(correlation < 0
+                          ? LCD_RGBPACK(255, 176, 50) : RBPREP_GREEN);
+    if (correlation >= 0)
+        rb->lcd_fillrect(cx, RBPREP_WAVE_BOTTOM - 13,
+                         correlation * 94 / 100 + 1, 4);
+    else
+        rb->lcd_fillrect(cx + correlation * 94 / 100,
+                         RBPREP_WAVE_BOTTOM - 13,
+                         -correlation * 94 / 100 + 1, 4);
+    rb->snprintf(line, sizeof(line), "CORR %+d", correlation);
+    centered_text(0, RBPREP_DECK_WIDTH, RBPREP_WAVE_BOTTOM - 29,
+                  line, LCD_WHITE);
+}
+
+static void draw_reactor_octagon(int cx, int cy, int radius, int color)
+{
+    int previous_x = cx + wheel_cosine[4] * radius / 256;
+    int previous_y = cy + wheel_sine[4] * radius / 256;
+    int point;
+
+    rb->lcd_set_foreground(color);
+    for (point = 1; point <= 8; point++) {
+        int angle = (4 + point * 8) & 63;
+        int x = cx + wheel_cosine[angle] * radius / 256;
+        int y = cy + wheel_sine[angle] * radius / 256;
+
+        rb->lcd_drawline(previous_x, previous_y, x, y);
+        previous_x = x;
+        previous_y = y;
+    }
+}
+
+static void draw_beat_reactor(void)
+{
+    int beat_number;
+    int beat_phase = visual_beat_phase(&beat_number);
+    int mid_push = (spectrum_levels[6] + spectrum_levels[7] -
+                    spectrum_levels[10] - spectrum_levels[11]) / 64;
+    int cx = RBPREP_DECK_WIDTH / 2 + mid_push;
+    int cy = RBPREP_WAVE_TOP + 73;
+    int aperture = 6 + spectrum_bass / 24 + spectrum_bass_hit / 48;
+    int treble = 0;
+    int ring;
+    int point;
+
+    text(5, RBPREP_WAVE_TOP + 3, "BEAT REACTOR",
+         LCD_RGBPACK(230, 120, 255));
+    for (point = 15; point < RBPREP_SPECTRUM_BANDS; point++)
+        treble += spectrum_levels[point];
+    treble /= 5;
+
+    /* Perspective ribs remain static while beat gates travel through them. */
+    rb->lcd_set_foreground(LCD_RGBPACK(22, 45, 37));
+    for (point = 0; point < 8; point++) {
+        int angle = 4 + point * 8;
+        rb->lcd_drawline(cx + wheel_cosine[angle] * aperture / 256,
+                         cy + wheel_sine[angle] * aperture / 256,
+                         cx + wheel_cosine[angle] * 72 / 256,
+                         cy + wheel_sine[angle] * 72 / 256);
+    }
+
+    for (ring = 7; ring >= 0; ring--) {
+        int travel = (beat_phase + ring * 32) & 255;
+        int radius = aperture + travel * (72 - aperture) / 255;
+        int gate_beat = ((beat_number - 1 + ring / 2) & 3) + 1;
+        int color = gate_beat == 1 ? LCD_WHITE
+                  : ring & 1 ? LCD_RGBPACK(40, 220, 255)
+                             : RBPREP_GREEN;
+
+        draw_reactor_octagon(cx, cy, radius, color);
+    }
+
+    /* Treble produces deterministic sparks; their positions are derived from
+       beat phase, so animation never depends on a random-number generator. */
+    for (point = 0; point < treble / 32; point++) {
+        int angle = (beat_phase / 4 + point * 11) & 63;
+        int radius = 28 + (point * 17 + beat_phase / 3) % 43;
+        int x = cx + wheel_cosine[angle] * radius / 256;
+        int y = cy + wheel_sine[angle] * radius / 256;
+
+        rb->lcd_set_foreground(point & 1 ? LCD_WHITE
+                                         : LCD_RGBPACK(255, 90, 225));
+        rb->lcd_drawpixel(x, y);
+        if (treble > 190)
+            rb->lcd_drawpixel(x + 1, y);
+    }
+    rb->lcd_set_foreground(LCD_BLACK);
+    xlcd_fillcircle(cx, cy, aperture - 1);
+    rb->lcd_set_foreground(spectrum_bass_hit > 80
+                          ? LCD_WHITE : RBPREP_GREEN);
+    xlcd_drawcircle(cx, cy, aperture);
+}
+
+static int track_key_pitch_class(void)
+{
+    static const signed char camelot_minor[12] = {
+        8, 3, 10, 5, 0, 7, 2, 9, 4, 11, 6, 1
+    };
+    static const signed char camelot_major[12] = {
+        11, 6, 1, 8, 3, 10, 5, 0, 7, 2, 9, 4
+    };
+    const char *key = selected_key;
+    int number = 0;
+    int pitch;
+    char letter;
+
+    while (*key == ' ')
+        key++;
+    if (*key >= '0' && *key <= '9') {
+        while (*key >= '0' && *key <= '9') {
+            number = number * 10 + *key - '0';
+            key++;
+        }
+        if (number >= 1 && number <= 12) {
+            if (*key == 'A' || *key == 'a')
+                return camelot_minor[number - 1];
+            if (*key == 'B' || *key == 'b')
+                return camelot_major[number - 1];
+        }
+    }
+
+    letter = *key;
+    if (letter >= 'a' && letter <= 'g')
+        letter -= 'a' - 'A';
+    if (letter == 'C') pitch = 0;
+    else if (letter == 'D') pitch = 2;
+    else if (letter == 'E') pitch = 4;
+    else if (letter == 'F') pitch = 5;
+    else if (letter == 'G') pitch = 7;
+    else if (letter == 'A') pitch = 9;
+    else if (letter == 'B') pitch = 11;
+    else return 0;
+    if (key[1] == '#')
+        pitch++;
+    else if (key[1] == 'b')
+        pitch--;
+    return (pitch + 12) % 12;
+}
+
+static void draw_harmonic_constellation(void)
+{
+    static const char *note_names[RBPREP_CHROMA_BANDS] = {
+        "C", "C#", "D", "D#", "E", "F",
+        "F#", "G", "G#", "A", "A#", "B"
+    };
+    static const unsigned char note_angles[RBPREP_CHROMA_BANDS] = {
+        48, 53, 59, 0, 5, 11, 16, 21, 27, 32, 37, 43
+    };
+    static const int note_colors[RBPREP_CHROMA_BANDS] = {
+        LCD_RGBPACK(255, 78, 88), LCD_RGBPACK(255, 130, 55),
+        LCD_RGBPACK(255, 205, 55), LCD_RGBPACK(185, 240, 60),
+        LCD_RGBPACK(70, 235, 105), LCD_RGBPACK(45, 230, 185),
+        LCD_RGBPACK(45, 205, 255), LCD_RGBPACK(60, 135, 255),
+        LCD_RGBPACK(120, 90, 255), LCD_RGBPACK(190, 80, 255),
+        LCD_RGBPACK(245, 75, 210), LCD_RGBPACK(255, 75, 145)
+    };
+    const int cx = RBPREP_DECK_WIDTH / 2;
+    const int cy = RBPREP_WAVE_TOP + 73;
+    int strongest[3] = { -1, -1, -1 };
+    int root = track_key_pitch_class();
+    int node_x[RBPREP_CHROMA_BANDS];
+    int node_y[RBPREP_CHROMA_BANDS];
+    int note;
+    int edge;
+    char line[32];
+
+    text(5, RBPREP_WAVE_TOP + 3, "HARMONIC CONSTELLATION",
+         LCD_RGBPACK(255, 120, 220));
+    rb->lcd_set_foreground(LCD_RGBPACK(30, 48, 43));
+    xlcd_drawcircle(cx, cy, 60);
+    xlcd_drawcircle(cx, cy, 42);
+
+    for (note = 0; note < RBPREP_CHROMA_BANDS; note++) {
+        int relative = (note - root + 12) % 12;
+        int angle = note_angles[relative];
+
+        node_x[note] = cx + wheel_cosine[angle] * 54 / 256;
+        node_y[note] = cy + wheel_sine[angle] * 54 / 256;
+        if (strongest[0] < 0 ||
+            chroma_levels[note] > chroma_levels[strongest[0]]) {
+            strongest[2] = strongest[1];
+            strongest[1] = strongest[0];
+            strongest[0] = note;
+        } else if (strongest[1] < 0 ||
+                   chroma_levels[note] > chroma_levels[strongest[1]]) {
+            strongest[2] = strongest[1];
+            strongest[1] = note;
+        } else if (strongest[2] < 0 ||
+                   chroma_levels[note] > chroma_levels[strongest[2]]) {
+            strongest[2] = note;
+        }
+    }
+
+    for (edge = 0; edge < 3; edge++) {
+        int a = strongest[edge];
+        int b = strongest[(edge + 1) % 3];
+        int level = MIN(chroma_levels[a], chroma_levels[b]);
+
+        rb->lcd_set_foreground(level > 150 ? LCD_WHITE
+                                          : LCD_RGBPACK(55, 105, 87));
+        rb->lcd_drawline(node_x[a], node_y[a], node_x[b], node_y[b]);
+    }
+
+    for (note = 0; note < RBPREP_CHROMA_BANDS; note++) {
+        int level = chroma_levels[note];
+        int radius = 2 + level / 64;
+        int relative = (note - root + 12) % 12;
+        int angle = note_angles[relative];
+        int label_x = cx + wheel_cosine[angle] * 69 / 256;
+        int label_y = cy + wheel_sine[angle] * 69 / 256;
+
+        rb->lcd_set_foreground(level > 50 ? note_colors[note]
+                                         : LCD_RGBPACK(35, 55, 47));
+        xlcd_fillcircle(node_x[note], node_y[note], radius);
+        if (note == root) {
+            rb->lcd_set_foreground(LCD_WHITE);
+            xlcd_drawcircle(node_x[note], node_y[note], radius + 2);
+        }
+        text(label_x - (note_names[note][1] ? 5 : 2), label_y - 4,
+             note_names[note], level > 65 ? LCD_WHITE : LCD_DARKGRAY);
+    }
+
+    rb->snprintf(line, sizeof(line), "KEY %s",
+                 selected_key[0] ? selected_key : note_names[root]);
+    centered_text(cx - 38, 76, cy - 4, line, LCD_WHITE);
 }
 
 static void draw_turntable_headshell(int style, int stylus_x, int stylus_y)
@@ -4281,7 +4764,12 @@ static void draw_waveform(void)
     int mid = (RBPREP_SIGNAL_TOP + RBPREP_SIGNAL_BOTTOM) / 2;
 
     if (visualizer_mode >= 1)
-        update_spectrum_levels(visualizer_mode == 1);
+        update_spectrum_levels(visualizer_mode == 1,
+                               visualizer_mode == 1 ||
+                               visualizer_mode == 2 ||
+                               visualizer_mode == 4 ||
+                               visualizer_mode == 6,
+                               visualizer_mode == 7);
     if (visualizer_mode == 1) {
         draw_boombox();
         return;
@@ -4290,6 +4778,18 @@ static void draw_waveform(void)
         return;
     } else if (visualizer_mode == 3) {
         draw_turntable();
+        return;
+    } else if (visualizer_mode == 4) {
+        draw_spectral_canyon();
+        return;
+    } else if (visualizer_mode == 5) {
+        draw_stereo_orbit();
+        return;
+    } else if (visualizer_mode == 6) {
+        draw_beat_reactor();
+        return;
+    } else if (visualizer_mode == 7) {
+        draw_harmonic_constellation();
         return;
     }
     viewport(&first, &span);
@@ -6669,6 +7169,8 @@ static enum rbprep_tool active_tool(void)
         else if (mode == MODE_LIST) selected = list_tool;
         else if (mode == MODE_PNAV) selected = pnav_tool;
         else if (mode == MODE_VISUALIZER) selected = visualizer_tool;
+        else if (mode == MODE_VISUALIZER_TWO)
+            selected = visualizer_two_tool;
         else selected = macro_tool;
         selected = MAX(0, MIN(tool_pages[page].count - 1, selected));
         return tool_pages[page].tools[selected];
@@ -6710,6 +7212,8 @@ static int *tool_selection(void)
         return &pnav_tool;
     if (mode == MODE_VISUALIZER)
         return &visualizer_tool;
+    if (mode == MODE_VISUALIZER_TWO)
+        return &visualizer_two_tool;
     return &macro_tool;
 }
 
@@ -6826,6 +7330,29 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
         xlcd_drawcircle(cx, cy, 4);
         xlcd_fillcircle(cx, cy, 1);
         rb->lcd_drawline(cx + 3, cy - 4, cx + 5, cy + 2);
+    } else if (tool == TOOL_VIS_CANYON) {
+        rb->lcd_drawline(cx, y, x, y + 8);
+        rb->lcd_drawline(cx, y, x + 8, y + 8);
+        rb->lcd_hline(x + 2, x + 6, y + 5);
+        rb->lcd_hline(x + 1, x + 7, y + 7);
+    } else if (tool == TOOL_VIS_ORBIT) {
+        xlcd_drawcircle(cx, cy, 4);
+        rb->lcd_drawline(cx, y, cx, y + 8);
+        rb->lcd_drawline(cx - 3, cy - 2, cx + 3, cy + 2);
+    } else if (tool == TOOL_VIS_REACTOR) {
+        rb->lcd_drawline(cx, y, x, cy);
+        rb->lcd_drawline(x, cy, cx, y + 8);
+        rb->lcd_drawline(cx, y + 8, x + 8, cy);
+        rb->lcd_drawline(x + 8, cy, cx, y);
+        xlcd_drawcircle(cx, cy, 1);
+    } else if (tool == TOOL_VIS_HARMONIC) {
+        xlcd_drawcircle(cx, cy, 4);
+        rb->lcd_fillrect(cx - 1, y, 2, 2);
+        rb->lcd_fillrect(x, cy + 1, 2, 2);
+        rb->lcd_fillrect(x + 7, cy + 1, 2, 2);
+        rb->lcd_drawline(cx, y + 1, x + 1, cy + 2);
+        rb->lcd_drawline(x + 1, cy + 2, x + 8, cy + 2);
+        rb->lcd_drawline(x + 8, cy + 2, cx, y + 1);
     } else if (tool == TOOL_MACRO_ONE || tool == TOOL_MACRO_TWO) {
         rb->lcd_drawrect(x, y + 1, 9, 7);
         rb->lcd_fillrect(x + 2, y + 3, 2, 2);
@@ -7536,6 +8063,14 @@ static void draw_tool_status(void)
         rb->snprintf(line, sizeof(line), "20-BAND EQ");
     else if (tool == TOOL_VIS_TURNTABLE)
         rb->snprintf(line, sizeof(line), "OSCILLO-TURNTABLE");
+    else if (tool == TOOL_VIS_CANYON)
+        rb->snprintf(line, sizeof(line), "SPECTRAL CANYON");
+    else if (tool == TOOL_VIS_ORBIT)
+        rb->snprintf(line, sizeof(line), "STEREO ORBIT");
+    else if (tool == TOOL_VIS_REACTOR)
+        rb->snprintf(line, sizeof(line), "BEAT REACTOR");
+    else if (tool == TOOL_VIS_HARMONIC)
+        rb->snprintf(line, sizeof(line), "HARMONIC CONSTELLATION");
     else if (tool == TOOL_MACRO_ONE || tool == TOOL_MACRO_TWO) {
         int slot = tool == TOOL_MACRO_ONE ? 0 : 1;
         rb->snprintf(line, sizeof(line), "M%d %.16s [%d]", slot + 1,
@@ -10061,7 +10596,7 @@ static void short_select(void)
                    pnav_tool_available(tool)) {
             reload_current_track();
         }
-    } else if (mode == MODE_VISUALIZER) {
+    } else if (mode == MODE_VISUALIZER || mode == MODE_VISUALIZER_TWO) {
         enum rbprep_tool tool = active_tool();
         if (tool == TOOL_WAVEFORM_STYLE)
             visualizer_mode = 0;
@@ -10071,6 +10606,14 @@ static void short_select(void)
             visualizer_mode = 2;
         else if (tool == TOOL_VIS_TURNTABLE)
             visualizer_mode = 3;
+        else if (tool == TOOL_VIS_CANYON)
+            visualizer_mode = 4;
+        else if (tool == TOOL_VIS_ORBIT)
+            visualizer_mode = 5;
+        else if (tool == TOOL_VIS_REACTOR)
+            visualizer_mode = 6;
+        else if (tool == TOOL_VIS_HARMONIC)
+            visualizer_mode = 7;
         if (visualizer_mode == 0)
             stop_spectrum_capture();
         else
@@ -10279,10 +10822,16 @@ static void adjust_active_tool(int direction)
     else if (tool == TOOL_PLAYLIST_MODE)
         playlist_playback = direction > 0;
     else if (tool == TOOL_WAVEFORM_STYLE || tool == TOOL_VIS_BOOMBOX ||
-             tool == TOOL_VIS_EQ || tool == TOOL_VIS_TURNTABLE) {
+             tool == TOOL_VIS_EQ || tool == TOOL_VIS_TURNTABLE ||
+             tool == TOOL_VIS_CANYON || tool == TOOL_VIS_ORBIT ||
+             tool == TOOL_VIS_REACTOR || tool == TOOL_VIS_HARMONIC) {
         visualizer_mode = tool == TOOL_WAVEFORM_STYLE ? 0 :
                           tool == TOOL_VIS_BOOMBOX ? 1 :
-                          tool == TOOL_VIS_EQ ? 2 : 3;
+                          tool == TOOL_VIS_EQ ? 2 :
+                          tool == TOOL_VIS_TURNTABLE ? 3 :
+                          tool == TOOL_VIS_CANYON ? 4 :
+                          tool == TOOL_VIS_ORBIT ? 5 :
+                          tool == TOOL_VIS_REACTOR ? 6 : 7;
         if (visualizer_mode == 0)
             stop_spectrum_capture();
         else
@@ -10855,6 +11404,8 @@ static void select_tool(enum rbprep_tool tool)
             else if (mode == MODE_LIST) list_tool = index;
             else if (mode == MODE_PNAV) pnav_tool = index;
             else if (mode == MODE_VISUALIZER) visualizer_tool = index;
+            else if (mode == MODE_VISUALIZER_TWO)
+                visualizer_two_tool = index;
             else macro_tool = index;
             return;
         }
@@ -11520,7 +12071,8 @@ enum plugin_status plugin_start(const void *parameter)
     grid_beat_shift = 0;
     cue_slot = 0;
     deck_tool = tempo_tool = grid_tool = cue_tool = loop_tool = 0;
-    metadata_tool = visualizer_tool = list_tool = pnav_tool = macro_tool = 0;
+    metadata_tool = visualizer_tool = visualizer_two_tool = 0;
+    list_tool = pnav_tool = macro_tool = 0;
     rating = 0;
     color_index = RBPREP_TRACK_COLOR_NONE;
     track_year = 0;
