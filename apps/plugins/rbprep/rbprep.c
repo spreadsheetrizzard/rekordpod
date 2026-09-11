@@ -55,7 +55,7 @@
 #define RBPREP_MENU_FRAME_TICKS MAX(1, HZ / 25)
 #define RBPREP_HUD_SCROLL_TICKS MAX(1, HZ / 10)
 #define RBPREP_STATUS_TICKS MAX(1, HZ)
-#define RBPREP_INDEX_PLAY_TICKS MAX(1, HZ / 4)
+#define RBPREP_WAVE_IO_PLAY_TICKS MAX(1, HZ / 4)
 #define RBPREP_CONFIG_VERSION 4
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
 #define RBPREP_DEVICE_NAME_FILE "/.rockbox/rbprep/device-name.txt"
@@ -287,7 +287,7 @@ static bool overview_dirty = true;
 static long overview_deadline;
 static long hud_scroll_deadline;
 static long status_deadline;
-static long wave_index_service_deadline;
+static long waveform_io_deadline;
 static int title_scroll_px;
 static int metadata_scroll_px;
 static bool hud_scroll_active;
@@ -504,6 +504,9 @@ static int seek_target;
 static int seek_applied_target;
 static long seek_deadline;
 static long seek_applied_tick;
+static bool jog_pitch_active;
+static int jog_pitch_x100;
+static long jog_pitch_deadline;
 #ifdef HAVE_WHEEL_POSITION
 static int seek_wheel_touch_position;
 static int seek_wheel_velocity_fp;
@@ -3014,6 +3017,56 @@ static void viewport(int *first, int *span)
     *first = zoom == 1 ? 0 : center - *span / 2;
 }
 
+static bool service_deep_zoom_cache(void)
+{
+#if RBPREP_WAVE_INDEX_FINE
+    int first;
+    int span;
+    int visible_begin;
+    int visible_end;
+    int buffered_begin;
+    int buffered_end;
+
+    if (capabilities.device_class != RBPREP_DEVICE_CLASSIC ||
+        mode < MODE_DECK || visualizer_mode != 0 || zoom < 64 ||
+        waveform_points <= 0)
+        return false;
+    viewport(&first, &span);
+    visible_begin = MAX(0, first);
+    visible_end = MIN(waveform_points, first + span);
+    if (visible_begin >= visible_end)
+        return false;
+
+    /* Fill what is on screen before read-ahead. Only one cache page may be
+       loaded per call, and this function is serviced outside the renderer. */
+    if (!rbprep_wave_range_cached(&wave_reader,
+                                  visible_begin, visible_end)) {
+        bool loaded = rbprep_wave_cache_range(&wave_reader,
+                                              visible_begin, visible_end);
+
+        if (loaded)
+            waveform_columns_valid = false;
+        return loaded;
+    }
+
+    /* One viewport behind and ahead makes ordinary playback cross page
+       boundaries without falling back from exact samples. Fast seeking is
+       still safe: the resident peak pyramid supplies the interim frame. */
+    buffered_begin = MAX(0, first - span);
+    buffered_end = MIN(waveform_points, first + span * 2);
+    if (!rbprep_wave_range_cached(&wave_reader,
+                                  buffered_begin, buffered_end)) {
+        bool loaded = rbprep_wave_cache_range(&wave_reader,
+                                              buffered_begin, buffered_end);
+
+        if (loaded)
+            waveform_columns_valid = false;
+        return loaded;
+    }
+#endif
+    return false;
+}
+
 static int time_to_x(int time_ms, int first, int span)
 {
     long long sample;
@@ -3193,14 +3246,12 @@ static void draw_loop_zone(int first, int span)
 
 static void rebuild_waveform_columns(int first, int span)
 {
-    int audio_status = rb->audio_status();
-    bool transport_active = (audio_status & AUDIO_STATUS_PLAY) &&
-                            !(audio_status & AUDIO_STATUS_PAUSE);
-    int samples_per_column = (span + RBPREP_DECK_WIDTH - 1) /
-                             RBPREP_DECK_WIDTH;
-    bool exact = !transport_active &&
-                 span <= (int)rbprep_wave_resident_points(&wave_reader) &&
-                 samples_per_column < 16;
+    int visible_begin = MAX(0, first);
+    int visible_end = MIN(waveform_points, first + span);
+    bool exact = capabilities.device_class == RBPREP_DEVICE_CLASSIC &&
+                 zoom >= 64 && visible_begin < visible_end &&
+                 rbprep_wave_range_cached(&wave_reader,
+                                          visible_begin, visible_end);
     int x;
 
     if (waveform_columns_valid && first == waveform_column_first &&
@@ -3225,12 +3276,12 @@ static void rebuild_waveform_columns(int first, int span)
         end = MIN(end, waveform_points);
 
         if (exact) {
-            if (!rbprep_wave_sample_at(&wave_reader, begin, &peak))
+            if (!rbprep_wave_sample_cached(&wave_reader, begin, &peak))
                 continue;
             for (index = begin + 1; index < end; index++) {
                 struct rbprep_wave_sample sample;
 
-                if (!rbprep_wave_sample_at(&wave_reader, index, &sample))
+                if (!rbprep_wave_sample_cached(&wave_reader, index, &sample))
                     break;
                 if (sample.amplitude > peak.amplitude)
                     peak = sample;
@@ -4434,8 +4485,10 @@ static bool load_latest_edit(int track_id)
 static bool save_edit_snapshot(void)
 {
     unsigned char data[RBPREP_EDIT_RECORD_SIZE];
+    off_t original_size;
     int fd;
     int i;
+    bool ok;
 
     if (selected_track_id < 0)
         return false;
@@ -4461,16 +4514,24 @@ static bool save_edit_snapshot(void)
     rb->strlcpy((char *)data + 120, selected_genre, 32);
     rb->strlcpy((char *)data + 152, selected_title, 64);
 
-    fd = rb->open(RBPREP_EDIT_JOURNAL,
-                  O_WRONLY | O_CREAT | O_APPEND, 0666);
+    fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDWR | O_CREAT, 0666);
     if (fd < 0)
         return false;
-    if (rb->write(fd, data, sizeof(data)) != sizeof(data)) {
-        rb->close(fd);
-        return false;
+    original_size = rb->filesize(fd);
+    if (original_size >= 0 &&
+        original_size % RBPREP_EDIT_RECORD_SIZE) {
+        original_size -= original_size % RBPREP_EDIT_RECORD_SIZE;
+        if (rb->ftruncate(fd, original_size) < 0)
+            original_size = -1;
     }
-    rb->close(fd);
-    return true;
+    ok = original_size >= 0 &&
+         rb->lseek(fd, original_size, SEEK_SET) >= 0 &&
+         write_exact(fd, data, sizeof(data));
+    if (!ok && original_size >= 0)
+        rb->ftruncate(fd, original_size);
+    if (rb->close(fd) < 0)
+        ok = false;
+    return ok;
 }
 
 static bool flush_deferred_edit(void)
@@ -4489,6 +4550,80 @@ static bool record_edit_change(void)
     return true;
 }
 
+static bool repair_edit_journal_tail(void)
+{
+    int fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDWR);
+    off_t size;
+    off_t complete;
+    bool ok = true;
+
+    if (fd < 0)
+        return true;
+    size = rb->filesize(fd);
+    if (size < 0) {
+        ok = false;
+    } else {
+        complete = size - size % RBPREP_EDIT_RECORD_SIZE;
+        if (complete != size && rb->ftruncate(fd, complete) < 0)
+            ok = false;
+    }
+    if (rb->close(fd) < 0)
+        ok = false;
+    return ok;
+}
+
+static bool repair_playlist_journal_tail(void)
+{
+    unsigned char buffer[128];
+    int fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDWR);
+    off_t size;
+    off_t cursor;
+    off_t keep = 0;
+    bool ok = true;
+
+    if (fd < 0)
+        return true;
+    size = rb->filesize(fd);
+    if (size <= 0)
+        goto done;
+    if (rb->lseek(fd, size - 1, SEEK_SET) < 0 ||
+        rb->read(fd, buffer, 1) != 1) {
+        ok = false;
+        goto done;
+    }
+    if (buffer[0] == '\n')
+        goto done;
+
+    /* Journal appends always include their newline in the same write. An
+       unterminated tail is therefore an interrupted record, never a durable
+       operation. Preserve every complete line before it. */
+    cursor = size;
+    while (cursor > 0) {
+        int count = MIN((off_t)sizeof(buffer), cursor);
+        int i;
+
+        cursor -= count;
+        if (rb->lseek(fd, cursor, SEEK_SET) < 0 ||
+            rb->read(fd, buffer, count) != count) {
+            ok = false;
+            goto done;
+        }
+        for (i = count - 1; i >= 0; i--) {
+            if (buffer[i] == '\n') {
+                keep = cursor + i + 1;
+                goto found_tail;
+            }
+        }
+    }
+found_tail:
+    if (rb->ftruncate(fd, keep) < 0)
+        ok = false;
+done:
+    if (rb->close(fd) < 0)
+        ok = false;
+    return ok;
+}
+
 static void read_burn_offsets(uint32_t *edit_offset,
                               uint32_t *playlist_offset)
 {
@@ -4505,6 +4640,37 @@ static void read_burn_offsets(uint32_t *edit_offset,
         *playlist_offset = read_u32(data + 8);
     }
     rb->close(fd);
+
+    /* A replaced/repaired journal can legitimately be shorter than an old
+       completion marker. Replaying from zero is idempotent and safer than
+       treating that stale marker as corruption. */
+    fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
+    if (fd >= 0) {
+        off_t size = rb->filesize(fd);
+
+        if (size < 0 || *edit_offset > (uint32_t)size ||
+            *edit_offset % RBPREP_EDIT_RECORD_SIZE)
+            *edit_offset = 0;
+        rb->close(fd);
+    } else {
+        *edit_offset = 0;
+    }
+    fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
+    if (fd >= 0) {
+        off_t size = rb->filesize(fd);
+        unsigned char newline;
+
+        if (size < 0 || *playlist_offset > (uint32_t)size) {
+            *playlist_offset = 0;
+        } else if (*playlist_offset > 0 &&
+                   (rb->lseek(fd, *playlist_offset - 1, SEEK_SET) < 0 ||
+                    rb->read(fd, &newline, 1) != 1 || newline != '\n')) {
+            *playlist_offset = 0;
+        }
+        rb->close(fd);
+    } else {
+        *playlist_offset = 0;
+    }
 }
 
 static bool write_burn_offsets(uint32_t edit_offset,
@@ -4784,10 +4950,14 @@ static void refresh_pending_summary(void)
 {
     uint32_t edit_offset;
     uint32_t playlist_offset;
+    bool journals_repaired = repair_edit_journal_tail() &&
+                             repair_playlist_journal_tail();
 
     read_burn_offsets(&edit_offset, &playlist_offset);
     refresh_pending_summary_from_offsets(edit_offset, playlist_offset,
                                          edit_offset, playlist_offset);
+    if (!journals_repaired)
+        pending_journal_invalid = true;
 }
 
 static bool delete_pending_edit(uint32_t track_id)
@@ -7669,14 +7839,12 @@ static bool append_playlist_operation(unsigned char operation,
                                       const char *name)
 {
     char line[192];
+    off_t original_size;
     int fd;
     int length;
+    bool ok;
 
     if (!playlist_id || !rb->strchr("ACRMD", operation))
-        return false;
-    fd = rb->open(RBPREP_PLAYLIST_JOURNAL,
-                  O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (fd < 0)
         return false;
     length = rb->snprintf(line, sizeof(line),
                           "%c\t%lu\t%lu\t%lu\t%d\t%s\n",
@@ -7684,12 +7852,23 @@ static bool append_playlist_operation(unsigned char operation,
                           (unsigned long)playlist_id,
                           (unsigned long)parent_id, MAX(0, MIN(2, kind)),
                           name ? name : "");
-    if (length <= 0 || length >= (int)sizeof(line) ||
-        rb->write(fd, line, length) != length) {
-        rb->close(fd);
+    if (length <= 0 || length >= (int)sizeof(line))
         return false;
-    }
-    rb->close(fd);
+    if (!repair_playlist_journal_tail())
+        return false;
+    fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDWR | O_CREAT, 0666);
+    if (fd < 0)
+        return false;
+    original_size = rb->filesize(fd);
+    ok = original_size >= 0 &&
+         rb->lseek(fd, original_size, SEEK_SET) >= 0 &&
+         write_exact(fd, line, length);
+    if (!ok && original_size >= 0)
+        rb->ftruncate(fd, original_size);
+    if (rb->close(fd) < 0)
+        ok = false;
+    if (!ok)
+        return false;
     refresh_pending_summary();
     return true;
 }
@@ -7719,6 +7898,8 @@ static bool append_playlist_seed_operation(uint32_t playlist_id,
                           (unsigned long)selected_track_id,
                           (unsigned long)playlist_id, name);
     if (second <= 0 || first + second >= (int)sizeof(data))
+        return false;
+    if (!repair_playlist_journal_tail())
         return false;
     fd = rb->open(RBPREP_PLAYLIST_JOURNAL,
                   O_RDWR | O_CREAT, 0666);
@@ -8203,12 +8384,23 @@ static bool update_play_clock(void)
     return true;
 }
 
+static void restore_jog_pitch(void)
+{
+    if (!jog_pitch_active)
+        return;
+    jog_pitch_active = false;
+    jog_pitch_x100 = 0;
+    apply_playback_rate();
+}
+
 static void stop_editor_audio(void)
 {
     bool resume;
 
-    if (seek_state == SEEK_IDLE)
+    if (seek_state == SEEK_IDLE) {
+        restore_jog_pitch();
         return;
+    }
     update_play_clock();
     resume = !seek_was_paused && !cue_audition_active;
     rb->audio_pause();
@@ -8217,6 +8409,7 @@ static void stop_editor_audio(void)
     seek_state = SEEK_IDLE;
     cue_audition_active = false;
     cue_audition_latched = false;
+    restore_jog_pitch();
     overview_dirty = true;
     if (resume)
         rb->audio_resume();
@@ -8232,6 +8425,8 @@ static void jump_to_time(int target)
     target = clamp_playhead(target);
     if (seek_state != SEEK_IDLE)
         stop_editor_audio();
+    else
+        restore_jog_pitch();
     if (status & AUDIO_STATUS_PLAY) {
         rb->audio_pre_ff_rewind();
         rb->audio_ff_rewind(target);
@@ -8334,6 +8529,7 @@ static bool service_audio_seek(void)
             } else {
                 rb->pcmbuf_fade(false, true);
             }
+            restore_jog_pitch();
             reset_play_clock(playhead, now);
         }
     }
@@ -8415,6 +8611,42 @@ static void seek_by(int delta, bool audition)
 }
 
 #ifdef HAVE_WHEEL_POSITION
+static void update_paused_jog_pitch(void)
+{
+    int status = rb->audio_status();
+    bool paused_origin = (status & AUDIO_STATUS_PAUSE) ||
+                         (seek_state != SEEK_IDLE && seek_was_paused);
+    int velocity_ms_per_second;
+    int pitch;
+
+    if (!paused_origin)
+        return;
+    velocity_ms_per_second = ABS(seek_wheel_velocity_fp) / 256;
+    if (velocity_ms_per_second <= 0)
+        return;
+
+    /* Timeline velocity is already expressed as milliseconds traversed per
+       real second: 1000 ms/s is natural speed. A physical deck changes pitch
+       with platter speed, so explicitly bypass timestretch/keylock for this
+       temporary audition and stay within Rockbox's supported 50%-200% band.
+       Reverse wheel travel is heard as successive forward grains whose start
+       positions move backwards, matching a jog wheel without reverse decode. */
+    pitch = (long long)velocity_ms_per_second * PITCH_SPEED_100 / 1000;
+    pitch = MAX(50 * PITCH_SPEED_PRECISION,
+                MIN(200 * PITCH_SPEED_PRECISION, pitch));
+    pitch = (pitch + PITCH_SPEED_PRECISION / 2) /
+            PITCH_SPEED_PRECISION * PITCH_SPEED_PRECISION;
+    if (jog_pitch_active &&
+        (TIME_BEFORE(*rb->current_tick, jog_pitch_deadline) ||
+         ABS(pitch - jog_pitch_x100) < PITCH_SPEED_PRECISION))
+        return;
+    rb->dsp_timestretch_enable(false);
+    rb->sound_set_pitch(pitch);
+    jog_pitch_x100 = pitch;
+    jog_pitch_active = true;
+    jog_pitch_deadline = *rb->current_tick + MAX(1, HZ / 10);
+}
+
 static bool seek_wheel_physics_enabled(void)
 {
     return platter_wheel_mode && !display_locked && !confirm_active &&
@@ -8500,6 +8732,7 @@ static bool service_seek_wheel_physics(void)
         delta = seek_wheel_delta_fp / 256;
         seek_wheel_delta_fp -= delta * 256;
         if (delta) {
+            update_paused_jog_pitch();
             seek_by(delta, true);
             changed = playhead != before;
             if (!changed)
@@ -9493,6 +9726,8 @@ static void change_zoom(bool zoom_in)
         zoom = zoom >= RBPREP_MAX_ZOOM ? 1 : zoom * 2;
     else
         zoom = zoom <= 1 ? RBPREP_MAX_ZOOM : zoom / 2;
+    waveform_columns_valid = false;
+    waveform_io_deadline = *rb->current_tick;
 }
 
 static void change_volume(int direction)
@@ -10678,6 +10913,9 @@ enum plugin_status plugin_start(const void *parameter)
     cue_audition_latched = false;
     overview_playhead_white = true;
     seek_state = SEEK_IDLE;
+    jog_pitch_active = false;
+    jog_pitch_x100 = 0;
+    jog_pitch_deadline = *rb->current_tick;
 #ifdef HAVE_WHEEL_POSITION
     seek_wheel_touch_position = -1;
     seek_wheel_velocity_fp = 0;
@@ -10775,7 +11013,7 @@ enum plugin_status plugin_start(const void *parameter)
     overview_deadline = *rb->current_tick;
     hud_scroll_deadline = *rb->current_tick;
     status_deadline = *rb->current_tick;
-    wave_index_service_deadline = *rb->current_tick;
+    waveform_io_deadline = *rb->current_tick;
     frame_deadline = *rb->current_tick;
     storage_keepalive_deadline = *rb->current_tick + HZ * 30;
 
@@ -10832,24 +11070,29 @@ enum plugin_status plugin_start(const void *parameter)
                                                 : RBPREP_MENU_FRAME_TICKS);
         }
         if (!display_locked && selected_track_id >= 0 &&
-            seek_state == SEEK_IDLE && rb->button_status() == BUTTON_NONE &&
-            wave_index.stage != RBPREP_WAVE_INDEX_IDLE &&
-            wave_index.stage != RBPREP_WAVE_INDEX_FAILED) {
+            seek_state == SEEK_IDLE && rb->button_status() == BUTTON_NONE) {
             int status = rb->audio_status();
             bool transport_active = (status & AUDIO_STATUS_PLAY) &&
                                     !(status & AUDIO_STATUS_PAUSE);
             long now = *rb->current_tick;
 
-            /* The renderer never reads RBW data. Index construction is the
-               sole background reader; pace it while audio is running so a
-               slow HDD/PATA bridge gets ample time to refill the codec
-               between small slices. Paused decks may finish at full speed. */
+            /* The renderer never reads RBW data. At deep zoom, first fill one
+               raw cache page for the visible/read-ahead window; otherwise
+               advance one index stage. Pacing ensures a slow HDD/PATA bridge
+               gets codec-refill time between these bounded operations. */
             if (!transport_active ||
-                !TIME_BEFORE(now, wave_index_service_deadline)) {
-                bool complete = rbprep_wave_index_service(&wave_index);
+                !TIME_BEFORE(now, waveform_io_deadline)) {
+                bool cache_loaded = service_deep_zoom_cache();
+                bool complete = false;
 
-                wave_index_service_deadline = now +
-                    (transport_active ? RBPREP_INDEX_PLAY_TICKS : 1);
+                if (!cache_loaded &&
+                    wave_index.stage != RBPREP_WAVE_INDEX_IDLE &&
+                    wave_index.stage != RBPREP_WAVE_INDEX_FAILED)
+                    complete = rbprep_wave_index_service(&wave_index);
+                waveform_io_deadline = now +
+                    (transport_active ? RBPREP_WAVE_IO_PLAY_TICKS : 1);
+                if (cache_loaded)
+                    redraw = true;
                 if (complete) {
                     waveform_columns_valid = false;
                     overview_dirty = true;

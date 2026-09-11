@@ -42,6 +42,13 @@ bool rbprep_wave_open(struct rbprep_wave_reader *reader, const char *path,
 void rbprep_wave_close(struct rbprep_wave_reader *reader);
 bool rbprep_wave_sample_at(struct rbprep_wave_reader *reader, uint32_t index,
                            struct rbprep_wave_sample *sample);
+bool rbprep_wave_sample_cached(struct rbprep_wave_reader *reader,
+                               uint32_t index,
+                               struct rbprep_wave_sample *sample);
+bool rbprep_wave_range_cached(struct rbprep_wave_reader *reader,
+                              uint32_t begin, uint32_t end);
+bool rbprep_wave_cache_range(struct rbprep_wave_reader *reader,
+                             uint32_t begin, uint32_t end);
 uint32_t rbprep_wave_resident_points(const struct rbprep_wave_reader *reader);
 bool rbprep_wave_build_overview(struct rbprep_wave_reader *reader,
                                 unsigned char (*overview)[4], int columns);
