@@ -61,7 +61,6 @@
 #define RBPREP_MENU_FRAME_TICKS MAX(1, HZ / 25)
 #define RBPREP_HUD_SCROLL_TICKS MAX(1, HZ / 10)
 #define RBPREP_STATUS_TICKS MAX(1, HZ)
-#define RBPREP_WAVE_IO_PLAY_TICKS MAX(1, HZ / 4)
 #define RBPREP_CONFIG_VERSION 4
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
 #define RBPREP_DEVICE_NAME_FILE "/.rockbox/rbprep/device-name.txt"
@@ -1236,7 +1235,7 @@ static const struct mixer_buffer_cbs spectrum_buffer_cbs = {
 
 static void start_spectrum_capture(void)
 {
-    if (spectrum_capture_active)
+    if (spectrum_capture_active || visualizer_mode == 0 || display_locked)
         return;
     pcm_capture_index = 0;
     pcm_capture_frames[0] = pcm_capture_frames[1] = 0;
@@ -2800,6 +2799,12 @@ static int beat_period_ms(void)
     return MAX(1, (first * (100 - fraction) + second * fraction + 50) / 100);
 }
 
+static bool imported_grid_resident(void)
+{
+    return beat_count > 0 &&
+           rbprep_grid_range_cached(&grid_reader, 0, beat_count);
+}
+
 static bool source_beat_at(int index, int *time_ms, int *number)
 {
     struct rbprep_grid_beat beat;
@@ -3117,7 +3122,7 @@ static void draw_beatgrid(int first, int span, int clip_left, int clip_right)
     pixels_per_beat = (long long)period * RBPREP_DECK_WIDTH /
                       MAX(1, view_end - view_start);
 
-    if (beat_count > 0) {
+    if (imported_grid_resident()) {
         int low = 0;
         int high = beat_count;
 
@@ -5604,6 +5609,8 @@ static bool load_waveform(int track_id)
         !rbprep_grid_open(&grid_reader, filename, beat_count,
                           beat_data_offset))
         beat_count = 0;
+    if (beat_count > 0)
+        rbprep_grid_cache_all(&grid_reader);
     beat_search_hint = 0;
     rb->close(fd);
     overview_dirty = true;
@@ -6955,7 +6962,8 @@ static void draw_beat_phase(void)
     char position[8];
     int bar = 1;
     int beat = 1;
-    int index = current_beat_index(playhead);
+    int index = imported_grid_resident()
+              ? current_beat_index(playhead) : -1;
     int i;
 
     if (index >= 0) {
@@ -6963,7 +6971,7 @@ static void draw_beat_phase(void)
 
         beat = adjusted_beat_number(index);
         bar = (index + first_beat - 1) / 4 + 1;
-    } else if (beat_count <= 0) {
+    } else {
         int ordinal = (playhead - grid_phase_ms - grid_offset) /
                       beat_period_ms();
         if (ordinal >= 0) {
@@ -9744,6 +9752,10 @@ static void short_select(void)
             visualizer_mode = 2;
         else if (tool == TOOL_VIS_TURNTABLE)
             visualizer_mode = 3;
+        if (visualizer_mode == 0)
+            stop_spectrum_capture();
+        else
+            start_spectrum_capture();
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     } else if (mode == MODE_MACRO) {
@@ -9956,6 +9968,10 @@ static void adjust_active_tool(int direction)
         visualizer_mode = tool == TOOL_WAVEFORM_STYLE ? 0 :
                           tool == TOOL_VIS_BOOMBOX ? 1 :
                           tool == TOOL_VIS_EQ ? 2 : 3;
+        if (visualizer_mode == 0)
+            stop_spectrum_capture();
+        else
+            start_spectrum_capture();
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     }
@@ -10746,6 +10762,11 @@ static void draw_rekordpod_boot_splash(void)
                             record_y + dot_y[phase], 2);
         }
 
+        /* Once vinyl has completed its click-wheel transformation, name the
+           instrument on its own screen before the camera dives into it. */
+        if (morph == 20)
+            centered_text(119, 82, 55, "rekordpod", LCD_WHITE);
+
         rb->lcd_set_foreground(LCD_RGBPACK(30, 38, 33));
         rb->lcd_fillrect(109, 218, 102, 5);
         rb->lcd_set_foreground(RBPREP_GREEN);
@@ -10789,8 +10810,46 @@ static void draw_rekordpod_boot_splash(void)
             xlcd_fillcircle(LCD_WIDTH / 2, wheel_cy,
                             MAX(5, 13 * scale / 1024));
         }
-        rb->lcd_set_foreground(LCD_BLACK);
+        if (frame < 12) {
+            rb->lcd_set_foreground(LCD_BLACK);
+        } else {
+            int luminance = MIN(255, (frame - 12) * 255 / 20);
+
+            rb->lcd_set_foreground(LCD_RGBPACK(luminance, luminance,
+                                               luminance));
+        }
         boot_fill_clipped_rect(sx, sy, sw, sh);
+        if (frame < 12)
+            centered_text(sx, sw, sy + sh / 2 - 4,
+                          "rekordpod", LCD_WHITE);
+        rb->lcd_update();
+        rb->sleep(MAX(1, HZ / 24));
+    }
+
+    /* Cross the visible pixel boundary: a fine white raster expands with
+       the camera while the black center cell grows to consume the panel.
+       Ending on true black gives the menu fade a clean, OLED-like origin. */
+    for (frame = 0; frame <= 28; frame++) {
+        int t = frame * 1024 / 28;
+        int eased = (long long)t * t * (3072 - 2 * t) /
+                    (1024 * 1024);
+        int cell = 4 + eased * 30 / 1024;
+        int aperture_w = MAX(1, (long long)LCD_WIDTH * eased / 1024);
+        int aperture_h = MAX(1, (long long)LCD_HEIGHT * eased / 1024);
+        int x;
+        int y;
+
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+        rb->lcd_set_foreground(LCD_RGBPACK(204, 208, 205));
+        for (x = LCD_WIDTH / 2 % cell; x < LCD_WIDTH; x += cell)
+            rb->lcd_vline(x, 0, LCD_HEIGHT - 1);
+        for (y = LCD_HEIGHT / 2 % cell; y < LCD_HEIGHT; y += cell)
+            rb->lcd_hline(0, LCD_WIDTH - 1, y);
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_fillrect((LCD_WIDTH - aperture_w) / 2,
+                         (LCD_HEIGHT - aperture_h) / 2,
+                         aperture_w, aperture_h);
         rb->lcd_update();
         rb->sleep(MAX(1, HZ / 24));
     }
@@ -11218,11 +11277,12 @@ enum plugin_status plugin_start(const void *parameter)
                                     !(status & AUDIO_STATUS_PAUSE);
             long now = *rb->current_tick;
 
-            /* The renderer never reads RBW data. At deep zoom, first fill one
-               raw cache page for the visible/read-ahead window; otherwise
-               advance one index stage. Pacing ensures a slow HDD/PATA bridge
-               gets codec-refill time between these bounded operations. */
-            if (!transport_active ||
+            /* Playback owns storage exclusively. Even an 8 KiB analysis read
+               can queue behind a slow PATA/flash erase cycle and starve the
+               codec or freeze the UI. Cache and index maintenance therefore
+               run only while paused/stopped; active playback falls back to
+               the fully resident peak pyramid on a raw-cache miss. */
+            if (!transport_active &&
                 !TIME_BEFORE(now, waveform_io_deadline)) {
                 bool cache_loaded = service_deep_zoom_cache();
                 bool complete = false;
@@ -11231,8 +11291,7 @@ enum plugin_status plugin_start(const void *parameter)
                     wave_index.stage != RBPREP_WAVE_INDEX_IDLE &&
                     wave_index.stage != RBPREP_WAVE_INDEX_FAILED)
                     complete = rbprep_wave_index_service(&wave_index);
-                waveform_io_deadline = now +
-                    (transport_active ? RBPREP_WAVE_IO_PLAY_TICKS : 1);
+                waveform_io_deadline = now + 1;
                 if (cache_loaded)
                     redraw = true;
                 if (complete) {

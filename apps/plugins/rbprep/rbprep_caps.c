@@ -22,7 +22,9 @@ void rbprep_caps_detect(struct rbprep_caps *caps,
     caps->device_class = RBPREP_DEVICE_CLASSIC;
     caps->waveform_cache_bytes = bounded_fraction(
         available, 192u * KIBIBYTE, 64u * KIBIBYTE);
-    caps->beat_cache_bytes = 8u * KIBIBYTE;
+    /* Keep up to 4096 imported beat markers resident. Renderer-side grid
+       lookups must never wake storage while the codec is feeding audio. */
+    caps->beat_cache_bytes = 32u * KIBIBYTE;
     /* A five-level, two-point-base peak pyramid for the maximum 131072-point
        analysis occupies about 343 KiB. It is resident while drawing, which
        restores high-definition 64x/128x views without live storage reads. */
@@ -42,7 +44,7 @@ void rbprep_caps_detect(struct rbprep_caps *caps,
     caps->device_class = RBPREP_DEVICE_VIDEO;
     caps->waveform_cache_bytes = bounded_fraction(
         available, 32u * KIBIBYTE, 48u * KIBIBYTE);
-    caps->beat_cache_bytes = 4u * KIBIBYTE;
+    caps->beat_cache_bytes = 8u * KIBIBYTE;
     caps->waveform_index_bytes = 48u * KIBIBYTE;
     caps->io_slice_bytes = 4u * KIBIBYTE;
     caps->deck_fps = 20;
