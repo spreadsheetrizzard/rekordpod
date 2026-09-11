@@ -24,7 +24,10 @@ void rbprep_caps_detect(struct rbprep_caps *caps,
         available, 192u * KIBIBYTE, 64u * KIBIBYTE);
     caps->beat_cache_bytes = 8u * KIBIBYTE;
     caps->waveform_index_bytes = 48u * KIBIBYTE;
-    caps->io_slice_bytes = 32u * KIBIBYTE;
+    /* Keep synchronous high-zoom cache fills below a single visible frame.
+       The larger workspace remains an LRU window; only each I/O slice is
+       reduced for flash/HDD adapters with poor long-read latency. */
+    caps->io_slice_bytes = 8u * KIBIBYTE;
     caps->deck_fps = 30;
     caps->visualizer_fps = 20;
 #if defined(USB_ENABLE_AUDIO)

@@ -318,6 +318,8 @@ static int body_brightness = 88;
 static int wheel_hue;
 static int wheel_saturation;
 static int wheel_brightness = 14;
+static int turntable_arm_style = 1;
+static int turntable_headshell_style;
 static int theme_accent = LCD_RGBPACK(70, 235, 125);
 static int theme_accent_dim = LCD_RGBPACK(28, 75, 48);
 static int theme_body = LCD_RGBPACK(220, 224, 221);
@@ -598,6 +600,7 @@ static bool usb_extract_event_registered;
 
 static void stop_editor_audio(void);
 static void reset_play_clock(int anchor, long tick);
+static bool update_play_clock(void);
 static void jump_to_time(int target);
 static bool flush_deferred_edit(void);
 static void start_spectrum_capture(void);
@@ -830,6 +833,8 @@ static const char *spectrum_labels[] = {
 static char *save_on_load_styles[] = { "immediate", "next track" };
 static char *auto_burn_styles[] = { "off", "next track load" };
 static char *off_on_styles[] = { "off", "on" };
+static char *turntable_arm_styles[] = { "straight", "s-shaped" };
+static char *turntable_headshell_styles[] = { "technics", "ipod body" };
 static const char *track_sort_names[] = {
     "TITLE", "BPM", "YEAR", "KEY", "COMMENTS", "TAGS", "IMPORTED"
 };
@@ -877,6 +882,10 @@ static const struct configdata rbprep_config[] = {
       "wheel saturation", NULL },
     { TYPE_INT, 5, 100, { .int_p = &wheel_brightness },
       "wheel brightness", NULL },
+    { TYPE_ENUM, 0, 1, { .int_p = &turntable_arm_style },
+      "turntable arm", turntable_arm_styles },
+    { TYPE_ENUM, 0, 1, { .int_p = &turntable_headshell_style },
+      "turntable headshell", turntable_headshell_styles },
     { TYPE_INT, 0, INT_MAX, { .int_p = &favorite_playlist_ids[0] },
       "favorite playlist 1", NULL },
     { TYPE_INT, 0, INT_MAX, { .int_p = &favorite_playlist_ids[1] },
@@ -931,9 +940,18 @@ static void service_config_persistence(void)
 static void service_storage_keepalive(void)
 {
     long now = *rb->current_tick;
+    int status;
 
     if (display_locked || TIME_BEFORE(now, storage_keepalive_deadline))
         return;
+    status = rb->audio_status();
+    if ((status & AUDIO_STATUS_PLAY) && !(status & AUDIO_STATUS_PAUSE)) {
+        /* Decoder refills already keep media awake. An extra ATA keepalive
+           here could collide with a refill and produced a visible hitch near
+           the one-minute mark on large flash adapters. */
+        storage_keepalive_deadline = now + HZ * 30;
+        return;
+    }
     /* Some large PATA-to-flash adapters are slow to recover from standby.
        Keep the already-awake device active while Rekordpod is in use, but
        immediately restore normal Rockbox power policy when HOLD is engaged,
@@ -3109,7 +3127,10 @@ static void draw_loop_zone(int first, int span)
 
 static void rebuild_waveform_columns(int first, int span)
 {
-    bool exact = span <= (int)rbprep_wave_resident_points(&wave_reader);
+    int samples_per_column = (span + RBPREP_DECK_WIDTH - 1) /
+                             RBPREP_DECK_WIDTH;
+    bool exact = span <= (int)rbprep_wave_resident_points(&wave_reader) &&
+                 samples_per_column < 16;
     int x;
 
     if (waveform_columns_valid && first == waveform_column_first &&
@@ -3411,6 +3432,7 @@ static void draw_boombox(void)
         "D#2", "E2", "F2", "F#2", "G2", "G#2", "A2", "A#2"
     };
     int bass = MIN(255, spectrum_bass + spectrum_bass_hit / 2);
+    int neon_pulse = MIN(255, 70 + bass / 2 + spectrum_bass_hit / 3);
     bool rattling = spectrum_bass >= 204;
     int rattle = rattling && ((*rb->current_tick / MAX(1, HZ / 20)) & 1)
                ? 1 : 0;
@@ -3419,15 +3441,20 @@ static void draw_boombox(void)
     int note;
     char line[32];
 
-    rb->lcd_set_foreground(LCD_RGBPACK(8, 12, 10));
+    rb->lcd_set_foreground(LCD_RGBPACK(1, 3, 5));
     rb->lcd_fillrect(8 + rattle, RBPREP_WAVE_TOP + 10,
                      RBPREP_DECK_WIDTH - 16, 132);
-    rb->lcd_set_foreground(rattling ? LCD_WHITE
-                                   : LCD_RGBPACK(93, 108, 99));
+    rb->lcd_set_foreground(LCD_RGBPACK(8, 55, 38));
+    rb->lcd_drawrect(6 + rattle, RBPREP_WAVE_TOP + 8,
+                     RBPREP_DECK_WIDTH - 12, 136);
+    rb->lcd_set_foreground(rattling ? LCD_WHITE : RBPREP_GREEN);
     rb->lcd_drawrect(8 + rattle, RBPREP_WAVE_TOP + 10,
                      RBPREP_DECK_WIDTH - 16, 132);
+    rb->lcd_set_foreground(LCD_RGBPACK(35, 205, 255));
+    rb->lcd_hline(14 + rattle, RBPREP_DECK_WIDTH - 15 + rattle,
+                  RBPREP_WAVE_TOP + 12);
     centered_text(0, RBPREP_DECK_WIDTH, RBPREP_WAVE_TOP + 14,
-                  "SUB RESONANCE", RBPREP_GREEN);
+                  "SUB RESONANCE", LCD_RGBPACK(135, 255, 225));
     if (rattling) {
         rb->lcd_set_foreground(LCD_WHITE);
         rb->lcd_hline(3, 6, RBPREP_WAVE_TOP + 55 + rattle);
@@ -3441,21 +3468,26 @@ static void draw_boombox(void)
         int channel = speaker ? vu_right : vu_left;
         int cone = 25 + bass / 18 + MIN(5, channel / 6554);
 
-        rb->lcd_set_foreground(LCD_RGBPACK(4, 7, 6));
+        rb->lcd_set_foreground(LCD_BLACK);
         xlcd_fillcircle(cx, cy, 49);
-        rb->lcd_set_foreground(LCD_RGBPACK(60, 72, 64));
+        rb->lcd_set_foreground(LCD_RGBPACK(10, 65, 40));
+        xlcd_drawcircle(cx, cy, 50);
+        rb->lcd_set_foreground(RBPREP_GREEN);
         xlcd_drawcircle(cx, cy, 48);
+        rb->lcd_set_foreground(LCD_RGBPACK(35, 205, 255));
         xlcd_drawcircle(cx, cy, 43);
-        rb->lcd_set_foreground(LCD_RGBPACK(16 + bass / 12,
-                                           30 + bass / 7,
-                                           24 + bass / 16));
+        rb->lcd_set_foreground(LCD_RGBPACK(3,
+                                           18 + bass / 5,
+                                           26 + bass / 4));
         xlcd_fillcircle(cx, cy, cone);
-        rb->lcd_set_foreground(LCD_RGBPACK(74 + bass / 3,
-                                           88 + bass / 5,
-                                           79 + bass / 7));
+        rb->lcd_set_foreground(LCD_RGBPACK(MIN(255, 45 + neon_pulse / 3),
+                                           MIN(255, 125 + neon_pulse / 2),
+                                           MIN(255, 150 + neon_pulse / 3)));
         xlcd_drawcircle(cx, cy, cone);
-        rb->lcd_set_foreground(LCD_RGBPACK(8, 12, 10));
+        rb->lcd_set_foreground(LCD_BLACK);
         xlcd_fillcircle(cx, cy, 9 + spectrum_bass_hit / 40);
+        rb->lcd_set_foreground(LCD_RGBPACK(225, 45, 255));
+        xlcd_drawcircle(cx, cy, 10 + spectrum_bass_hit / 40);
 
         /* Each speaker doubles as a compact steelpan note field. */
         for (note = 0; note < (int)ARRAYLEN(note_names); note++) {
@@ -3467,10 +3499,14 @@ static void draw_boombox(void)
                           bass_pitch_confidence >= 36;
 
             rb->lcd_set_foreground(active ? LCD_WHITE
-                                          : LCD_RGBPACK(42, 91, 61));
-            if (active)
+                                          : note < 6 ? RBPREP_GREEN
+                                          : note < 12
+                                          ? LCD_RGBPACK(40, 205, 255)
+                                          : LCD_RGBPACK(215, 45, 255));
+            if (active) {
+                xlcd_drawcircle(x, y, 4);
                 xlcd_fillcircle(x, y, 3);
-            else {
+            } else {
                 xlcd_drawcircle(x, y, 2);
                 rb->lcd_drawpixel(x, y);
             }
@@ -3482,15 +3518,16 @@ static void draw_boombox(void)
                       note_names[bass_note_index], LCD_WHITE);
         rb->snprintf(line, sizeof(line), "%d.%dHz",
                      bass_frequency_x10 / 10, bass_frequency_x10 % 10);
-        centered_text(118, 64, RBPREP_WAVE_TOP + 69, line, RBPREP_GREEN);
+        centered_text(118, 64, RBPREP_WAVE_TOP + 69, line,
+                      LCD_RGBPACK(40, 220, 255));
     } else {
         centered_text(118, 64, RBPREP_WAVE_TOP + 51, "--", LCD_LIGHTGRAY);
         centered_text(118, 64, RBPREP_WAVE_TOP + 69,
-                      "LISTEN", RBPREP_GREEN_DIM);
+                      "LISTEN", LCD_RGBPACK(155, 45, 205));
     }
     rb->snprintf(line, sizeof(line), "%ddB", spectrum_level_db(spectrum_bass));
     centered_text(118, 64, RBPREP_WAVE_TOP + 87, line,
-                  rattling ? LCD_WHITE : LCD_RGBPACK(155, 174, 161));
+                  rattling ? LCD_WHITE : RBPREP_GREEN);
     if (rattling)
         centered_text(118, 64, RBPREP_WAVE_TOP + 105,
                       "RATTLE", LCD_WHITE);
@@ -3658,12 +3695,6 @@ static void draw_turntable(void)
         previous_y = y;
     }
 
-    rb->lcd_set_foreground(LCD_RGBPACK(112, 116, 113));
-    xlcd_fillcircle(cx, cy, 13);
-    rb->lcd_set_foreground(LCD_RGBPACK(37, 40, 38));
-    xlcd_drawcircle(cx, cy, 13);
-    xlcd_drawcircle(cx, cy, 9);
-
     /* Cue flags are record-relative: their timeline position chooses a groove
        angle and the platter phase rotates the whole cue map. */
     for (slot = 0; slot < 16; slot++) {
@@ -3685,8 +3716,12 @@ static void draw_turntable(void)
                                cue_palette[hotcue_colors[slot] & 7]);
     }
 
+    /* No record label masks the scope: only a pin-sized spindle interrupts
+       the continuous horizontal trace through the platter center. */
+    rb->lcd_set_foreground(LCD_BLACK);
+    xlcd_fillcircle(cx, cy, 2);
     rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
-    xlcd_fillcircle(cx, cy, 4);
+    rb->lcd_drawpixel(cx, cy);
 
     /* A real tonearm moves inward over the full side.  The stylus follows a
        fixed pickup angle while its groove radius falls from 56 to 34 pixels. */
@@ -3696,10 +3731,14 @@ static void draw_turntable(void)
     groove_radius = 56 - progress_x1000 * 22 / 1000;
     stylus_x = cx + cosine[7] * groove_radius / 256;
     stylus_y = cy + sine[7] * groove_radius / 256;
-    arm_mid1_x = (192 * 2 + stylus_x) / 3 + 5;
+    arm_mid1_x = (192 * 2 + stylus_x) / 3;
     arm_mid1_y = ((RBPREP_WAVE_TOP + 30) * 2 + stylus_y) / 3;
-    arm_mid2_x = (192 + stylus_x * 2) / 3 - 5;
+    arm_mid2_x = (192 + stylus_x * 2) / 3;
     arm_mid2_y = (RBPREP_WAVE_TOP + 30 + stylus_y * 2) / 3;
+    if (turntable_arm_style) {
+        arm_mid1_x += 5;
+        arm_mid2_x -= 5;
+    }
     /* A three-pixel brushed-metal tube reads much more like the curved arm
        on a real deck than a single, computer-perfect line. */
     rb->lcd_set_foreground(LCD_RGBPACK(67, 73, 69));
@@ -3731,9 +3770,21 @@ static void draw_turntable(void)
                      stylus_x + 3, stylus_y + 3);
     rb->lcd_drawline(stylus_x - 1, stylus_y + 2,
                      stylus_x, stylus_y + 5);
-    rb->lcd_set_foreground(LCD_RGBPACK(205, 211, 207));
-    rb->lcd_drawline(stylus_x - 2, stylus_y - 1,
-                     stylus_x + 2, stylus_y + 2);
+    if (turntable_headshell_style) {
+        rb->lcd_set_foreground(theme_body_shadow);
+        rb->lcd_drawline(stylus_x - 3, stylus_y - 1,
+                         stylus_x + 3, stylus_y + 3);
+        rb->lcd_drawline(stylus_x - 3, stylus_y - 2,
+                         stylus_x + 3, stylus_y + 2);
+        rb->lcd_set_foreground(theme_body);
+        rb->lcd_drawline(stylus_x - 2, stylus_y - 1,
+                         stylus_x + 2, stylus_y + 2);
+        xlcd_fillcircle(stylus_x - 2, stylus_y - 1, 1);
+    } else {
+        rb->lcd_set_foreground(LCD_RGBPACK(205, 211, 207));
+        rb->lcd_drawline(stylus_x - 2, stylus_y - 1,
+                         stylus_x + 2, stylus_y + 2);
+    }
     rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_drawpixel(stylus_x, stylus_y + 4);
     rb->lcd_set_foreground(LCD_RGBPACK(115, 124, 119));
@@ -3793,22 +3844,22 @@ static void draw_turntable(void)
         bool playing = (rb->audio_status() & AUDIO_STATUS_PLAY) &&
                        !(rb->audio_status() & AUDIO_STATUS_PAUSE);
         int button_x = 4;
-        int button_y = RBPREP_WAVE_BOTTOM - 14;
+        int button_y = RBPREP_WAVE_BOTTOM - 19;
 
         rb->lcd_set_foreground(playing ? LCD_RGBPACK(12, 49, 29)
                                       : LCD_RGBPACK(11, 14, 12));
-        rb->lcd_fillrect(button_x, button_y, 25, 11);
+        rb->lcd_fillrect(button_x, button_y, 38, 16);
         rb->lcd_set_foreground(RBPREP_GREEN);
-        rb->lcd_drawrect(button_x, button_y, 25, 11);
-        rb->lcd_fillrect(button_x, button_y, 3, 11);
+        rb->lcd_drawrect(button_x, button_y, 38, 16);
+        rb->lcd_fillrect(button_x, button_y, 4, 16);
         rb->lcd_set_foreground(LCD_WHITE);
         if (playing) {
-            rb->lcd_fillrect(button_x + 10, button_y + 3, 2, 6);
-            rb->lcd_fillrect(button_x + 15, button_y + 3, 2, 6);
+            rb->lcd_fillrect(button_x + 15, button_y + 4, 3, 8);
+            rb->lcd_fillrect(button_x + 22, button_y + 4, 3, 8);
         } else {
-            xlcd_filltriangle(button_x + 10, button_y + 2,
-                              button_x + 10, button_y + 8,
-                              button_x + 18, button_y + 5);
+            xlcd_filltriangle(button_x + 14, button_y + 3,
+                              button_x + 14, button_y + 12,
+                              button_x + 26, button_y + 8);
         }
     }
 
@@ -5063,6 +5114,31 @@ static void open_track_browser(int playlist_node)
     force_full_redraw = true;
 }
 
+/* Switching playlists while the decoder is still feeding PCM lets storage
+   and codec teardown race the analysis/index reads below.  On slow PATA flash
+   bridges that looks like a frozen waveform while the old song continues for
+   several seconds.  Pause first, then give Rockbox a short bounded chance to
+   publish the paused state before any track-load I/O begins. */
+static bool soft_pause_for_track_load(void)
+{
+    int status = rb->audio_status();
+    long deadline;
+
+    if (!(status & AUDIO_STATUS_PLAY) || (status & AUDIO_STATUS_PAUSE))
+        return false;
+    update_play_clock();
+    rb->audio_pause();
+    deadline = *rb->current_tick + MAX(1, HZ / 5);
+    do {
+        status = rb->audio_status();
+        if (!(status & AUDIO_STATUS_PLAY) || (status & AUDIO_STATUS_PAUSE))
+            break;
+        rb->yield();
+    } while (TIME_BEFORE(*rb->current_tick, deadline));
+    reset_play_clock(playhead, *rb->current_tick);
+    return true;
+}
+
 static bool play_track_index(int index, int row,
                              enum rbprep_mode return_mode)
 {
@@ -5072,6 +5148,8 @@ static bool play_track_index(int index, int row,
     const char *extension;
     bool already_loaded;
     bool force_reload = force_track_reload;
+    bool resume_existing = false;
+    bool capture_was_active = false;
 
     if (!read_track_record(index, &track) ||
         !read_index_string(track.path_offset, path, sizeof(path)))
@@ -5087,11 +5165,6 @@ static bool play_track_index(int index, int row,
                                       force_reload);
         return false;
     }
-    if (index != selected_track_index)
-        save_rbprep_config();
-    if (index != selected_track_index || force_reload)
-        service_deferred_burn();
-
     id3 = rb->audio_current_track();
     already_loaded = !force_reload && id3 && id3->path &&
                      !rb->strcmp(id3->path, path);
@@ -5110,6 +5183,17 @@ static bool play_track_index(int index, int row,
         return true;
     }
 
+    stop_editor_audio();
+    resume_existing = soft_pause_for_track_load();
+    capture_was_active = spectrum_capture_active;
+    stop_spectrum_capture();
+    if (index != selected_track_index)
+        save_rbprep_config();
+    if (index != selected_track_index || force_reload) {
+        service_deferred_burn();
+        resume_existing = soft_pause_for_track_load() || resume_existing;
+    }
+
     if (host_rpm_index != 0 || played_rpm_index != 0 ||
         pitch_bend_x100 != 0 || tempo_x100 != PITCH_SPEED_100) {
         host_rpm_index = played_rpm_index = 0;
@@ -5118,7 +5202,6 @@ static bool play_track_index(int index, int row,
         apply_playback_rate();
     }
     if (!already_loaded) {
-        stop_editor_audio();
         if (force_reload) {
             rb->audio_stop();
             rb->yield();
@@ -5127,6 +5210,11 @@ static bool play_track_index(int index, int row,
         if (rb->playlist_create(NULL, NULL) < 0 ||
             rb->playlist_insert_track(NULL, path, PLAYLIST_INSERT_LAST,
                                       false, true) < 0) {
+            if (resume_existing &&
+                (rb->audio_status() & AUDIO_STATUS_PAUSE))
+                rb->audio_resume();
+            if (capture_was_active && !display_locked)
+                start_spectrum_capture();
             rb->splash(HZ * 2, "Could not load track");
             restore_black_canvas();
             return false;
@@ -5164,14 +5252,20 @@ static bool play_track_index(int index, int row,
     load_waveform(track.id);
     load_latest_edit(track.id);
     track_edit_dirty = false;
+    id3 = rb->audio_current_track();
     if (already_loaded && id3) {
         if (id3->length > 0)
             track_length = id3->length;
         playhead = clamp_playhead(id3->elapsed);
+        if (resume_existing &&
+            (rb->audio_status() & AUDIO_STATUS_PAUSE))
+            rb->audio_resume();
     } else {
         playhead = 0;
         rb->playlist_start(0, 0, 0);
     }
+    if (capture_was_active && !display_locked)
+        start_spectrum_capture();
     reset_play_clock(playhead, *rb->current_tick);
     playing_track_row = row;
     audio_was_running = true;
@@ -6712,14 +6806,17 @@ static void draw_settings(void)
     const char *names[] = {
         "AUTOBOOT REKORDPOD", "AUTO-NEXT DEFAULT", "WAVEFORM SHAPE",
         "TRACK EXIT", "COMMIT POLICY", "WHEEL CLICK", "ACCENT COLOR",
-        "IPOD BODY COLOR", "WHEEL / VINYL COLOR"
+        "IPOD BODY COLOR", "WHEEL / VINYL COLOR", "TURNTABLE ARM",
+        "HEADSHELL DESIGN"
     };
     const char *values[] = {
         autoboot_enabled ? "ON" : "OFF",
         autoplay_enabled ? "ON" : "OFF",
         waveform_half ? "HALF" : "FULL",
         "ASK EACH TIME", "SAVE & LOAD",
-        click_sound ? "ON" : "OFF", "HSB", "HSB", "HSB"
+        click_sound ? "ON" : "OFF", "HSB", "HSB", "HSB",
+        turntable_arm_style ? "S-SHAPED" : "STRAIGHT",
+        turntable_headshell_style ? "IPOD BODY" : "TECHNICS"
     };
     const char *description;
 
@@ -6727,12 +6824,12 @@ static void draw_settings(void)
     text(10, 29, "PLAYBACK  /  WORKFLOW  /  DISPLAY",
          LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < (int)ARRAYLEN(names); row++) {
-        int y = 37 + row * 18;
+        int y = 34 + row * 15;
         if (row == settings_selection)
-            draw_blade_selection(y - 2, 17, RBPREP_GREEN);
+            draw_blade_selection(y - 1, 14, RBPREP_GREEN);
         rb->lcd_set_foreground(row == settings_selection
                                ? LCD_WHITE : RBPREP_GREEN);
-        xlcd_fillcircle(17, y + 6, row == settings_selection ? 5 : 4);
+        xlcd_fillcircle(17, y + 6, row == settings_selection ? 4 : 3);
         rb->lcd_set_foreground(row == settings_selection
                                ? LCD_BLACK : LCD_RGBPACK(10, 38, 23));
         xlcd_fillcircle(17, y + 6, 1);
@@ -6764,7 +6861,11 @@ static void draw_settings(void)
          ? "Color used for controls, selections and accents"
          : settings_selection == 7
          ? "Color of the iPod body in the boot animation"
-         : "Color of the boot record, wheel and record motifs";
+         : settings_selection == 8
+         ? "Color of the boot record, wheel and record motifs"
+         : settings_selection == 9
+         ? "Choose a straight or classic S-shaped pickup arm"
+         : "Technics pickup or a headshell matching iPod body color";
     rb->lcd_set_foreground(LCD_RGBPACK(13, 19, 16));
     rb->lcd_fillrect(8, 198, LCD_WIDTH - 16, 22);
     text(13, 204, description, LCD_RGBPACK(145, 165, 151));
@@ -6890,6 +6991,70 @@ static void draw_genre_picker(void)
     text(7, 226, "WHEEL: BROWSE   SELECT: ASSIGN   MENU: BACK", LCD_WHITE);
 }
 
+static void draw_main_menu_fx(void)
+{
+    static const int16_t orbit_x[16] = {
+        256, 237, 181, 98, 0, -98, -181, -237,
+        -256, -237, -181, -98, 0, 98, 181, 237
+    };
+    static const int16_t orbit_y[16] = {
+        0, 98, 181, 237, 256, 237, 181, 98,
+        0, -98, -181, -237, -256, -237, -181, -98
+    };
+    long frame = *rb->current_tick / MAX(1, HZ / 20);
+    int cx = 282;
+    int cy = 128;
+    int point;
+    int band;
+    int scan_y = 38 + (frame * 3) % 178;
+
+    /* A live neon record tunnel gives the otherwise-static launcher its own
+       identity. It stays in the unused right rail so menu text remains crisp. */
+    rb->lcd_set_foreground(LCD_RGBPACK(2, 18, 11));
+    rb->lcd_fillrect(226, 37, LCD_WIDTH - 226, 181);
+    rb->lcd_set_foreground(LCD_RGBPACK(10, 48, 29));
+    xlcd_drawcircle(cx, cy, 70);
+    rb->lcd_set_foreground(RBPREP_GREEN_DIM);
+    xlcd_drawcircle(cx, cy, 58);
+    rb->lcd_set_foreground(LCD_RGBPACK(20, 86, 105));
+    xlcd_drawcircle(cx, cy, 45);
+    rb->lcd_set_foreground(LCD_RGBPACK(91, 31, 104));
+    xlcd_drawcircle(cx, cy, 31);
+    rb->lcd_set_foreground(LCD_RGBPACK(6, 22, 14));
+    xlcd_fillcircle(cx, cy, 18);
+    rb->lcd_set_foreground(LCD_WHITE);
+    xlcd_fillcircle(cx, cy, 2);
+    for (point = 0; point < 16; point++) {
+        int angle = (point + frame) & 15;
+        int x = cx + orbit_x[angle] * 65 / 256;
+        int y = cy + orbit_y[angle] * 65 / 256;
+        int color = point % 4 == 0 ? LCD_WHITE
+                  : point & 1 ? LCD_RGBPACK(40, 225, 255)
+                              : RBPREP_GREEN;
+
+        rb->lcd_set_foreground(color);
+        if (((point + frame) & 3) == 0)
+            xlcd_fillcircle(x, y, 2);
+        else
+            rb->lcd_drawpixel(x, y);
+    }
+    rb->lcd_set_foreground((frame & 1) ? RBPREP_GREEN_DIM
+                                      : LCD_RGBPACK(16, 54, 35));
+    rb->lcd_hline(226, LCD_WIDTH - 1, scan_y);
+
+    /* OP-1-like activity teeth form a compact animated footer meter. */
+    for (band = 0; band < 24; band++) {
+        int height = 2 + ((band * 7 + frame * 3) % 13);
+        int x = 8 + band * 9;
+        rb->lcd_set_foreground((band + frame) % 7 == 0
+                               ? LCD_WHITE
+                               : band & 1 ? RBPREP_GREEN
+                                          : LCD_RGBPACK(35, 155, 205));
+        rb->lcd_vline(x, 222 - height, 222);
+        rb->lcd_vline(x + 1, 222 - height / 2, 222);
+    }
+}
+
 static void draw_main_menu(void)
 {
     static const char *items[] = {
@@ -6904,6 +7069,7 @@ static void draw_main_menu(void)
 
     draw_blade_shell("RBPREP  /  PERFORMANCE LIBRARY",
                      RBPREP_GREEN);
+    draw_main_menu_fx();
     if (library_fd >= 0)
         rb->snprintf(line, sizeof(line), "%lu TRACKS / INDEX ONLINE",
                      (unsigned long)library_track_count);
@@ -6920,7 +7086,13 @@ static void draw_main_menu(void)
         int y = 42 + i * 23;
         bool selected = i == selection;
         if (selected) {
+            int sweep = (*rb->current_tick / MAX(1, HZ / 30) * 9) %
+                        (LCD_WIDTH - 18);
             draw_blade_selection(y - 2, 20, RBPREP_GREEN);
+            rb->lcd_set_foreground(LCD_RGBPACK(60, 255, 145));
+            rb->lcd_hline(10, LCD_WIDTH - 10, y - 1);
+            rb->lcd_set_foreground(LCD_WHITE);
+            rb->lcd_fillrect(9 + sweep, y - 2, 5, 2);
         }
         draw_main_glyph(20, y + 7, i, selected);
         text(42, y + 3, items[i], selected ? LCD_WHITE : RBPREP_MENU_TEXT);
@@ -8428,10 +8600,14 @@ static void short_select(void)
             restore_black_canvas();
         } else if (settings_selection == 5) {
             click_sound = !click_sound;
-        } else {
+        } else if (settings_selection <= 8) {
             color_picker_target = settings_selection - 6;
             accent_component = 0;
             mode = MODE_ACCENT;
+        } else if (settings_selection == 9) {
+            turntable_arm_style = !turntable_arm_style;
+        } else {
+            turntable_headshell_style = !turntable_headshell_style;
         }
         rebuild_waveform_height_lut();
         mark_rbprep_config_dirty();
@@ -9978,6 +10154,8 @@ enum plugin_status plugin_start(const void *parameter)
     wheel_hue = MAX(0, MIN(359, wheel_hue));
     wheel_saturation = MAX(0, MIN(100, wheel_saturation));
     wheel_brightness = MAX(5, MIN(100, wheel_brightness));
+    turntable_arm_style = !!turntable_arm_style;
+    turntable_headshell_style = !!turntable_headshell_style;
     update_theme_colors();
     mode = MODE_LIBRARY;
     selection = 0;
@@ -10138,7 +10316,8 @@ enum plugin_status plugin_start(const void *parameter)
            menus remain event-driven while the deck keeps its timecode clock. */
         if (!display_locked &&
             !TIME_BEFORE(*rb->current_tick, frame_deadline) &&
-            (force_full_redraw || mode >= MODE_DECK || redraw)) {
+            (force_full_redraw || mode == MODE_LIBRARY ||
+             mode >= MODE_DECK || redraw)) {
             draw_screen();
             redraw = false;
             frame_deadline = *rb->current_tick +
@@ -10160,12 +10339,13 @@ enum plugin_status plugin_start(const void *parameter)
             int chord_status = rb->button_status();
             int chord_button = macro_chord_button;
 
-            /* A macro chord only arms another workflow cell.  Keep the
-               entire input path latched until both SELECT and the companion
-               button are physically up; otherwise SELECT's release can be
-               mistaken for a fresh press and execute the newly armed tool.
-               A deliberate second SELECT press is the sole execution path. */
-            if (!(chord_status & (chord_button | BUTTON_SELECT))) {
+            /* A macro chord only arms another workflow cell. Release the
+               latch as soon as its companion direction is physically up so
+               SELECT may remain held while LEFT/RIGHT is tapped repeatedly.
+               `pressed` stays empty for the whole hold, so the eventual
+               SELECT release cannot execute the armed cell; execution still
+               requires a deliberate new SELECT press. */
+            if (!(chord_status & chord_button)) {
                 macro_chord_button = BUTTON_NONE;
                 pressed = BUTTON_NONE;
                 if (chord_button == BUTTON_LEFT)
@@ -10179,7 +10359,7 @@ enum plugin_status plugin_start(const void *parameter)
                 } else if (chord_button == BUTTON_PLAY) {
                     suppress_play = false;
                 }
-                select_hold_fired = false;
+                select_hold_fired = !!(chord_status & BUTTON_SELECT);
                 suppress_menu = suppress_play = false;
                 suppress_left = suppress_right = false;
                 menu_button_down = false;
@@ -10488,7 +10668,7 @@ enum plugin_status plugin_start(const void *parameter)
                 usb_selection = MIN(capabilities.usb_audio ? 2 : 1,
                                     usb_selection + 1);
             else if (mode == MODE_SETTINGS)
-                settings_selection = MIN(8, settings_selection + 1);
+                settings_selection = MIN(10, settings_selection + 1);
             else if (mode == MODE_ACCENT)
                 adjust_active_color(1);
             else if (mode == MODE_PLAYLIST_ACTIONS)
