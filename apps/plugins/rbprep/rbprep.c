@@ -3,6 +3,11 @@
 #include "lib/helper.h"
 #include "lib/pluginlib_exit.h"
 #include "lib/xlcd.h"
+#include "rbprep_caps.h"
+#include "rbprep_grid.h"
+#include "rbprep_store.h"
+#include "rbprep_wave.h"
+#include "rbprep_wave_index.h"
 
 #if CONFIG_KEYPAD != IPOD_4G_PAD
 #error "RBPrep currently targets the iPod click wheel"
@@ -47,21 +52,21 @@
 #define RBPREP_CUE_SETTLE MAX(1, HZ / 50)
 #define RBPREP_PREVIEW_TICKS MAX(1, HZ * 4 / 25)
 #define RBPREP_OVERVIEW_TICKS MAX(1, HZ / 2)
-#define RBPREP_FRAME_TICKS MAX(1, HZ / 20)
 #define RBPREP_MENU_FRAME_TICKS MAX(1, HZ / 25)
-#define RBPREP_SPECTRUM_TICKS MAX(1, HZ / 12)
 #define RBPREP_HUD_SCROLL_TICKS MAX(1, HZ / 10)
 #define RBPREP_STATUS_TICKS MAX(1, HZ)
 #define RBPREP_CONFIG_VERSION 4
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
 #define RBPREP_USB_STATUS "/.rockbox/rbprep/usb-status.rbs"
 #define RBPREP_AUTOBOOT_OFF "/.rockbox/rbprep/autoboot.off"
-#define RBPREP_MACRO_FILE "/.rockbox/rbprep/tool-macros.rbm"
-#define RBPREP_MACRO_FILE_TMP "/.rockbox/rbprep/tool-macros.rbm.tmp"
-#define RBPREP_MACRO_FILE_PREV "/.rockbox/rbprep/tool-macros.rbm.prev"
-#define RBPREP_MACRO_RECOVERY_FILE "/.rekordpod-macros.rbm"
-#define RBPREP_MACRO_RECOVERY_TMP "/.rekordpod-macros.rbm.tmp"
-#define RBPREP_MACRO_RECOVERY_PREV "/.rekordpod-macros.rbm.prev"
+#define RBPREP_MACRO_FILE_A "/.rockbox/rbprep/state/macros.a"
+#define RBPREP_MACRO_FILE_B "/.rockbox/rbprep/state/macros.b"
+#define RBPREP_MACRO_LEGACY_FILE "/.rockbox/rbprep/tool-macros.rbm"
+#define RBPREP_MACRO_LEGACY_TMP "/.rockbox/rbprep/tool-macros.rbm.tmp"
+#define RBPREP_MACRO_LEGACY_PREV "/.rockbox/rbprep/tool-macros.rbm.prev"
+#define RBPREP_MACRO_LEGACY_ROOT "/.rekordpod-macros.rbm"
+#define RBPREP_MACRO_LEGACY_ROOT_TMP "/.rekordpod-macros.rbm.tmp"
+#define RBPREP_MACRO_LEGACY_ROOT_PREV "/.rekordpod-macros.rbm.prev"
 #define RBPREP_MACRO_LINK_FILE "/.rekordpod-workflows.rbl"
 #define RBPREP_MACRO_LINK_TMP "/.rekordpod-workflows.rbl.tmp"
 #define RBPREP_MACRO_LINK_LEGACY \
@@ -70,12 +75,12 @@
 #define RBPREP_PLAYLIST_JOURNAL "/.rockbox/rbprep/playlist-adds.rba"
 #define RBPREP_EDIT_JOURNAL "/.rockbox/rbprep/edits.rbe"
 #define RBPREP_BURN_STATE "/.rockbox/rbprep/local-burn.rbs"
+#define RBPREP_SEARCH_RESULTS "/.rockbox/rbprep/state/search.results"
 /* Fixed-size, little-endian RBE1 snapshots make interrupted appends harmless
    and keep the eventual macOS importer independent of compiler struct layout. */
 #define RBPREP_EDIT_RECORD_SIZE 216
 #define RBPREP_PENDING_ROWS 8
-#define RBPREP_PENDING_MAX 512
-#define RBPREP_SEARCH_MAX 8192
+#define RBPREP_PENDING_MAX 64
 #define RBPREP_SPECTRUM_BANDS 20
 #define RBPREP_PCM_FRAMES 1024
 #define RBPREP_GREEN theme_accent
@@ -83,19 +88,22 @@
 #define RBPREP_MENU_TEXT LCD_RGBPACK(188, 205, 193)
 #define RBPREP_TOOL_PAGE_MAX 4
 #define RBPREP_MACRO_COUNT 2
-#define RBPREP_MACRO_STEPS 24
+#define RBPREP_MACRO_STEPS 48
+#define RBPREP_MACRO_LEGACY_STEPS 24
 #define RBPREP_MACRO_NAME 24
 #define RBPREP_MACRO_CHOOSE (-2147483647 - 1)
 #define RBPREP_MACRO_LOCK_WHEEL 0x01
 #define RBPREP_MACRO_LINKS 128
 #define RBPREP_SMART_QUERIES 128
 #define RBPREP_DAC_INITIAL_GAIN_DB (-50)
-#define RBPREP_MACRO_FORMAT 4
 #define RBPREP_MACRO_STEP_SIZE 8
-#define RBPREP_MACRO_STORE_SIZE \
-    (12 + RBPREP_MACRO_COUNT * \
+#define RBPREP_MACRO_V5_HEADER 24
+#define RBPREP_MACRO_V5_PAYLOAD \
+    (4 + RBPREP_MACRO_COUNT * \
      (RBPREP_MACRO_NAME + 1 + \
       RBPREP_MACRO_STEPS * RBPREP_MACRO_STEP_SIZE))
+#define RBPREP_MACRO_V5_SIZE \
+    (RBPREP_MACRO_V5_HEADER + RBPREP_MACRO_V5_PAYLOAD)
 #define RBPREP_TRACK_COLOR_NONE 8
 #define RBPREP_TRACK_COLOR_COUNT 9
 
@@ -196,7 +204,9 @@ enum rbprep_confirm_action {
     CONFIRM_PLAYLIST_NODE_DELETE,
     CONFIRM_MACRO_CLEAR,
     CONFIRM_MACRO_DELETE_STEP,
-    CONFIRM_BURN_ALL_NOW
+    CONFIRM_BURN_ALL_NOW,
+    CONFIRM_TRACK_LOAD,
+    CONFIRM_PLAYLIST_SEED
 };
 
 enum rbprep_burn_request {
@@ -239,9 +249,12 @@ struct rbprep_pending_playlist {
 };
 
 static enum rbprep_mode mode;
+static struct rbprep_caps capabilities;
+static struct rbprep_wave_reader wave_reader;
+static struct rbprep_grid_reader grid_reader;
+static struct rbprep_wave_index wave_index;
 static int selection;
 static int playhead;
-static unsigned char waveform[RBPREP_POINTS][4];
 static unsigned char overview_waveform[RBPREP_OVERVIEW_WIDTH][4];
 static struct rbprep_wave_column waveform_columns[RBPREP_DECK_WIDTH];
 static unsigned char waveform_height_lut[256];
@@ -249,9 +262,8 @@ static int waveform_column_first;
 static int waveform_column_span;
 static bool waveform_columns_valid;
 static int waveform_points;
-static int beat_times[RBPREP_BEATS];
-static unsigned char beat_numbers[RBPREP_BEATS];
 static int beat_count;
+static int beat_search_hint;
 static int zoom = 1;
 static int grid_offset;
 static int grid_phase_ms = 26;
@@ -293,6 +305,7 @@ static int click_sound;
 static int keylock_enabled = 1;
 static int autoplay_enabled = 1;
 static int autoboot_enabled = 1;
+static int favorite_playlist_ids[2];
 static int total_plays;
 static int accent_hue = 145;
 static int accent_saturation = 70;
@@ -328,6 +341,7 @@ static int16_t pcm_capture[2][RBPREP_PCM_FRAMES * 2] MEM_ALIGN_ATTR;
 static int16_t pcm_snapshot[RBPREP_PCM_FRAMES * 2] MEM_ALIGN_ATTR;
 static int16_t pcm_mono[RBPREP_PCM_FRAMES] MEM_ALIGN_ATTR;
 static int16_t pcm_pitch[RBPREP_PCM_FRAMES] MEM_ALIGN_ATTR;
+static int pcm_snapshot_frames;
 static volatile int pcm_capture_index;
 static volatile int pcm_capture_frames[2];
 static volatile unsigned int pcm_capture_generation;
@@ -365,10 +379,15 @@ static bool force_track_reload;
 static bool audio_was_running;
 static bool confirm_active;
 static bool confirm_ok;
+static int confirm_choice;
 static bool confirm_wait_release;
 static bool exit_requested;
 static enum rbprep_confirm_action confirm_action;
 static char confirm_message[64];
+static int deferred_track_index = -1;
+static int deferred_track_row = -1;
+static enum rbprep_mode deferred_track_return_mode;
+static bool deferred_track_force_reload;
 static int confirm_slot;
 static int confirm_time;
 static int confirm_playlist_node;
@@ -430,6 +449,8 @@ struct rbprep_tool_macro {
 static struct rbprep_tool_macro tool_macros[RBPREP_MACRO_COUNT];
 static int macro_active = -1;
 static int macro_position;
+static uint32_t macro_generation;
+static int macro_generation_slot = -1;
 static bool macro_store_valid;
 static bool macro_dirty;
 static int macro_manage_slot;
@@ -544,6 +565,7 @@ static int tree_selection;
 static int tree_top;
 static int tree_child_count;
 static int tree_children[RBPREP_TREE_NODES];
+static int favorite_playlist_nodes[2] = { -1, -1 };
 static struct rbprep_playlist_cache_row
     playlist_cache[RBPREP_LIST_ROWS];
 static char tree_parent_name[80];
@@ -554,8 +576,10 @@ static int track_sort_key;
 static bool track_sort_descending;
 static int filter_selection;
 static char track_search[40];
-static uint32_t search_results[RBPREP_SEARCH_MAX];
 static int search_result_count;
+static int search_result_fd = -1;
+static uint32_t shuffle_multiplier = 1;
+static uint32_t shuffle_offset;
 static bool search_active;
 static bool collection_shuffle_active;
 static int active_playlist_node = -1;
@@ -593,6 +617,9 @@ static void clear_macro(int slot);
 static bool handle_usb_system_event(int button);
 static bool save_rbprep_config(void);
 static bool save_tool_macros(void);
+static void begin_track_load_confirmation(int index, int row,
+                                          enum rbprep_mode return_mode,
+                                          bool force_reload);
 
 static void set_output_gain(int volume)
 {
@@ -629,7 +656,8 @@ static void rbprep_usb_inserted(unsigned short id, void *event_data)
     (void)id;
 #if !defined(SIMULATOR) && !defined(USB_NONE) && defined(HAVE_USB_POWER)
     int *requested_mode = event_data;
-    bool dac_requested = mode == MODE_USB && usb_armed_selection == 2;
+    bool dac_requested = capabilities.usb_audio &&
+                         mode == MODE_USB && usb_armed_selection == 2;
 
     /* This event runs before USB descriptors are configured, so establish
        the quiet DAC baseline before macOS can open the audio stream. */
@@ -674,6 +702,13 @@ static void rbprep_cleanup(void)
     stop_spectrum_capture();
     restore_playback_rate();
     restore_dac_gain();
+    rbprep_wave_close(&wave_reader);
+    rbprep_grid_close(&grid_reader);
+    rbprep_wave_index_close(&wave_index);
+    if (search_result_fd >= 0) {
+        rb->close(search_result_fd);
+        search_result_fd = -1;
+    }
     set_storage_performance_mode(false);
     backlight_use_settings();
 }
@@ -727,7 +762,7 @@ static const char * const tool_names[TOOL_COUNT] = {
     "SEEK", "SCRUB", "ZOOM", "GAIN", "HOST RPM", "PLAY RPM",
     "PITCH BEND", "TEMPO", "AUTO-NEXT", "ADD TO PLAYLIST",
     "RGB WAVEFORM", "PITCH LOCK", "BOOMBOX", "20-BAND EQ",
-    "TURNTABLE", "M1", "M2", "GRID NUDGE",
+    "OSCILLO-TURNTABLE", "M1", "M2", "GRID NUDGE",
     "GRID BPM", "DOWNBEAT", "QUANTIZE", "CUE SLOT", "CUE MOVE",
     "CUE COLOR", "CUE DELETE", "LOOP SIZE", "LOOP IN", "LOOP OUT",
     "LOOP ACTIVE", "RATING", "TRACK COLOR", "YEAR", "GENRE",
@@ -782,7 +817,7 @@ static const uint16_t macro_tool_storage_ids[TOOL_COUNT] = {
 
 static char *waveform_styles[] = { "full", "half" };
 static char *visualizer_styles[] = {
-    "rgb waveform", "boombox bass", "20-band EQ", "turntable"
+    "rgb waveform", "boombox bass", "20-band EQ", "Oscillo-Turntable"
 };
 static char *rpm_styles[] = { "33", "45", "78" };
 /* All values share a denominator of three: 33 1/3, 45 and 78 RPM. */
@@ -841,7 +876,11 @@ static const struct configdata rbprep_config[] = {
     { TYPE_INT, 0, 100, { .int_p = &wheel_saturation },
       "wheel saturation", NULL },
     { TYPE_INT, 5, 100, { .int_p = &wheel_brightness },
-      "wheel brightness", NULL }
+      "wheel brightness", NULL },
+    { TYPE_INT, 0, INT_MAX, { .int_p = &favorite_playlist_ids[0] },
+      "favorite playlist 1", NULL },
+    { TYPE_INT, 0, INT_MAX, { .int_p = &favorite_playlist_ids[1] },
+      "favorite playlist 2", NULL }
 };
 
 /* Never write configuration from the animation/playback hot path. On flash
@@ -1381,6 +1420,20 @@ static bool read_exact(int fd, void *buffer, size_t size)
     return true;
 }
 
+static bool write_exact(int fd, const void *buffer, size_t size)
+{
+    const unsigned char *cursor = buffer;
+
+    while (size > 0) {
+        ssize_t count = rb->write(fd, cursor, size);
+        if (count <= 0)
+            return false;
+        cursor += count;
+        size -= count;
+    }
+    return true;
+}
+
 static uint32_t macro_checksum(const unsigned char *data, size_t size)
 {
     uint32_t checksum = 2166136261u;
@@ -1427,38 +1480,36 @@ static void reset_tool_macros(void)
     for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++)
         for (step = 0; step < RBPREP_MACRO_STEPS; step++)
             tool_macros[slot].steps[step].value = RBPREP_MACRO_CHOOSE;
+    macro_active = -1;
+    macro_position = 0;
+    macro_generation = 0;
+    macro_generation_slot = -1;
     macro_store_valid = true;
     macro_dirty = false;
 }
 
-static bool macro_current_file_valid(const char *path)
+static bool macro_v5_validate(const unsigned char *data, int size,
+                              uint32_t *generation)
 {
-    unsigned char data[RBPREP_MACRO_STORE_SIZE];
     const unsigned char *cursor;
-    bool read_ok;
-    int size;
     int slot;
     int step;
-    int fd;
 
-    fd = rb->open(path, O_RDONLY);
-    if (fd < 0)
-        return false;
-    size = rb->filesize(fd);
-    read_ok = size == RBPREP_MACRO_STORE_SIZE &&
-              read_exact(fd, data, sizeof(data));
-    if (rb->close(fd) < 0)
-        read_ok = false;
-    if (!read_ok)
-        return false;
-    if (rb->memcmp(data, "RBM4", 4) ||
-        read_u16(data + 4) != RBPREP_MACRO_FORMAT ||
+    if (size != RBPREP_MACRO_V5_SIZE || rb->memcmp(data, "RBM5", 4) ||
+        read_u16(data + 4) != 5 ||
         read_u16(data + 6) != RBPREP_MACRO_COUNT ||
-        read_u32(data + 8) != macro_checksum(data + 12,
-                                             sizeof(data) - 12))
+        read_u16(data + 8) != RBPREP_MACRO_STEPS ||
+        read_u16(data + 10) != RBPREP_MACRO_STEP_SIZE ||
+        read_u32(data + 16) != RBPREP_MACRO_V5_PAYLOAD ||
+        read_u32(data + 20) != macro_checksum(
+            data + RBPREP_MACRO_V5_HEADER, RBPREP_MACRO_V5_PAYLOAD))
         return false;
 
-    cursor = data + 12;
+    cursor = data + RBPREP_MACRO_V5_HEADER;
+    if ((cursor[0] != 0xff && cursor[0] >= RBPREP_MACRO_COUNT) ||
+        cursor[1] >= RBPREP_MACRO_STEPS)
+        return false;
+    cursor += 4;
     for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++) {
         int count;
 
@@ -1469,105 +1520,52 @@ static bool macro_current_file_valid(const char *path)
         for (step = 0; step < RBPREP_MACRO_STEPS; step++) {
             unsigned char tool;
 
-            if (!macro_tool_from_storage_id(read_u16(cursor), &tool))
+            if (step < count &&
+                !macro_tool_from_storage_id(read_u16(cursor), &tool))
                 return false;
             cursor += RBPREP_MACRO_STEP_SIZE;
         }
     }
-    return cursor == data + sizeof(data);
-}
-
-static bool macro_file_matches(const char *path,
-                               const unsigned char *expected, int size)
-{
-    unsigned char data[RBPREP_MACRO_STORE_SIZE];
-    int fd;
-    bool matches;
-
-    if (size != (int)sizeof(data))
+    if (cursor != data + size)
         return false;
-    fd = rb->open(path, O_RDONLY);
-    if (fd < 0)
-        return false;
-    matches = rb->filesize(fd) == size &&
-              read_exact(fd, data, size) &&
-              !rb->memcmp(data, expected, size);
-    if (rb->close(fd) < 0)
-        matches = false;
-    return matches;
-}
-
-static bool write_macro_store(const char *path, const char *temporary,
-                              const char *previous,
-                              const unsigned char *data, int size)
-{
-    bool current_exists;
-    bool current_valid;
-    bool moved_current = false;
-    int fd;
-
-    fd = rb->open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0)
-        goto failed;
-    if (rb->write(fd, data, size) != (ssize_t)size) {
-        rb->close(fd);
-        goto failed;
-    }
-    if (rb->close(fd) < 0 ||
-        !macro_file_matches(temporary, data, size) ||
-        !macro_current_file_valid(temporary))
-        goto failed;
-
-    current_exists = rb->file_exists(path);
-    current_valid = current_exists && macro_current_file_valid(path);
-    if (current_exists) {
-        if (current_valid) {
-            if (rb->file_exists(previous) && rb->remove(previous) < 0)
-                goto failed;
-            if (rb->rename(path, previous) < 0)
-                goto failed;
-            moved_current = true;
-        } else if (rb->remove(path) < 0) {
-            goto failed;
-        }
-    }
-
-    if (rb->rename(temporary, path) < 0) {
-        if (moved_current)
-            rb->rename(previous, path);
-        goto failed;
-    }
-    if (!macro_file_matches(path, data, size) ||
-        !macro_current_file_valid(path)) {
-        rb->remove(path);
-        if (moved_current)
-            rb->rename(previous, path);
-        goto failed;
-    }
+    *generation = read_u32(data + 12);
     return true;
-
-failed:
-    rb->remove(temporary);
-    return false;
 }
 
-static bool save_tool_macros(void)
+static bool macro_v5_read(const char *path, unsigned char *data,
+                          uint32_t *generation)
 {
-    unsigned char data[RBPREP_MACRO_STORE_SIZE];
-    unsigned char *cursor = data + 12;
-    bool primary_ok;
-    bool recovery_ok;
+    int size = 0;
+
+    return rbprep_store_read(rb, path, data, RBPREP_MACRO_V5_SIZE, &size) &&
+           macro_v5_validate(data, size, generation);
+}
+
+static bool macro_generation_is_newer(uint32_t candidate,
+                                      uint32_t reference)
+{
+    return (int32_t)(candidate - reference) > 0;
+}
+
+static void macro_v5_pack(unsigned char *data, uint32_t generation)
+{
+    unsigned char *cursor = data + RBPREP_MACRO_V5_HEADER;
     int slot;
     int step;
 
-    /* A caller may be retrying a failed operation at editor exit, USB
-       handoff, or plugin shutdown. Keep this set until the canonical file
-       has been reopened and byte-for-byte verified. */
-    macro_dirty = true;
-    rb->memset(data, 0, sizeof(data));
-    rb->memcpy(data, "RBM4", 4);
-    write_u16(data + 4, RBPREP_MACRO_FORMAT);
+    rb->memset(data, 0, RBPREP_MACRO_V5_SIZE);
+    rb->memcpy(data, "RBM5", 4);
+    write_u16(data + 4, 5);
     write_u16(data + 6, RBPREP_MACRO_COUNT);
+    write_u16(data + 8, RBPREP_MACRO_STEPS);
+    write_u16(data + 10, RBPREP_MACRO_STEP_SIZE);
+    write_u32(data + 12, generation);
+    write_u32(data + 16, RBPREP_MACRO_V5_PAYLOAD);
+
+    cursor[0] = macro_active >= 0 && macro_active < RBPREP_MACRO_COUNT
+                    ? macro_active : 0xff;
+    cursor[1] = MAX(0, MIN(RBPREP_MACRO_STEPS - 1, macro_position));
+    cursor += 4;
     for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++) {
         rb->memcpy(cursor, tool_macros[slot].name, RBPREP_MACRO_NAME);
         cursor += RBPREP_MACRO_NAME;
@@ -1581,39 +1579,104 @@ static bool save_tool_macros(void)
             cursor += RBPREP_MACRO_STEP_SIZE;
         }
     }
-    write_u32(data + 8, macro_checksum(data + 12, sizeof(data) - 12));
-    primary_ok = write_macro_store(RBPREP_MACRO_FILE,
-                                   RBPREP_MACRO_FILE_TMP,
-                                   RBPREP_MACRO_FILE_PREV,
-                                   data, sizeof(data));
-    recovery_ok = write_macro_store(RBPREP_MACRO_RECOVERY_FILE,
-                                    RBPREP_MACRO_RECOVERY_TMP,
-                                    RBPREP_MACRO_RECOVERY_PREV,
-                                    data, sizeof(data));
-
-    /* The original .rockbox store is canonical again. The root copy is a
-       redundant recovery generation, not a competing source of truth. */
-    macro_store_valid = primary_ok || recovery_ok;
-    macro_dirty = !macro_store_valid;
-    return macro_store_valid;
+    write_u32(data + 20, macro_checksum(
+        data + RBPREP_MACRO_V5_HEADER, RBPREP_MACRO_V5_PAYLOAD));
 }
 
-static bool decode_tool_macros(const unsigned char *data, int size,
-                               bool *current_format)
+static bool decode_tool_macros_v5(const unsigned char *data)
+{
+    const unsigned char *cursor = data + RBPREP_MACRO_V5_HEADER;
+    int saved_active = cursor[0] == 0xff ? -1 : cursor[0];
+    int saved_position = cursor[1];
+    int slot;
+    int step;
+
+    reset_tool_macros();
+    cursor += 4;
+    for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++) {
+        int count;
+
+        rb->memcpy(tool_macros[slot].name, cursor, RBPREP_MACRO_NAME);
+        tool_macros[slot].name[RBPREP_MACRO_NAME - 1] = '\0';
+        cursor += RBPREP_MACRO_NAME;
+        count = *cursor++;
+        tool_macros[slot].count = count;
+        for (step = 0; step < RBPREP_MACRO_STEPS; step++) {
+            unsigned char tool;
+
+            if (macro_tool_from_storage_id(read_u16(cursor), &tool))
+                tool_macros[slot].steps[step].tool = tool;
+            else if (step < count)
+                return false;
+            else
+                tool_macros[slot].steps[step].tool = TOOL_SEEK;
+            tool_macros[slot].steps[step].flags = cursor[2] &
+                                                 RBPREP_MACRO_LOCK_WHEEL;
+            tool_macros[slot].steps[step].value =
+                (int)read_u32(cursor + 4);
+            cursor += RBPREP_MACRO_STEP_SIZE;
+        }
+    }
+    macro_active = saved_active;
+    if (macro_active >= 0 && tool_macros[macro_active].count > 0)
+        macro_position = MIN(saved_position,
+                             tool_macros[macro_active].count - 1);
+    else {
+        macro_active = -1;
+        macro_position = 0;
+    }
+    macro_store_valid = true;
+    macro_dirty = false;
+    return true;
+}
+
+static bool save_tool_macros(void)
+{
+    unsigned char data[RBPREP_MACRO_V5_SIZE];
+    unsigned char verify[RBPREP_MACRO_V5_SIZE];
+    int target_slot = macro_generation_slot == 0 ? 1 : 0;
+    const char *target = target_slot == 0 ? RBPREP_MACRO_FILE_A
+                                          : RBPREP_MACRO_FILE_B;
+    uint32_t next_generation = macro_generation + 1;
+    uint32_t verify_generation;
+    bool ok;
+
+    if (next_generation == 0)
+        next_generation = 1;
+    macro_dirty = true;
+    macro_v5_pack(data, next_generation);
+    rbprep_store_ensure_state_dir(rb);
+    ok = rbprep_store_write_verified(rb, target, data, sizeof(data),
+                                     verify, sizeof(verify)) &&
+         macro_v5_validate(verify, sizeof(verify), &verify_generation) &&
+         verify_generation == next_generation;
+    if (ok) {
+        macro_generation = next_generation;
+        macro_generation_slot = target_slot;
+        macro_store_valid = true;
+        macro_dirty = false;
+    } else {
+        macro_store_valid = false;
+    }
+    return ok;
+}
+
+static bool decode_tool_macros_legacy(const unsigned char *data, int size)
 {
     const unsigned char *cursor;
     int legacy_size = 12 + RBPREP_MACRO_COUNT *
-                      (RBPREP_MACRO_NAME + 1 + RBPREP_MACRO_STEPS);
+                      (RBPREP_MACRO_NAME + 1 +
+                       RBPREP_MACRO_LEGACY_STEPS);
     int legacy_value_size = 12 + RBPREP_MACRO_COUNT *
                             (RBPREP_MACRO_NAME + 1 +
-                             RBPREP_MACRO_STEPS * 6);
-    int current_size = 12 + RBPREP_MACRO_COUNT *
-                       (RBPREP_MACRO_NAME + 1 +
-                        RBPREP_MACRO_STEPS * RBPREP_MACRO_STEP_SIZE);
+                             RBPREP_MACRO_LEGACY_STEPS * 6);
+    int v4_size = 12 + RBPREP_MACRO_COUNT *
+                  (RBPREP_MACRO_NAME + 1 +
+                   RBPREP_MACRO_LEGACY_STEPS * RBPREP_MACRO_STEP_SIZE);
     bool legacy_v1;
     bool legacy_v2;
     bool legacy_v3;
-    bool current_v4;
+    bool legacy_v4;
     int slot;
     int step;
 
@@ -1626,9 +1689,9 @@ static bool decode_tool_macros(const unsigned char *data, int size,
     legacy_v3 = size == legacy_value_size &&
                 !rb->memcmp(data, "RBM3", 4) &&
                 read_u16(data + 4) == 3;
-    current_v4 = size == current_size && !rb->memcmp(data, "RBM4", 4) &&
-                 read_u16(data + 4) == RBPREP_MACRO_FORMAT;
-    if ((!legacy_v1 && !legacy_v2 && !legacy_v3 && !current_v4) ||
+    legacy_v4 = size == v4_size && !rb->memcmp(data, "RBM4", 4) &&
+                read_u16(data + 4) == 4;
+    if ((!legacy_v1 && !legacy_v2 && !legacy_v3 && !legacy_v4) ||
         read_u16(data + 6) != RBPREP_MACRO_COUNT ||
         read_u32(data + 8) != macro_checksum(data + 12,
                                              size - 12)) {
@@ -1639,13 +1702,18 @@ static bool decode_tool_macros(const unsigned char *data, int size,
         rb->memcpy(tool_macros[slot].name, cursor, RBPREP_MACRO_NAME);
         tool_macros[slot].name[RBPREP_MACRO_NAME - 1] = '\0';
         cursor += RBPREP_MACRO_NAME;
-        tool_macros[slot].count = MIN(*cursor++, RBPREP_MACRO_STEPS);
-        for (step = 0; step < RBPREP_MACRO_STEPS; step++) {
-            if (current_v4) {
-                if (!macro_tool_from_storage_id(read_u16(cursor),
-                        &tool_macros[slot].steps[step].tool)) {
+        tool_macros[slot].count = MIN(*cursor++,
+                                      RBPREP_MACRO_LEGACY_STEPS);
+        for (step = 0; step < RBPREP_MACRO_LEGACY_STEPS; step++) {
+            if (legacy_v4) {
+                unsigned char tool;
+
+                if (macro_tool_from_storage_id(read_u16(cursor), &tool))
+                    tool_macros[slot].steps[step].tool = tool;
+                else if (step < tool_macros[slot].count)
                     goto invalid;
-                }
+                else
+                    tool_macros[slot].steps[step].tool = TOOL_SEEK;
                 tool_macros[slot].steps[step].flags = cursor[2] &
                                                      RBPREP_MACRO_LOCK_WHEEL;
                 tool_macros[slot].steps[step].value =
@@ -1657,14 +1725,14 @@ static bool decode_tool_macros(const unsigned char *data, int size,
             if (legacy_v1) {
                 tool_macros[slot].steps[step].flags = 0;
                 tool_macros[slot].steps[step].value = RBPREP_MACRO_CHOOSE;
-            } else if (!current_v4) {
+            } else if (!legacy_v4) {
                 tool_macros[slot].steps[step].flags = *cursor++ &
                                                      RBPREP_MACRO_LOCK_WHEEL;
                 tool_macros[slot].steps[step].value = (int)read_u32(cursor);
                 cursor += 4;
             }
         }
-        for (step = 0; step < RBPREP_MACRO_STEPS; step++) {
+        for (step = 0; step < RBPREP_MACRO_LEGACY_STEPS; step++) {
             if (tool_macros[slot].steps[step].tool >= TOOL_COUNT &&
                 step < tool_macros[slot].count) {
                 goto invalid;
@@ -1677,7 +1745,6 @@ static bool decode_tool_macros(const unsigned char *data, int size,
             }
         }
     }
-    *current_format = current_v4;
     macro_store_valid = true;
     return true;
 
@@ -1689,52 +1756,66 @@ invalid:
 
 static bool load_tool_macros(void)
 {
-    unsigned char data[RBPREP_MACRO_STORE_SIZE];
-    const char *stores[] = {
-        RBPREP_MACRO_FILE_TMP,
-        RBPREP_MACRO_FILE,
-        RBPREP_MACRO_FILE_PREV,
-        RBPREP_MACRO_RECOVERY_TMP,
-        RBPREP_MACRO_RECOVERY_FILE,
-        RBPREP_MACRO_RECOVERY_PREV
+    unsigned char a[RBPREP_MACRO_V5_SIZE];
+    unsigned char b[RBPREP_MACRO_V5_SIZE];
+    unsigned char legacy[RBPREP_MACRO_V5_SIZE];
+    const char *legacy_stores[] = {
+        RBPREP_MACRO_LEGACY_TMP,
+        RBPREP_MACRO_LEGACY_FILE,
+        RBPREP_MACRO_LEGACY_PREV,
+        RBPREP_MACRO_LEGACY_ROOT_TMP,
+        RBPREP_MACRO_LEGACY_ROOT,
+        RBPREP_MACRO_LEGACY_ROOT_PREV
     };
+    uint32_t generation_a = 0;
+    uint32_t generation_b = 0;
+    bool valid_a;
+    bool valid_b;
     bool saw_store = false;
-    bool current_format = false;
     int source;
 
     reset_tool_macros();
-    for (source = 0; source < (int)ARRAYLEN(stores); source++) {
-        int fd = rb->open(stores[source], O_RDONLY);
-        int size;
-        bool read_ok;
+    valid_a = macro_v5_read(RBPREP_MACRO_FILE_A, a, &generation_a);
+    valid_b = macro_v5_read(RBPREP_MACRO_FILE_B, b, &generation_b);
+    saw_store = rb->file_exists(RBPREP_MACRO_FILE_A) ||
+                rb->file_exists(RBPREP_MACRO_FILE_B);
+    if (valid_a || valid_b) {
+        bool choose_b = valid_b && (!valid_a ||
+                         macro_generation_is_newer(generation_b,
+                                                   generation_a));
+        const unsigned char *chosen = choose_b ? b : a;
 
-        if (fd < 0)
+        if (!decode_tool_macros_v5(chosen))
+            goto invalid;
+        macro_generation = choose_b ? generation_b : generation_a;
+        macro_generation_slot = choose_b ? 1 : 0;
+        macro_store_valid = true;
+        macro_dirty = false;
+        return true;
+    }
+
+    for (source = 0; source < (int)ARRAYLEN(legacy_stores); source++) {
+        int size = 0;
+
+        if (!rb->file_exists(legacy_stores[source]))
             continue;
         saw_store = true;
-        size = rb->filesize(fd);
-        read_ok = size >= 12 && size <= (int)sizeof(data) &&
-                  read_exact(fd, data, size);
-        rb->close(fd);
-        if (!read_ok ||
-            !decode_tool_macros(data, size, &current_format))
+        if (!rbprep_store_read(rb, legacy_stores[source], legacy,
+                               sizeof(legacy), &size) ||
+            !decode_tool_macros_legacy(legacy, size))
             continue;
 
-        /* Recover an interrupted generation, migrate older formats, and
-           heal the redundant root copy when it differs from the canonical
-           store. This also converts the one-off root-store regression back
-           to the original known-good .rockbox location. */
-        if (source != 1 || !current_format ||
-            !macro_file_matches(RBPREP_MACRO_RECOVERY_FILE,
-                                data, size)) {
-            macro_dirty = true;
-            if (!save_tool_macros())
-                macro_store_valid = false;
-        } else {
-            macro_dirty = false;
-        }
+        /* Commit the migrated state into one verified RBM5 slot. The old
+           files remain untouched until two new generations exist. */
+        macro_generation = 0;
+        macro_generation_slot = -1;
+        macro_dirty = true;
+        if (!save_tool_macros())
+            macro_store_valid = false;
         return macro_store_valid;
     }
 
+invalid:
     reset_tool_macros();
     macro_store_valid = !saw_store;
     return !saw_store;
@@ -2140,6 +2221,49 @@ static int child_node_at(uint32_t parent, int ordinal,
     return -1;
 }
 
+static int playlist_browser_count(void)
+{
+    int favorites = 0;
+    int slot;
+
+    if (tree_parent == RBPREP_ROOT_NODE)
+        for (slot = 0; slot < 2; slot++)
+            if (favorite_playlist_nodes[slot] >= 0)
+                favorites++;
+    return tree_child_count + favorites + (playlist_add_mode ? 1 : 0);
+}
+
+static int playlist_node_at_visible(int ordinal,
+                                    struct rbprep_node_record *result,
+                                    int *favorite_slot)
+{
+    int slot;
+
+    if (favorite_slot)
+        *favorite_slot = -1;
+    if (playlist_add_mode) {
+        if (ordinal == 0)
+            return -1;
+        ordinal--;
+    }
+    if (tree_parent == RBPREP_ROOT_NODE) {
+        for (slot = 0; slot < 2; slot++) {
+            int node_index = favorite_playlist_nodes[slot];
+
+            if (node_index < 0)
+                continue;
+            if (ordinal-- == 0) {
+                if (result && !read_node_record(node_index, result))
+                    return -1;
+                if (favorite_slot)
+                    *favorite_slot = slot;
+                return node_index;
+            }
+        }
+    }
+    return child_node_at(tree_parent, ordinal, result);
+}
+
 static void invalidate_playlist_cache(void)
 {
     int row;
@@ -2182,10 +2306,17 @@ static void refresh_tree_children(uint32_t parent)
     tree_parent = parent;
     tree_child_count = 0;
     tree_parent_name[0] = '\0';
+    favorite_playlist_nodes[0] = favorite_playlist_nodes[1] = -1;
     invalidate_playlist_cache();
     for (index = 0; (uint32_t)index < library_node_count; index++) {
         if (!read_node_record(index, &node))
             break;
+        if (favorite_playlist_ids[0] > 0 &&
+            node.source_id == (uint32_t)favorite_playlist_ids[0])
+            favorite_playlist_nodes[0] = index;
+        if (favorite_playlist_ids[1] > 0 &&
+            node.source_id == (uint32_t)favorite_playlist_ids[1])
+            favorite_playlist_nodes[1] = index;
         if (node.parent == parent && tree_child_count < RBPREP_TREE_NODES)
             tree_children[tree_child_count++] = index;
     }
@@ -2218,9 +2349,18 @@ static int track_index_at_row(int row)
     struct rbprep_node_record node;
 
     if (active_playlist_node < 0) {
-        if (collection_shuffle_active || search_active)
+        if (collection_shuffle_active)
             return row >= 0 && row < search_result_count
-                 ? (int)search_results[row] : -1;
+                 ? (int)(((uint64_t)shuffle_multiplier * row +
+                           shuffle_offset) % search_result_count) : -1;
+        if (search_active) {
+            if (row < 0 || row >= search_result_count ||
+                search_result_fd < 0 ||
+                rb->lseek(search_result_fd, (off_t)row * 4, SEEK_SET) < 0 ||
+                !read_exact(search_result_fd, data, sizeof(data)))
+                return -1;
+            return read_u32(data);
+        }
         return collection_sorted_index_at(row);
     }
     if (!read_node_record(active_playlist_node, &node) || row < 0 ||
@@ -2288,8 +2428,15 @@ static bool track_matches_search(int index)
 
 static void rebuild_search_results(void)
 {
+    unsigned char output[256 * 4];
+    int buffered = 0;
+    bool write_ok = true;
     int row;
 
+    if (search_result_fd >= 0) {
+        rb->close(search_result_fd);
+        search_result_fd = -1;
+    }
     collection_shuffle_active = false;
     search_active = track_search[0] != '\0';
     search_result_count = 0;
@@ -2297,14 +2444,46 @@ static void rebuild_search_results(void)
         track_row_count = library_track_count;
         return;
     }
+    rbprep_store_ensure_state_dir(rb);
+    search_result_fd = rb->open(RBPREP_SEARCH_RESULTS,
+                                O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (search_result_fd < 0) {
+        search_active = false;
+        track_row_count = library_track_count;
+        rb->splash(HZ * 2, "Could not create search results");
+        restore_black_canvas();
+        return;
+    }
     for (row = 0; (uint32_t)row < library_track_count; row++) {
         int index = collection_sorted_index_at(row);
         if ((row & 127) == 0)
             rb->splash_progress(row, library_track_count,
                                 "Searching %.24s", track_search);
-        if (index >= 0 && track_matches_search(index) &&
-            search_result_count < RBPREP_SEARCH_MAX)
-            search_results[search_result_count++] = index;
+        if (index >= 0 && track_matches_search(index)) {
+            write_u32(output + buffered * 4, index);
+            buffered++;
+            search_result_count++;
+            if (buffered == 256) {
+                if (!write_exact(search_result_fd, output, sizeof(output))) {
+                    write_ok = false;
+                    break;
+                }
+                buffered = 0;
+            }
+        }
+    }
+    if (write_ok && buffered > 0)
+        write_ok = write_exact(search_result_fd, output, buffered * 4);
+    if (rb->close(search_result_fd) < 0)
+        write_ok = false;
+    search_result_fd = -1;
+    if (write_ok)
+        search_result_fd = rb->open(RBPREP_SEARCH_RESULTS, O_RDONLY);
+    if (!write_ok || search_result_fd < 0) {
+        search_active = false;
+        search_result_count = 0;
+        rb->splash(HZ * 2, "Search result write failed");
+        restore_black_canvas();
     }
     track_row_count = search_result_count;
     track_selection = track_top = 0;
@@ -2524,54 +2703,110 @@ static int beat_period_ms(void)
     return MAX(1, (first * (100 - fraction) + second * fraction + 50) / 100);
 }
 
+static bool source_beat_at(int index, int *time_ms, int *number)
+{
+    struct rbprep_grid_beat beat;
+
+    if (index < 0 || index >= beat_count ||
+        !rbprep_grid_beat_at(&grid_reader, index, &beat))
+        return false;
+    if (time_ms)
+        *time_ms = beat.time_ms;
+    if (number)
+        *number = beat.number;
+    return true;
+}
+
 static int adjusted_beat_number(int index)
 {
-    return ((beat_numbers[index] - 1 + grid_beat_shift) & 3) + 1;
+    int time_ms;
+    int number;
+
+    if (!source_beat_at(index, &time_ms, &number))
+        number = (index & 3) + 1;
+    else if (index > 0) {
+        int previous_time;
+        int previous_number;
+
+        if (source_beat_at(index - 1, &previous_time, &previous_number)) {
+            int source_period = grid_source_bpm_x100 > 0
+                              ? MAX(1, 6000000 / grid_source_bpm_x100)
+                              : 500;
+            int delta = MAX(1, time_ms - previous_time);
+            int steps = MAX(1, MIN(8,
+                (delta + source_period / 2) / source_period));
+            int expected = ((previous_number - 1 + steps) & 3) + 1;
+
+            if (number != expected) {
+                int next_time;
+                int next_number;
+
+                if (index + 1 >= beat_count ||
+                    !source_beat_at(index + 1, &next_time, &next_number)) {
+                    number = expected;
+                } else {
+                    int next_delta = MAX(1, next_time - time_ms);
+                    int next_steps = MAX(1, MIN(8,
+                        (next_delta + source_period / 2) / source_period));
+                    int predicted = ((number - 1 + next_steps) & 3) + 1;
+
+                    if (predicted != next_number)
+                        number = expected;
+                }
+            }
+        }
+    }
+    return ((number - 1 + grid_beat_shift) & 3) + 1;
 }
 
 static int adjusted_beat_time(int index)
 {
     long long delta;
+    int time_ms;
 
-    if (index < 0 || index >= beat_count)
+    if (!source_beat_at(index, &time_ms, NULL))
         return grid_phase_ms + grid_offset;
-    delta = (long long)beat_times[index] - grid_phase_ms;
+    delta = (long long)time_ms - grid_phase_ms;
     if (grid_bpm_x100 > 0 && grid_source_bpm_x100 > 0)
         delta = delta * grid_source_bpm_x100 / grid_bpm_x100;
     return grid_phase_ms + grid_offset + delta;
 }
 
-static int nearest_beat_index(int time_ms)
-{
-    int low = 0;
-    int high = beat_count;
-
-    if (beat_count <= 0)
-        return -1;
-    while (low < high) {
-        int middle = low + (high - low) / 2;
-        if (adjusted_beat_time(middle) < time_ms)
-            low = middle + 1;
-        else
-            high = middle;
-    }
-    if (low <= 0)
-        return 0;
-    if (low >= beat_count)
-        return beat_count - 1;
-    if (time_ms - adjusted_beat_time(low - 1) <=
-        adjusted_beat_time(low) - time_ms)
-        return low - 1;
-    return low;
-}
-
 static int current_beat_index(int time_ms)
 {
-    int low = 0;
-    int high = beat_count;
+    int index;
+    int step;
+    int low;
+    int high;
 
     if (beat_count <= 0 || time_ms < adjusted_beat_time(0))
         return -1;
+    index = MAX(0, MIN(beat_count - 1, beat_search_hint));
+    if (adjusted_beat_time(index) <= time_ms) {
+        for (step = 0; step < 16 && index + 1 < beat_count; step++) {
+            if (adjusted_beat_time(index + 1) > time_ms) {
+                beat_search_hint = index;
+                return index;
+            }
+            index++;
+        }
+        if (index + 1 >= beat_count) {
+            beat_search_hint = index;
+            return index;
+        }
+        low = index + 1;
+        high = beat_count;
+    } else {
+        for (step = 0; step < 16 && index > 0; step++) {
+            if (adjusted_beat_time(index - 1) <= time_ms) {
+                beat_search_hint = index - 1;
+                return index - 1;
+            }
+            index--;
+        }
+        low = 0;
+        high = index;
+    }
     while (low < high) {
         int middle = low + (high - low) / 2;
         if (adjusted_beat_time(middle) <= time_ms)
@@ -2579,7 +2814,26 @@ static int current_beat_index(int time_ms)
         else
             high = middle;
     }
-    return low - 1;
+    beat_search_hint = MAX(0, low - 1);
+    return beat_search_hint;
+}
+
+static int nearest_beat_index(int time_ms)
+{
+    int before = current_beat_index(time_ms);
+    int after;
+
+    if (beat_count <= 0)
+        return -1;
+    if (before < 0)
+        return 0;
+    after = before + 1;
+    if (after >= beat_count)
+        return before;
+    if (time_ms - adjusted_beat_time(before) <=
+        adjusted_beat_time(after) - time_ms)
+        return before;
+    return after;
 }
 
 static int quantized_time(int time_ms)
@@ -2855,6 +3109,7 @@ static void draw_loop_zone(int first, int span)
 
 static void rebuild_waveform_columns(int first, int span)
 {
+    bool exact = span <= (int)rbprep_wave_resident_points(&wave_reader);
     int x;
 
     if (waveform_columns_valid && first == waveform_column_first &&
@@ -2864,9 +3119,8 @@ static void rebuild_waveform_columns(int first, int span)
     for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
         int begin;
         int end;
+        struct rbprep_wave_sample peak;
         int index;
-        int peak_index;
-        int peak;
 
         begin = first + (long long)x * span / RBPREP_DECK_WIDTH;
         end = first + (long long)(x + 1) * span / RBPREP_DECK_WIDTH;
@@ -2878,19 +3132,47 @@ static void rebuild_waveform_columns(int first, int span)
         if (end <= begin)
             end = begin + 1;
         end = MIN(end, waveform_points);
-        peak_index = MIN(begin, waveform_points - 1);
-        peak = waveform[peak_index][0];
-        for (index = begin + 1; index < end; index++) {
-            if (waveform[index][0] > peak) {
-                peak = waveform[index][0];
-                peak_index = index;
+
+        if (exact) {
+            if (!rbprep_wave_sample_at(&wave_reader, begin, &peak))
+                continue;
+            for (index = begin + 1; index < end; index++) {
+                struct rbprep_wave_sample sample;
+
+                if (!rbprep_wave_sample_at(&wave_reader, index, &sample))
+                    break;
+                if (sample.amplitude > peak.amplitude)
+                    peak = sample;
+            }
+        } else if (!rbprep_wave_index_range_peak(&wave_index, begin, end,
+                                                  &peak)) {
+            int overview_begin = (long long)begin *
+                                 RBPREP_OVERVIEW_WIDTH / waveform_points;
+            int overview_end = ((long long)end * RBPREP_OVERVIEW_WIDTH +
+                                waveform_points - 1) / waveform_points;
+
+            overview_begin = MAX(0, MIN(RBPREP_OVERVIEW_WIDTH - 1,
+                                         overview_begin));
+            overview_end = MAX(overview_begin + 1,
+                               MIN(RBPREP_OVERVIEW_WIDTH, overview_end));
+            peak.amplitude = overview_waveform[overview_begin][0];
+            peak.red = overview_waveform[overview_begin][1];
+            peak.green = overview_waveform[overview_begin][2];
+            peak.blue = overview_waveform[overview_begin][3];
+            for (index = overview_begin + 1; index < overview_end; index++) {
+                if (overview_waveform[index][0] > peak.amplitude) {
+                    peak.amplitude = overview_waveform[index][0];
+                    peak.red = overview_waveform[index][1];
+                    peak.green = overview_waveform[index][2];
+                    peak.blue = overview_waveform[index][3];
+                }
             }
         }
 
-        waveform_columns[x].amplitude = peak;
-        waveform_columns[x].red = waveform[peak_index][1];
-        waveform_columns[x].green = waveform[peak_index][2];
-        waveform_columns[x].blue = waveform[peak_index][3];
+        waveform_columns[x].amplitude = peak.amplitude;
+        waveform_columns[x].red = peak.red;
+        waveform_columns[x].green = peak.green;
+        waveform_columns[x].blue = peak.blue;
         waveform_columns[x].valid = true;
     }
     waveform_column_first = first;
@@ -3027,7 +3309,8 @@ static void update_spectrum_levels(bool need_pitch)
 
     if (TIME_BEFORE(*rb->current_tick, spectrum_deadline))
         return;
-    spectrum_deadline = *rb->current_tick + RBPREP_SPECTRUM_TICKS;
+    spectrum_deadline = *rb->current_tick +
+        MAX(1, HZ / MAX(1, capabilities.visualizer_fps));
     generation = pcm_capture_generation;
     if (generation == spectrum_generation) {
         if (!(rb->audio_status() & AUDIO_STATUS_PLAY) ||
@@ -3047,6 +3330,7 @@ static void update_spectrum_levels(bool need_pitch)
     if (frames > 0)
         rb->memcpy(pcm_snapshot, pcm_capture[capture],
                    frames * 2 * sizeof(int16_t));
+    pcm_snapshot_frames = frames;
     generation = pcm_capture_generation;
     rb->pcm_play_unlock();
     spectrum_generation = generation;
@@ -3116,6 +3400,12 @@ static void draw_boombox(void)
         0, 128, 222, 256, 222, 128,
         0, -128, -222, -256, -222, -128
     };
+    /* Pitch classes around a steelpan-style circle of fifths, rooted at F#:
+       F#, C#, G#, D#, A#, F, C, G, D, A, E, B. Lower, larger tone fields
+       sit near the rim; the higher register moves inward. */
+    static const unsigned char steelpan_angle[12] = {
+        0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5
+    };
     static const char *note_names[] = {
         "F#1", "G1", "G#1", "A1", "A#1", "B1", "C2", "C#2", "D2",
         "D#2", "E2", "F2", "F#2", "G2", "G#2", "A2", "A#2"
@@ -3167,10 +3457,10 @@ static void draw_boombox(void)
         rb->lcd_set_foreground(LCD_RGBPACK(8, 12, 10));
         xlcd_fillcircle(cx, cy, 9 + spectrum_bass_hit / 40);
 
-        /* Two chromatic pitch rings: F#1..B1 inside, C2..A#2 outside. */
+        /* Each speaker doubles as a compact steelpan note field. */
         for (note = 0; note < (int)ARRAYLEN(note_names); note++) {
-            int angle = note % 12;
-            int radius = note < 6 ? 18 : 29;
+            int angle = steelpan_angle[note % 12];
+            int radius = note < 6 ? 31 : note < 12 ? 26 : 17;
             int x = cx + cosine[angle] * radius / 256;
             int y = cy + sine[angle] * radius / 256;
             bool active = note == bass_note_index &&
@@ -3179,9 +3469,11 @@ static void draw_boombox(void)
             rb->lcd_set_foreground(active ? LCD_WHITE
                                           : LCD_RGBPACK(42, 91, 61));
             if (active)
-                xlcd_fillcircle(x, y, 2);
-            else
+                xlcd_fillcircle(x, y, 3);
+            else {
+                xlcd_drawcircle(x, y, 2);
                 rb->lcd_drawpixel(x, y);
+            }
         }
     }
 
@@ -3265,8 +3557,6 @@ static void draw_turntable(void)
     static const int target_rpm_x100[] = { 3333, 4500, 7800 };
     const int cx = 86;
     const int cy = (RBPREP_WAVE_TOP + RBPREP_WAVE_BOTTOM) / 2;
-    int first;
-    int span;
     int phase;
     int point;
     int slot;
@@ -3285,7 +3575,6 @@ static void draw_turntable(void)
     char line[48];
     char delta[16];
 
-    viewport(&first, &span);
     phase = (long long)playhead * target_rpm_x100[played_rpm_index] * 64 /
             6000000 % 64;
 
@@ -3339,28 +3628,32 @@ static void draw_turntable(void)
             rb->lcd_drawpixel(x, y);
     }
 
-    for (point = 0; point <= 64; point++) {
-        int angle = (point + phase) & 63;
-        int index = first + (long long)(point & 63) * span / 64;
-        int amplitude = 0;
-        int radius;
-        int x;
+    /* The record rotates; the oscilloscope does not. A stable left-to-right
+       trace makes transients readable while the platter, strobe and cue map
+       retain the physical motion of the deck. */
+    previous_x = cx - 49;
+    previous_y = cy;
+    for (point = 0; point < 99; point++) {
+        int x = cx - 49 + point;
+        int distance = ABS(x - cx);
+        int vertical_limit = distance < 34 ? 24 :
+                             distance < 44 ? 16 : 7;
+        int sample = 0;
         int y;
-        int color = LCD_RGBPACK(55, 190, 125);
 
-        if (waveform_points > 0) {
-            index = MAX(0, MIN(waveform_points - 1, index));
-            amplitude = waveform[index][0];
-            color = LCD_RGBPACK(waveform[index][1], waveform[index][2],
-                                waveform[index][3]);
+        if (pcm_snapshot_frames > 0) {
+            int frame = (long long)point * pcm_snapshot_frames / 99;
+
+            frame = MIN(pcm_snapshot_frames - 1, frame);
+            sample = ((int)pcm_snapshot[frame * 2] +
+                      (int)pcm_snapshot[frame * 2 + 1]) / 2;
         }
-        radius = 34 + amplitude * 23 / 255;
-        x = cx + cosine[angle] * radius / 256;
-        y = cy + sine[angle] * radius / 256;
-        if (point > 0) {
-            rb->lcd_set_foreground(color);
+        y = cy + MAX(-vertical_limit,
+                     MIN(vertical_limit, sample / 1050));
+        rb->lcd_set_foreground(ABS(sample) > 24500
+                               ? LCD_WHITE : RBPREP_GREEN);
+        if (point > 0)
             rb->lcd_drawline(previous_x, previous_y, x, y);
-        }
         previous_x = x;
         previous_y = y;
     }
@@ -3596,7 +3889,7 @@ static void draw_waveform(void)
     int x;
     int mid = (RBPREP_SIGNAL_TOP + RBPREP_SIGNAL_BOTTOM) / 2;
 
-    if (visualizer_mode == 1 || visualizer_mode == 2)
+    if (visualizer_mode >= 1)
         update_spectrum_levels(visualizer_mode == 1);
     if (visualizer_mode == 1) {
         draw_boombox();
@@ -3655,33 +3948,6 @@ static void draw_waveform(void)
             MIN(RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1,
                    time_to_x(playhead, first, span)));
     rb->lcd_vline(x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
-}
-
-static void rebuild_overview_waveform(void)
-{
-    int x;
-
-    rb->memset(overview_waveform, 0, sizeof(overview_waveform));
-    if (waveform_points <= 0)
-        return;
-
-    for (x = 0; x < RBPREP_OVERVIEW_WIDTH; x++) {
-        int begin = (long long)x * waveform_points /
-                    RBPREP_OVERVIEW_WIDTH;
-        int end = (long long)(x + 1) * waveform_points /
-                  RBPREP_OVERVIEW_WIDTH;
-        int index;
-        int peak_index = MIN(begin, waveform_points - 1);
-
-        if (end <= begin)
-            end = begin + 1;
-        end = MIN(end, waveform_points);
-        for (index = begin + 1; index < end; index++) {
-            if (waveform[index][0] > waveform[peak_index][0])
-                peak_index = index;
-        }
-        rb->memcpy(overview_waveform[x], waveform[peak_index], 4);
-    }
 }
 
 static void draw_overview_waveform(void)
@@ -3809,10 +4075,14 @@ static void clear_analysis(void)
 {
     int i;
 
+    rbprep_wave_close(&wave_reader);
+    rbprep_grid_close(&grid_reader);
+    rbprep_wave_index_close(&wave_index);
     waveform_points = 0;
     waveform_columns_valid = false;
     rb->memset(overview_waveform, 0, sizeof(overview_waveform));
     beat_count = 0;
+    beat_search_hint = 0;
     grid_offset = 0;
     grid_phase_ms = 0;
     grid_beat_shift = 0;
@@ -3936,9 +4206,7 @@ static bool flush_deferred_edit(void)
 static bool record_edit_change(void)
 {
     track_edit_dirty = true;
-    if (save_on_track_load)
-        return true;
-    return flush_deferred_edit();
+    return true;
 }
 
 static void read_burn_offsets(uint32_t *edit_offset,
@@ -4673,9 +4941,16 @@ static bool load_waveform(int track_id)
     int fd;
     int i;
     int cue_count;
-    int declared_points;
+    uint32_t declared_points;
     int declared_beats;
+    off_t metadata_offset;
+    off_t beat_data_offset;
+    off_t required_size;
+    off_t source_file_size;
+    uint32_t source_size;
+    uint32_t source_fingerprint;
     char filename[MAX_PATH];
+    char index_filename[MAX_PATH];
     unsigned char header[40];
 
     clear_analysis();
@@ -4700,16 +4975,47 @@ static bool load_waveform(int track_id)
     rating = MIN(5, header[32]);
     color_index = normalize_track_color(header[33]);
 
-    waveform_points = MIN(declared_points, RBPREP_POINTS);
-    if (!read_exact(fd, waveform, waveform_points * 4)) {
+    metadata_offset = sizeof(header) +
+                      (off_t)declared_points * RBPREP_WAVE_SAMPLE_BYTES;
+    beat_data_offset = metadata_offset + (off_t)cue_count * 8;
+    required_size = beat_data_offset +
+                    (off_t)declared_beats * 8;
+    source_file_size = rb->filesize(fd);
+    if (!declared_points || declared_points > RBPREP_POINTS ||
+        metadata_offset < (off_t)sizeof(header) ||
+        source_file_size < required_size ||
+        (uint64_t)source_file_size > 0xffffffffu) {
         clear_analysis();
         rb->close(fd);
         return false;
     }
-    if (declared_points > waveform_points)
-        rb->lseek(fd, (declared_points - waveform_points) * 4, SEEK_CUR);
+    source_size = source_file_size;
 
-    rebuild_overview_waveform();
+    waveform_points = declared_points;
+    if (!rbprep_wave_open(&wave_reader, filename, waveform_points,
+                          sizeof(header))) {
+        clear_analysis();
+        rb->close(fd);
+        return false;
+    }
+
+    source_fingerprint = rbprep_wave_index_fingerprint(
+        header, sizeof(header), source_size);
+    rb->snprintf(index_filename, sizeof(index_filename),
+                 "/.rockbox/rbprep/wave-index/%06d.rbx", track_id);
+    if (!rbprep_wave_index_open(&wave_index, index_filename, track_id,
+                                waveform_points, source_size,
+                                source_fingerprint, overview_waveform)) {
+        rbprep_wave_index_start(&wave_index, index_filename, track_id,
+                                waveform_points, source_size,
+                                source_fingerprint, filename, sizeof(header),
+                                overview_waveform);
+    }
+    if (rb->lseek(fd, metadata_offset, SEEK_SET) < 0) {
+        clear_analysis();
+        rb->close(fd);
+        return false;
+    }
 
     for (i = 0; i < cue_count; i++) {
         unsigned char cue[8];
@@ -4723,26 +5029,11 @@ static bool load_waveform(int track_id)
         }
     }
     beat_count = MIN(declared_beats, RBPREP_BEATS);
-    for (i = 0; i < beat_count; i++) {
-        unsigned char beat[8];
-        if (!read_exact(fd, beat, sizeof(beat))) {
-            beat_count = i;
-            break;
-        }
-        beat_times[i] = read_u32(beat);
-        beat_numbers[i] = MAX(1, MIN(4, beat[4]));
-    }
-    /* Some exports contain an occasional missing or malformed beat number.
-       Preserve the first known phase, then advance by the number of elapsed
-       beat periods so the HUD cannot jump directly from 2 to 4. */
-    for (i = 1; i < beat_count; i++) {
-        int source_period = grid_source_bpm_x100 > 0
-                          ? MAX(1, 6000000 / grid_source_bpm_x100) : 500;
-        int delta = MAX(1, beat_times[i] - beat_times[i - 1]);
-        int steps = MAX(1, MIN(8,
-            (delta + source_period / 2) / source_period));
-        beat_numbers[i] = ((beat_numbers[i - 1] - 1 + steps) & 3) + 1;
-    }
+    if (beat_count > 0 &&
+        !rbprep_grid_open(&grid_reader, filename, beat_count,
+                          beat_data_offset))
+        beat_count = 0;
+    beat_search_hint = 0;
     rb->close(fd);
     overview_dirty = true;
     return true;
@@ -4785,18 +5076,19 @@ static bool play_track_index(int index, int row,
     if (!read_track_record(index, &track) ||
         !read_index_string(track.path_offset, path, sizeof(path)))
         return false;
-    if (index != selected_track_index && !flush_deferred_edit()) {
-        rb->splash(HZ * 2, "Could not save previous edits");
-        restore_black_canvas();
-        return false;
-    }
-    if (index != selected_track_index)
-        save_rbprep_config();
     if (!rb->file_exists(path)) {
         rb->splashf(HZ * 2, "Missing: %s", path);
         restore_black_canvas();
         return false;
     }
+    if ((index != selected_track_index || force_reload) &&
+        track_edit_dirty) {
+        begin_track_load_confirmation(index, row, return_mode,
+                                      force_reload);
+        return false;
+    }
+    if (index != selected_track_index)
+        save_rbprep_config();
     if (index != selected_track_index || force_reload)
         service_deferred_burn();
 
@@ -4921,8 +5213,9 @@ static bool play_track_row(int row)
 
 static void start_shuffled_collection(void)
 {
-    int count = MIN((int)library_track_count, RBPREP_SEARCH_MAX);
-    int index;
+    int count = library_track_count;
+    uint32_t candidate;
+    uint32_t divisor;
 
     if (count <= 0) {
         rb->splash(HZ * 2, "Collection is empty");
@@ -4930,19 +5223,35 @@ static void start_shuffled_collection(void)
         return;
     }
     search_active = false;
+    if (search_result_fd >= 0) {
+        rb->close(search_result_fd);
+        search_result_fd = -1;
+    }
     track_search[0] = '\0';
     active_playlist_node = -1;
     collection_shuffle_active = true;
     search_result_count = count;
-    for (index = 0; index < count; index++)
-        search_results[index] = index;
     rb->srand((unsigned int)(*rb->current_tick ^ library_track_count));
-    for (index = count - 1; index > 0; index--) {
-        int other = rb->rand() % (index + 1);
-        uint32_t swap = search_results[index];
-        search_results[index] = search_results[other];
-        search_results[other] = swap;
+    candidate = ((uint32_t)rb->rand() | 1u) % count;
+    if (!candidate)
+        candidate = 1;
+    while (true) {
+        uint32_t left = candidate;
+        uint32_t right = count;
+
+        while (right) {
+            divisor = left % right;
+            left = right;
+            right = divisor;
+        }
+        if (left == 1)
+            break;
+        candidate = (candidate + 2) % count;
+        if (!candidate)
+            candidate = 1;
     }
+    shuffle_multiplier = candidate;
+    shuffle_offset = (uint32_t)rb->rand() % count;
     track_row_count = count;
     track_selection = track_top = 0;
     playing_track_row = -1;
@@ -5134,13 +5443,54 @@ static void draw_playlist_browser(void)
         int ordinal = tree_top + row;
         int y = 34 + row * 19;
         struct rbprep_playlist_cache_row *cached;
+        struct rbprep_node_record favorite_node;
         struct rbprep_node_record *node;
+        char favorite_name[80];
+        const char *display_name = "";
+        int favorite_slot = -1;
+        int actual_ordinal;
 
-        if (ordinal >= tree_child_count)
+        if (ordinal >= playlist_browser_count())
             break;
-        if (!cached_playlist_node(ordinal, &cached))
+        if (playlist_add_mode && ordinal == 0) {
+            if (ordinal == tree_selection)
+                draw_blade_selection(y - 2, 19,
+                                     LCD_RGBPACK(34, 105, 73));
+            rb->lcd_set_foreground(ordinal == tree_selection
+                                   ? LCD_WHITE : RBPREP_GREEN);
+            rb->lcd_drawrect(10, y + 1, 13, 13);
+            rb->lcd_hline(13, 20, y + 7);
+            rb->lcd_vline(16, y + 4, y + 10);
+            text(30, y + 2, "NEW PLAYLIST...", LCD_WHITE);
             continue;
-        node = &cached->node;
+        }
+        actual_ordinal = ordinal - (playlist_add_mode ? 1 : 0);
+        if (tree_parent == RBPREP_ROOT_NODE) {
+            int slot;
+
+            for (slot = 0; slot < 2; slot++) {
+                if (favorite_playlist_nodes[slot] < 0)
+                    continue;
+                if (actual_ordinal-- == 0) {
+                    favorite_slot = slot;
+                    break;
+                }
+            }
+        }
+        if (favorite_slot >= 0) {
+            if (!read_node_record(favorite_playlist_nodes[favorite_slot],
+                                  &favorite_node) ||
+                !read_index_string(favorite_node.name_offset, favorite_name,
+                                   sizeof(favorite_name)))
+                continue;
+            node = &favorite_node;
+            display_name = favorite_name;
+        } else {
+            if (!cached_playlist_node(actual_ordinal, &cached))
+                continue;
+            node = &cached->node;
+            display_name = cached->name;
+        }
         if (ordinal == tree_selection) {
             draw_blade_selection(y - 2, 19,
                                  node->kind == 0
@@ -5149,7 +5499,10 @@ static void draw_playlist_browser(void)
         }
         draw_playlist_node_glyph(16, y + 7, node->kind == 0,
                                  ordinal == tree_selection);
-        rb->snprintf(line, sizeof(line), "%.38s", cached->name);
+        rb->snprintf(line, sizeof(line), "%s%.34s",
+                     favorite_slot >= 0 ? (favorite_slot ? "F2  " : "F1  ")
+                                        : "",
+                     display_name);
         text(30, y + 2, line, LCD_WHITE);
         if (node->kind != 0) {
             int macro_slot = macro_link_for(node->source_id);
@@ -5166,7 +5519,7 @@ static void draw_playlist_browser(void)
     rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
     rb->lcd_fillrect(0, 210, LCD_WIDTH, 30);
     rb->snprintf(line, sizeof(line), "%d/%d", tree_selection + 1,
-                 tree_child_count);
+                 playlist_browser_count());
     text(7, 213, line, RBPREP_GREEN);
     text(70, 213, "WHEEL: BROWSE", LCD_LIGHTGRAY);
     text(7, 226, playlist_add_mode
@@ -5180,27 +5533,28 @@ static void draw_playlist_actions(void)
 {
     static const char * const actions[] = {
         "CREATE PLAYLIST HERE", "RENAME PLAYLIST",
-        "MOVE PLAYLIST", "DELETE PLAYLIST", "WORKFLOW PAD"
+        "MOVE PLAYLIST", "DELETE PLAYLIST", "WORKFLOW PAD",
+        "SET AS FAVORITE 1", "SET AS FAVORITE 2", "CLEAR FAVORITE"
     };
     struct rbprep_node_record node;
     char name[64];
     char line[96];
-    bool editable = playlist_action_node >= 0 &&
-                    read_node_record(playlist_action_node, &node) &&
-                    node.kind != 0;
+    bool has_target = playlist_action_node >= 0 &&
+                      read_node_record(playlist_action_node, &node);
+    bool editable = has_target && node.kind != 0;
     int i;
 
     draw_blade_shell("PLAYLIST MANAGER", RBPREP_GREEN);
-    if (editable && read_index_string(node.name_offset, name, sizeof(name)))
+    if (has_target && read_index_string(node.name_offset, name, sizeof(name)))
         rb->snprintf(line, sizeof(line), "SELECTED: %.42s", name);
     else
         rb->snprintf(line, sizeof(line), "DESTINATION: CURRENT FOLDER");
     text(12, 35, line, LCD_RGBPACK(145, 165, 151));
     for (i = 0; i < (int)ARRAYLEN(actions); i++) {
-        int y = 52 + i * 28;
-        bool enabled = i == 0 || editable;
+        int y = 48 + i * 20;
+        bool enabled = i == 0 || (i >= 5 ? has_target : editable);
         if (i == playlist_action_selection)
-            draw_blade_selection(y - 3, 23, RBPREP_GREEN);
+            draw_blade_selection(y - 2, 18, RBPREP_GREEN);
         draw_playlist_node_glyph(20, y + 7, false,
                                  i == playlist_action_selection);
         text(40, y + 3, actions[i],
@@ -5210,6 +5564,9 @@ static void draw_playlist_actions(void)
             text(255, y + 3, macro_slot < 0 ? "OFF" :
                  macro_slot == 0 ? "M1" : "M2", RBPREP_GREEN);
         }
+        if ((i == 5 || i == 6) && has_target &&
+            favorite_playlist_ids[i - 5] == (int)node.source_id)
+            text(278, y + 3, "SET", RBPREP_GREEN);
     }
     text(7, 210, "WHEEL: CHOOSE    SELECT: OPEN", LCD_WHITE);
     text(7, 226, "MENU: BACK", LCD_LIGHTGRAY);
@@ -5849,12 +6206,13 @@ static void draw_macro_editor(void)
     };
     struct rbprep_tool_macro *macro = &tool_macros[macro_manage_slot];
     char line[80];
+    int page_first = (macro_edit_position / 24) * 24;
     int i;
 
     draw_blade_shell("WORKFLOW EDITOR", RBPREP_GREEN);
-    rb->snprintf(line, sizeof(line), "M%d  %.23s  /  %d OF %d",
+    rb->snprintf(line, sizeof(line), "M%d  %.18s  %d/%d  PAGE %d/2",
                  macro_manage_slot + 1, macro->name, macro->count,
-                 RBPREP_MACRO_STEPS);
+                 RBPREP_MACRO_STEPS, page_first / 24 + 1);
     text(9, 27, line, LCD_RGBPACK(155, 179, 161));
     for (i = 0; i < 4; i++) {
         int left = 7 + i * 77;
@@ -5866,15 +6224,17 @@ static void draw_macro_editor(void)
         centered_text(left, 73, 47, operations[i],
                       i == macro_edit_operation ? LCD_BLACK : LCD_LIGHTGRAY);
     }
-    for (i = 0; i < RBPREP_MACRO_STEPS; i++) {
+    for (i = 0; i < 24; i++) {
+        int step = page_first + i;
         int column = i % 8;
         int row = i / 8;
         int cx = 23 + column * 39;
         int cy = 82 + row * 36;
-        bool used = i < macro->count;
+        bool used = step < macro->count;
         bool insertion = macro_edit_operation == 0 &&
-                         i == macro->count && macro->count < RBPREP_MACRO_STEPS;
-        bool selected = i == macro_edit_position && (used || insertion);
+                         step == macro->count &&
+                         macro->count < RBPREP_MACRO_STEPS;
+        bool selected = step == macro_edit_position && (used || insertion);
         int color = selected ? LCD_WHITE : used ? LCD_RGBPACK(40, 78, 54)
                                                  : LCD_RGBPACK(21, 31, 25);
 
@@ -5884,15 +6244,15 @@ static void draw_macro_editor(void)
         else
             xlcd_drawcircle(cx, cy, selected ? 10 : 8);
         if (used)
-            draw_tool_icon(cx, cy, macro->steps[i].tool,
+            draw_tool_icon(cx, cy, macro->steps[step].tool,
                            selected ? LCD_BLACK : LCD_RGBPACK(190, 213, 197));
         else if (insertion)
             text(cx - 3, cy - 5, "+", selected ? LCD_WHITE : RBPREP_GREEN);
-        if (used && macro->steps[i].value != RBPREP_MACRO_CHOOSE) {
+        if (used && macro->steps[step].value != RBPREP_MACRO_CHOOSE) {
             rb->lcd_set_foreground(LCD_RGBPACK(255, 145, 40));
             rb->lcd_fillrect(cx + 7, cy - 9, 3, 3);
         }
-        rb->snprintf(line, sizeof(line), "%02d", i + 1);
+        rb->snprintf(line, sizeof(line), "%02d", step + 1);
         centered_text(cx - 12, 24, cy + 11, line,
                       selected ? RBPREP_GREEN : LCD_RGBPACK(68, 84, 73));
     }
@@ -6252,7 +6612,7 @@ static void draw_tool_status(void)
     else if (tool == TOOL_VIS_EQ)
         rb->snprintf(line, sizeof(line), "20-BAND EQ");
     else if (tool == TOOL_VIS_TURNTABLE)
-        rb->snprintf(line, sizeof(line), "TURNTABLE  TECHNICS");
+        rb->snprintf(line, sizeof(line), "OSCILLO-TURNTABLE");
     else if (tool == TOOL_MACRO_ONE || tool == TOOL_MACRO_TWO) {
         int slot = tool == TOOL_MACRO_ONE ? 0 : 1;
         rb->snprintf(line, sizeof(line), "M%d %.16s [%d]", slot + 1,
@@ -6351,15 +6711,14 @@ static void draw_settings(void)
     int value_x;
     const char *names[] = {
         "AUTOBOOT REKORDPOD", "AUTO-NEXT DEFAULT", "WAVEFORM SHAPE",
-        "SAVE EDITS", "TRACK AUTO BURN", "WHEEL CLICK", "ACCENT COLOR",
+        "TRACK EXIT", "COMMIT POLICY", "WHEEL CLICK", "ACCENT COLOR",
         "IPOD BODY COLOR", "WHEEL / VINYL COLOR"
     };
     const char *values[] = {
         autoboot_enabled ? "ON" : "OFF",
         autoplay_enabled ? "ON" : "OFF",
         waveform_half ? "HALF" : "FULL",
-        save_on_track_load ? "ON NEXT TRACK" : "IMMEDIATELY",
-        auto_burn ? "CONFIRMED EDITS" : "OFF",
+        "ASK EACH TIME", "SAVE & LOAD",
         click_sound ? "ON" : "OFF", "HSB", "HSB", "HSB"
     };
     const char *description;
@@ -6395,13 +6754,9 @@ static void draw_settings(void)
          : settings_selection == 2
          ? (waveform_half ? "One-sided RGB waveform" : "Mirrored RGB waveform")
          : settings_selection == 3
-         ? (save_on_track_load
-            ? "One snapshot is written when the next track loads"
-            : "Confirmed edits are journaled immediately")
+         ? "Choose Save, Discard or Stay before another track loads"
          : settings_selection == 4
-         ? (auto_burn
-            ? "Each confirmation atomically updates PDB + Rekordpod index"
-            : "Track edits stay journaled until Burn Track / Burn All")
+         ? "Save verifies the PDB + Rekordpod index before loading"
          : settings_selection == 5
          ? (click_sound ? "Audible feedback on clickwheel scroll"
                         : "Silent clickwheel navigation")
@@ -6458,14 +6813,17 @@ static void draw_accent_picker(void)
 
 static void apply_usb_choice(int choice)
 {
-    usb_selection = MAX(0, MIN(2, choice));
+    if (choice == 2 && !capabilities.usb_audio)
+        choice = 0;
+    usb_selection = MAX(0, MIN(capabilities.usb_audio ? 2 : 1, choice));
     usb_armed_selection = usb_selection;
 #ifdef USB_ENABLE_HID
     rb->global_settings->usb_hid = false;
     rb->usb_set_hid(false);
 #endif
 #ifdef USB_ENABLE_AUDIO
-    rb->global_settings->usb_audio = usb_selection == 2 ? 1 : 0;
+    rb->global_settings->usb_audio = capabilities.usb_audio &&
+                                     usb_selection == 2 ? 1 : 0;
     rb->usb_set_audio(rb->global_settings->usb_audio);
 #endif
 #if !defined(SIMULATOR) && !defined(USB_NONE) && \
@@ -6481,6 +6839,7 @@ static void apply_usb_choice(int choice)
 static void draw_usb_mode(void)
 {
     int row;
+    int count = capabilities.usb_audio ? 3 : 2;
     const char *names[] = { "POWER ONLY", "DATA TRANSFER", "USB DAC" };
     const char *details[] = {
         "Charge safely; data, DAC and HID stay hidden",
@@ -6491,7 +6850,7 @@ static void draw_usb_mode(void)
     draw_blade_shell("USB MODE", RBPREP_GREEN);
     text(9, 34, "TAKES EFFECT ON NEXT USB CONNECTION",
          LCD_RGBPACK(105, 125, 112));
-    for (row = 0; row < 3; row++) {
+    for (row = 0; row < count; row++) {
         int y = 54 + row * 44;
         if (row == usb_selection)
             draw_blade_selection(y - 5, 45, RBPREP_GREEN);
@@ -6747,6 +7106,25 @@ static void begin_confirmation(enum rbprep_confirm_action action)
     confirm_action = action;
     confirm_active = true;
     confirm_ok = true;
+    confirm_choice = 1;
+    confirm_wait_release = !!(rb->button_status() & BUTTON_SELECT);
+    force_full_redraw = true;
+}
+
+static void begin_track_load_confirmation(int index, int row,
+                                          enum rbprep_mode return_mode,
+                                          bool force_reload)
+{
+    deferred_track_index = index;
+    deferred_track_row = row;
+    deferred_track_return_mode = return_mode;
+    deferred_track_force_reload = force_reload;
+    rb->snprintf(confirm_message, sizeof(confirm_message),
+                 "CURRENT TRACK HAS CHANGES");
+    confirm_action = CONFIRM_TRACK_LOAD;
+    confirm_active = true;
+    confirm_choice = 0;
+    confirm_ok = true;
     confirm_wait_release = !!(rb->button_status() & BUTTON_SELECT);
     force_full_redraw = true;
 }
@@ -6782,6 +7160,49 @@ static bool append_playlist_operation(unsigned char operation,
     rb->close(fd);
     refresh_pending_summary();
     return true;
+}
+
+static bool append_playlist_seed_operation(uint32_t playlist_id,
+                                           uint32_t parent_id,
+                                           const char *name)
+{
+    char data[384];
+    off_t original_size;
+    int fd;
+    int first;
+    int second;
+    bool ok;
+
+    if (!playlist_id || selected_track_id < 0 || !name || !name[0])
+        return false;
+    first = rb->snprintf(data, sizeof(data),
+                         "%c\t0\t%lu\t%lu\t1\t%s\n",
+                         PLAYLIST_OP_CREATE, (unsigned long)playlist_id,
+                         (unsigned long)parent_id, name);
+    if (first <= 0 || first >= (int)sizeof(data))
+        return false;
+    second = rb->snprintf(data + first, sizeof(data) - first,
+                          "%c\t%lu\t%lu\t0\t1\t%s\n",
+                          PLAYLIST_OP_ADD,
+                          (unsigned long)selected_track_id,
+                          (unsigned long)playlist_id, name);
+    if (second <= 0 || first + second >= (int)sizeof(data))
+        return false;
+    fd = rb->open(RBPREP_PLAYLIST_JOURNAL,
+                  O_RDWR | O_CREAT, 0666);
+    if (fd < 0)
+        return false;
+    original_size = rb->filesize(fd);
+    ok = original_size >= 0 &&
+         rb->lseek(fd, original_size, SEEK_SET) >= 0 &&
+         write_exact(fd, data, first + second);
+    if (!ok && original_size >= 0)
+        rb->ftruncate(fd, original_size);
+    if (rb->close(fd) < 0)
+        ok = false;
+    if (ok)
+        refresh_pending_summary();
+    return ok;
 }
 
 static bool append_playlist_journal(int node_index)
@@ -6838,8 +7259,13 @@ static void apply_grid_origin(int origin)
     int index = nearest_beat_index(origin);
 
     if (index >= 0) {
+        int number;
+
+        if (!source_beat_at(index, NULL, &number))
+            number = (index & 3) + 1;
+
         grid_offset += origin - adjusted_beat_time(index);
-        grid_beat_shift = (1 - beat_numbers[index]) & 3;
+        grid_beat_shift = (1 - number) & 3;
     } else {
         grid_phase_ms = origin;
         grid_offset = 0;
@@ -6853,6 +7279,33 @@ static void finish_confirmation(bool apply)
 
     confirm_active = false;
     confirm_action = CONFIRM_NONE;
+    if (action == CONFIRM_TRACK_LOAD) {
+        bool success;
+
+        if (!apply || confirm_choice == 2) {
+            restore_black_canvas();
+            return;
+        }
+        if (confirm_choice == 0) {
+            if (!burn_loaded_track_now()) {
+                track_edit_dirty = true;
+                restore_black_canvas();
+                return;
+            }
+        } else {
+            staged_tool = -1;
+            track_edit_dirty = false;
+        }
+        force_track_reload = deferred_track_force_reload;
+        success = play_track_index(deferred_track_index,
+                                   deferred_track_row,
+                                   deferred_track_return_mode);
+        force_track_reload = false;
+        if (!success && confirm_choice == 1)
+            track_edit_dirty = true;
+        restore_black_canvas();
+        return;
+    }
     if (!apply) {
         if (action == CONFIRM_KEEP_EDIT)
             discard_staged_edit();
@@ -6887,10 +7340,20 @@ static void finish_confirmation(bool apply)
             playlist_add_mode = false;
             mode = MODE_DECK;
             refresh_pending_summary();
-            if (!burn_playlist_changes_now())
-                rb->splash(HZ * 2, "Playlist change saved; burn failed");
+            burn_request = BURN_REQUEST_ALL;
         } else {
             rb->splash(HZ * 2, "Could not queue playlist add");
+        }
+    } else if (action == CONFIRM_PLAYLIST_SEED) {
+        if (append_playlist_seed_operation(playlist_action_id,
+                                           playlist_action_parent_id,
+                                           playlist_action_name)) {
+            playlist_add_mode = false;
+            mode = MODE_DECK;
+            burn_request = BURN_REQUEST_ALL;
+            rb->splash(HZ, "Playlist seed queued");
+        } else {
+            rb->splash(HZ * 2, "Could not create playlist seed");
         }
     } else if (action == CONFIRM_GENRE) {
         rb->strlcpy(selected_genre, confirm_genre,
@@ -6957,9 +7420,9 @@ static void finish_confirmation(bool apply)
 static void draw_confirmation(void)
 {
     const int x = 25;
-    const int y = 83;
+    const int y = confirm_action == CONFIRM_TRACK_LOAD ? 72 : 83;
     const int width = LCD_WIDTH - 50;
-    const int height = 76;
+    const int height = confirm_action == CONFIRM_TRACK_LOAD ? 96 : 76;
 
     rb->lcd_set_foreground(LCD_RGBPACK(4, 4, 4));
     rb->lcd_fillrect(x, y, width, height);
@@ -6967,6 +7430,29 @@ static void draw_confirmation(void)
     rb->lcd_drawrect(x, y, width, height);
     text(x + 10, y + 9, "CONFIRM", RBPREP_GREEN);
     text(x + 10, y + 29, confirm_message, LCD_WHITE);
+
+    if (confirm_action == CONFIRM_TRACK_LOAD) {
+        static const char * const choices[] = {
+            "SAVE & LOAD", "DISCARD & LOAD", "STAY"
+        };
+        static const int widths[] = { 86, 104, 52 };
+        int left = x + 8;
+        int choice;
+
+        for (choice = 0; choice < 3; choice++) {
+            bool selected = confirm_choice == choice;
+
+            rb->lcd_set_foreground(selected ? RBPREP_GREEN
+                                             : LCD_RGBPACK(20, 26, 22));
+            rb->lcd_fillrect(left, y + 53, widths[choice], 20);
+            centered_text(left, widths[choice], y + 58, choices[choice],
+                          selected ? LCD_BLACK : LCD_WHITE);
+            left += widths[choice] + 4;
+        }
+        text(x + 10, y + 79, "LEFT/RIGHT: CHOOSE   SELECT: CONFIRM",
+             LCD_LIGHTGRAY);
+        return;
+    }
 
     rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(20, 26, 22)
                                       : LCD_RGBPACK(12, 49, 29));
@@ -7636,9 +8122,10 @@ static bool playlist_name_with_keyboard(char *name, size_t size,
 static void choose_playlist_action(void)
 {
     struct rbprep_node_record node;
-    bool editable = playlist_action_node >= 0 &&
-                    read_node_record(playlist_action_node, &node) &&
-                    node.kind != 0 && node.source_id;
+    bool has_target = playlist_action_node >= 0 &&
+                      read_node_record(playlist_action_node, &node) &&
+                      node.source_id;
+    bool editable = has_target && node.kind != 0;
 
     if (playlist_action_selection == 0) {
         rb->strlcpy(playlist_action_name, "NEW PLAYLIST",
@@ -7658,6 +8145,39 @@ static void choose_playlist_action(void)
         rb->snprintf(confirm_message, sizeof(confirm_message),
                      "CREATE %.30s?", playlist_action_name);
         begin_confirmation(CONFIRM_PLAYLIST_CREATE);
+    } else if (playlist_action_selection >= 5) {
+        int slot;
+
+        if (!has_target) {
+            rb->splash(HZ, "Select a playlist or folder first");
+            restore_black_canvas();
+            return;
+        }
+        if (playlist_action_selection == 5 ||
+            playlist_action_selection == 6) {
+            slot = playlist_action_selection - 5;
+            favorite_playlist_ids[slot] = node.source_id;
+            mark_rbprep_config_dirty();
+            save_rbprep_config();
+            rb->splash(HZ, slot ? "Favorite 2 set" : "Favorite 1 set");
+        } else {
+            bool cleared = false;
+
+            for (slot = 0; slot < 2; slot++) {
+                if (favorite_playlist_ids[slot] == (int)node.source_id) {
+                    favorite_playlist_ids[slot] = 0;
+                    cleared = true;
+                }
+            }
+            if (cleared) {
+                mark_rbprep_config_dirty();
+                save_rbprep_config();
+            }
+            rb->splash(HZ, cleared ? "Favorite cleared"
+                                   : "Target is not a favorite");
+        }
+        refresh_tree_children(tree_parent);
+        restore_black_canvas();
     } else if (!editable) {
         rb->splash(HZ, "Select a playlist first");
         restore_black_canvas();
@@ -7827,7 +8347,33 @@ static void short_select(void)
         }
     } else if (mode == MODE_PLAYLISTS) {
         struct rbprep_node_record node;
-        int index = child_node_at(tree_parent, tree_selection, &node);
+        int index;
+
+        if (playlist_add_mode && tree_selection == 0) {
+            rb->strlcpy(playlist_action_name, "NEW PLAYLIST",
+                        sizeof(playlist_action_name));
+            if (!playlist_name_with_keyboard(playlist_action_name,
+                                             sizeof(playlist_action_name),
+                                             "CREATE + ADD TRACK"))
+                return;
+            playlist_action_id = next_playlist_source_id();
+            playlist_action_parent_id =
+                playlist_parent_source_id(
+                    tree_parent == RBPREP_ROOT_NODE ? -1
+                                                    : (int)tree_parent);
+            if (tree_parent != RBPREP_ROOT_NODE &&
+                !playlist_action_parent_id) {
+                rb->splash(HZ * 2,
+                           "Rebuild cache for stable folder IDs");
+                restore_black_canvas();
+                return;
+            }
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "CREATE %.22s + ADD?", playlist_action_name);
+            begin_confirmation(CONFIRM_PLAYLIST_SEED);
+            return;
+        }
+        index = playlist_node_at_visible(tree_selection, &node, NULL);
         if (index >= 0 && node.kind == 0) {
             tree_selection = tree_top = 0;
             refresh_tree_children(index);
@@ -7875,23 +8421,11 @@ static void short_select(void)
         } else if (settings_selection == 2)
             waveform_half = !waveform_half;
         else if (settings_selection == 3) {
-            save_on_track_load = !save_on_track_load;
-            if (!save_on_track_load && !flush_deferred_edit()) {
-                rb->splash(HZ * 2, "Could not save deferred edits");
-                restore_black_canvas();
-            }
+            rb->splash(HZ, "Track exit always asks");
+            restore_black_canvas();
         } else if (settings_selection == 4) {
-            auto_burn = !auto_burn;
-            if (auto_burn) {
-                /* Real-time commit and deferred journaling are mutually
-                   exclusive; confirmations become the sole burn boundary. */
-                save_on_track_load = false;
-                if (!flush_deferred_edit()) {
-                    auto_burn = false;
-                    rb->splash(HZ * 2, "Auto Burn: journal write failed");
-                    restore_black_canvas();
-                }
-            }
+            rb->splash(HZ, "Save & Load commits safely");
+            restore_black_canvas();
         } else if (settings_selection == 5) {
             click_sound = !click_sound;
         } else {
@@ -8207,7 +8741,7 @@ static void long_select(void)
     } else if (mode == MODE_PLAYLISTS && !playlist_add_mode &&
         !playlist_move_mode) {
         struct rbprep_node_record node;
-        int index = child_node_at(tree_parent, tree_selection, &node);
+        int index = playlist_node_at_visible(tree_selection, &node, NULL);
 
         playlist_action_selection = 0;
         playlist_action_node = -1;
@@ -8216,8 +8750,7 @@ static void long_select(void)
         if (index >= 0) {
             if (node.kind == 0)
                 playlist_action_parent = index;
-            else
-                playlist_action_node = index;
+            playlist_action_node = index;
         }
         mode = MODE_PLAYLIST_ACTIONS;
         force_full_redraw = true;
@@ -9288,7 +9821,8 @@ static void prepare_rekordpod_for_usb(void *parameter)
     /* USB DAC owns the clickwheel while connected. Start from a quiet,
        deterministic gain without permanently replacing the user's normal
        playback volume. Rekordpod restores this saved value on disconnect. */
-    if (usb_armed_selection == 2 && !dac_gain_override) {
+    if (capabilities.usb_audio && usb_armed_selection == 2 &&
+        !dac_gain_override) {
         dac_saved_volume = rb->global_status->volume;
         dac_gain_override = true;
         set_output_gain(RBPREP_DAC_INITIAL_GAIN_DB);
@@ -9302,6 +9836,9 @@ static void prepare_rekordpod_for_usb(void *parameter)
     write_usb_status_snapshot();
     stop_spectrum_capture();
     restore_playback_rate();
+    rbprep_wave_close(&wave_reader);
+    rbprep_grid_close(&grid_reader);
+    rbprep_wave_index_close(&wave_index);
     set_storage_performance_mode(false);
     if (library_fd >= 0) {
         rb->close(library_fd);
@@ -9310,6 +9847,10 @@ static void prepare_rekordpod_for_usb(void *parameter)
     if (genre_fd >= 0) {
         rb->close(genre_fd);
         genre_fd = -1;
+    }
+    if (search_result_fd >= 0) {
+        rb->close(search_result_fd);
+        search_result_fd = -1;
     }
 }
 
@@ -9327,6 +9868,17 @@ static void resume_rekordpod_after_usb(void)
     open_library_index();
     load_genre_rollup();
     load_smart_query_flags();
+    if (search_active) {
+        search_result_fd = rb->open(RBPREP_SEARCH_RESULTS, O_RDONLY);
+        if (search_result_fd < 0) {
+            search_active = false;
+            search_result_count = 0;
+        }
+    }
+    if (selected_track_id >= 0) {
+        load_waveform(selected_track_id);
+        load_latest_edit(selected_track_id);
+    }
     /* Never replace an unsaved in-memory workflow after a failed media
        write. A successful pre-USB save clears macro_dirty; otherwise keep
        the user's sequence intact and retry at the next save boundary. */
@@ -9379,7 +9931,24 @@ enum plugin_status plugin_start(const void *parameter)
     bool autoboot_launch = parameter &&
         !rb->strcmp((const char *)parameter, "autoboot");
     long frame_deadline;
+    void *beat_workspace;
+    void *index_workspace;
 
+    rbprep_caps_detect(&capabilities, rb);
+    rbprep_wave_init(&wave_reader, rb, capabilities.workspace,
+                     capabilities.waveform_cache_bytes,
+                     capabilities.io_slice_bytes);
+    beat_workspace = capabilities.workspace
+        ? (unsigned char *)capabilities.workspace +
+          capabilities.waveform_cache_bytes : NULL;
+    rbprep_grid_init(&grid_reader, rb, beat_workspace,
+                     capabilities.beat_cache_bytes);
+    index_workspace = beat_workspace
+        ? (unsigned char *)beat_workspace + capabilities.beat_cache_bytes
+        : NULL;
+    rbprep_wave_index_init(&wave_index, rb, index_workspace,
+                           capabilities.waveform_index_bytes,
+                           capabilities.io_slice_bytes);
     atexit(rbprep_cleanup);
 #ifdef HAS_BUTTON_HOLD
     display_locked = rb->button_hold();
@@ -9489,12 +10058,12 @@ enum plugin_status plugin_start(const void *parameter)
     waveform_half = !!waveform_half;
     visualizer_mode = MAX(0, MIN((int)ARRAYLEN(visualizer_styles) - 1,
                                  visualizer_mode));
-    save_on_track_load = !!save_on_track_load;
-    auto_burn = !!auto_burn;
+    if (!save_on_track_load || auto_burn)
+        mark_rbprep_config_dirty();
+    save_on_track_load = true;
+    auto_burn = false;
     click_sound = !!click_sound;
     keylock_enabled = !!keylock_enabled;
-    if (auto_burn)
-        save_on_track_load = false;
     scrub_step_index = MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1,
                                   scrub_step_index));
     host_rpm_index = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1,
@@ -9573,8 +10142,16 @@ enum plugin_status plugin_start(const void *parameter)
             draw_screen();
             redraw = false;
             frame_deadline = *rb->current_tick +
-                             (mode >= MODE_DECK ? RBPREP_FRAME_TICKS
+                             (mode >= MODE_DECK
+                              ? MAX(1, HZ / MAX(1, capabilities.deck_fps))
                                                 : RBPREP_MENU_FRAME_TICKS);
+        }
+        if (!display_locked && selected_track_id >= 0 &&
+            seek_state == SEEK_IDLE && rb->button_status() == BUTTON_NONE &&
+            rbprep_wave_index_service(&wave_index)) {
+            waveform_columns_valid = false;
+            overview_dirty = true;
+            redraw = true;
         }
         button = rb->button_get_w_tmo(display_locked ? MAX(1, HZ / 20) : 1);
         if (button != BUTTON_NONE)
@@ -9627,12 +10204,22 @@ enum plugin_status plugin_start(const void *parameter)
             }
             if (button == BUTTON_LEFT || button == BUTTON_SCROLL_BACK ||
                 button == (BUTTON_SCROLL_BACK | BUTTON_REPEAT)) {
-                confirm_ok = false;
+                if (confirm_action == CONFIRM_TRACK_LOAD)
+                    confirm_choice = MAX(0, confirm_choice - 1);
+                else {
+                    confirm_ok = false;
+                    confirm_choice = 0;
+                }
                 force_full_redraw = true;
             } else if (button == BUTTON_RIGHT ||
                        button == BUTTON_SCROLL_FWD ||
                        button == (BUTTON_SCROLL_FWD | BUTTON_REPEAT)) {
-                confirm_ok = true;
+                if (confirm_action == CONFIRM_TRACK_LOAD)
+                    confirm_choice = MIN(2, confirm_choice + 1);
+                else {
+                    confirm_ok = true;
+                    confirm_choice = 1;
+                }
                 force_full_redraw = true;
             } else if (button == (BUTTON_MENU | BUTTON_REL)) {
                 finish_confirmation(false);
@@ -9875,8 +10462,9 @@ enum plugin_status plugin_start(const void *parameter)
                 adjust_macro_value(1, false);
             else if (mode == MODE_LIBRARY)
                 selection = MIN(7, selection + 1);
-            else if (mode == MODE_PLAYLISTS && tree_child_count > 0) {
-                tree_selection = MIN(tree_child_count - 1,
+            else if (mode == MODE_PLAYLISTS &&
+                     playlist_browser_count() > 0) {
+                tree_selection = MIN(playlist_browser_count() - 1,
                                      tree_selection + 1);
                 if (tree_selection >= tree_top + RBPREP_LIST_ROWS)
                     tree_top = tree_selection - RBPREP_LIST_ROWS + 1;
@@ -9897,14 +10485,15 @@ enum plugin_status plugin_start(const void *parameter)
                     pending_top = pending_selection - RBPREP_PENDING_ROWS + 1;
             }
             else if (mode == MODE_USB)
-                usb_selection = MIN(2, usb_selection + 1);
+                usb_selection = MIN(capabilities.usb_audio ? 2 : 1,
+                                    usb_selection + 1);
             else if (mode == MODE_SETTINGS)
                 settings_selection = MIN(8, settings_selection + 1);
             else if (mode == MODE_ACCENT)
                 adjust_active_color(1);
             else if (mode == MODE_PLAYLIST_ACTIONS)
                 playlist_action_selection =
-                    MIN(4, playlist_action_selection + 1);
+                    MIN(7, playlist_action_selection + 1);
             else if (mode == MODE_MACRO_ACTIONS)
                 macro_action_selection =
                     MIN(2, macro_action_selection + 1);
@@ -10038,7 +10627,7 @@ enum plugin_status plugin_start(const void *parameter)
                 pressed = BUTTON_NONE;
             } else if (mode == MODE_PLAYLIST_ACTIONS) {
                 playlist_action_selection =
-                    MIN(4, playlist_action_selection + 1);
+                    MIN(7, playlist_action_selection + 1);
                 pressed = BUTTON_NONE;
             } else if (mode == MODE_MACRO_ACTIONS) {
                 macro_action_selection =
@@ -10063,7 +10652,7 @@ enum plugin_status plugin_start(const void *parameter)
                 adjust_macro_value(1, true);
             else if (mode == MODE_PLAYLIST_ACTIONS)
                 playlist_action_selection =
-                    MIN(4, playlist_action_selection + 1);
+                    MIN(7, playlist_action_selection + 1);
             else if (mode == MODE_MACRO_ACTIONS)
                 macro_action_selection =
                     MIN(2, macro_action_selection + 1);

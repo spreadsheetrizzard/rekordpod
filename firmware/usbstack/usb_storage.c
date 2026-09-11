@@ -316,8 +316,8 @@ static void receive_time(void);
 #endif
 static void fill_inquiry(IF_MD_NONVOID(int lun));
 
-#ifdef IPOD_6G
 static int rbprep_mode = RBPREP_MODE_READ_WRITE;
+#ifdef IPOD_6G
 static sector_t rbprep_fat_start[NUM_DRIVES];
 static sector_t rbprep_fat_end[NUM_DRIVES];
 #endif
@@ -343,6 +343,7 @@ void usb_storage_set_rbprep(int mode)
  * host-visible MBR and FAT32 BPB in RAM in both directions.
  */
 
+#ifdef IPOD_6G
 static uint32_t rbprep_get_le32(const unsigned char *p)
 {
     return (uint32_t)p[0]
@@ -369,6 +370,7 @@ static void rbprep_put_le16(unsigned char *p, uint16_t value)
     p[0] = value & 0xff;
     p[1] = (value >> 8) & 0xff;
 }
+#endif
 
 static void rbprep_patch_mbr_for_512(unsigned char *data,
                                      unsigned int size)

@@ -27,7 +27,6 @@ playing_time.c
 properties.c
 random_folder_advance_config.c
 rb_info.c
-rbprep.c
 rockblox.c
 search.c
 settings_dumper.c
