@@ -7939,8 +7939,8 @@ static void draw_main_menu_fx(void)
     }
 #ifdef HAVE_WHEEL_POSITION
     if (platter_wheel_mode && rb->wheel_status() >= 0) {
-        /* wheel_status() zero is a quarter turn behind the drawing table. */
-        int touch_angle = (rb->wheel_status() * 64 / 96 + 16) & 63;
+        /* Align the hardware wheel origin with the drawing table. */
+        int touch_angle = (rb->wheel_status() * 64 / 96 + 48) & 63;
         int touch_x = cx + wheel_cosine[touch_angle] * 55 / 256;
         int touch_y = cy + wheel_sine[touch_angle] * 55 / 256;
 
