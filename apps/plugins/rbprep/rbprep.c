@@ -7939,7 +7939,8 @@ static void draw_main_menu_fx(void)
     }
 #ifdef HAVE_WHEEL_POSITION
     if (platter_wheel_mode && rb->wheel_status() >= 0) {
-        int touch_angle = rb->wheel_status() * 64 / 96;
+        /* wheel_status() zero is a quarter turn behind the drawing table. */
+        int touch_angle = (rb->wheel_status() * 64 / 96 + 16) & 63;
         int touch_x = cx + wheel_cosine[touch_angle] * 55 / 256;
         int touch_y = cy + wheel_sine[touch_angle] * 55 / 256;
 
@@ -11124,72 +11125,13 @@ static void draw_rekordpod_boot_splash(void)
             xlcd_fillcircle(LCD_WIDTH / 2, wheel_cy,
                             MAX(5, 13 * scale / 1024));
         }
-        if (frame < 12) {
-            rb->lcd_set_foreground(LCD_BLACK);
-        } else {
-            int luminance = MIN(255, (frame - 12) * 255 / 20);
-
-            rb->lcd_set_foreground(LCD_RGBPACK(luminance, luminance,
-                                               luminance));
-        }
+        rb->lcd_set_foreground(LCD_BLACK);
         boot_fill_clipped_rect(sx, sy, sw, sh);
         if (frame < 12)
             centered_text(sx, sw, sy + sh / 2 - 4,
                           "rekordpod", LCD_WHITE);
         rb->lcd_update();
         rb->sleep(MAX(1, HZ / 24));
-    }
-
-    /* Cross the visible pixel boundary: a fine white raster expands with
-       the camera while the black center cell grows to consume the panel.
-       Ending on true black gives the menu fade a clean, OLED-like origin. */
-    for (frame = 0; frame <= 28; frame++) {
-        int t = frame * 1024 / 28;
-        int eased = (long long)t * t * (3072 - 2 * t) /
-                    (1024 * 1024);
-        int cell = 4 + eased * 30 / 1024;
-        int aperture_w = MAX(1, (long long)LCD_WIDTH * eased / 1024);
-        int aperture_h = MAX(1, (long long)LCD_HEIGHT * eased / 1024);
-        int x;
-        int y;
-
-        rb->lcd_set_foreground(LCD_WHITE);
-        rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
-        rb->lcd_set_foreground(LCD_RGBPACK(204, 208, 205));
-        for (x = LCD_WIDTH / 2 % cell; x < LCD_WIDTH; x += cell)
-            rb->lcd_vline(x, 0, LCD_HEIGHT - 1);
-        for (y = LCD_HEIGHT / 2 % cell; y < LCD_HEIGHT; y += cell)
-            rb->lcd_hline(0, LCD_WIDTH - 1, y);
-        rb->lcd_set_foreground(LCD_BLACK);
-        rb->lcd_fillrect((LCD_WIDTH - aperture_w) / 2,
-                         (LCD_HEIGHT - aperture_h) / 2,
-                         aperture_w, aperture_h);
-        rb->lcd_update();
-        rb->sleep(MAX(1, HZ / 24));
-    }
-
-    /* The target has no alpha plane. Ordered dithering gives the menu a
-       short, deterministic fade without allocating another framebuffer. */
-    {
-        static const unsigned char bayer[4][4] = {
-            { 0,  8,  2, 10 }, { 12, 4, 14, 6 },
-            { 3, 11,  1,  9 }, { 15, 7, 13, 5 }
-        };
-        int fade;
-        int x;
-        int y;
-
-        for (fade = 0; fade <= 16; fade++) {
-            draw_main_menu();
-            draw_status_bar();
-            rb->lcd_set_foreground(LCD_BLACK);
-            for (y = 0; y < LCD_HEIGHT; y++)
-                for (x = 0; x < LCD_WIDTH; x++)
-                    if (bayer[y & 3][x & 3] >= fade)
-                        rb->lcd_drawpixel(x, y);
-            rb->lcd_update();
-            rb->sleep(MAX(1, HZ / 24));
-        }
     }
 }
 
