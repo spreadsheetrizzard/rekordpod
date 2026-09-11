@@ -38,6 +38,8 @@
 #define ATA_RETRIES 3
 #endif
 
+#define ATA_POWERUP_ATTEMPTS 3
+
 #define CMD_READ_SECTORS           0x20
 #define CMD_READ_DMA_EXT           0x25
 #define CMD_READ_MULTIPLE_EXT      0x29
@@ -770,13 +772,8 @@ static int ata_power_up(void)
     return 0;
 }
 
-static void ata_power_down(void)
+static void ata_cut_power(void)
 {
-    if (!ata_powered)
-        return;
-
-    logf("ata POWERDOWN %ld", current_tick);
-
     PCON(7) = 0;
     PCON(8) = 0;
     PCON(9) = 0;
@@ -784,6 +781,38 @@ static void ata_power_down(void)
     PCON(11) &= ~0xf;
     ide_power_enable(false);
     ata_powered = false;
+}
+
+static void ata_power_down(void)
+{
+    if (!ata_powered)
+        return;
+
+    logf("ata POWERDOWN %ld", current_tick);
+    ata_cut_power();
+}
+
+static int ata_power_up_with_retries(void)
+{
+    int attempt;
+    int rc = 0;
+
+    for (attempt = 0; attempt < ATA_POWERUP_ATTEMPTS; attempt++) {
+        rc = ata_power_up();
+        if (!IS_ERR(rc))
+            return 0;
+
+        /* A USB/VBUS transition can leave high-capacity PATA-to-flash
+           adapters powered but unresponsive to IDENTIFY.  The ordinary
+           power-down helper deliberately ignores a drive that never
+           completed initialization, so force the partial hardware state
+           off before retrying with an increasing settle interval. */
+        logf("ata POWERUP retry %d rc=%08x", attempt + 1, rc);
+        ata_cut_power();
+        if (attempt + 1 < ATA_POWERUP_ATTEMPTS)
+            sleep((attempt + 1) * HZ);
+    }
+    return rc;
 }
 
 static int ata_rw_chunk_internal(uint64_t sector, uint32_t cnt, void* buffer, bool write)
@@ -911,7 +940,7 @@ static int ata_rw_chunk(uint64_t sector, uint32_t cnt, void* buffer, bool write)
 static int ata_transfer_sectors(uint64_t sector, int count, void* buffer, int write)
 {
     if (!ata_powered)
-        ata_power_up();
+        PASS_RC(ata_power_up_with_retries(), 0, 0);
     if (sector + count > total_sectors)
         RET_ERR(0);
     ata_set_active();
@@ -965,7 +994,7 @@ int ata_soft_reset(void)
     int rc;
     mutex_lock(&ata_mutex);
     if (!ata_powered)
-        PASS_RC(ata_power_up(), 1, 0);
+        PASS_RC(ata_power_up_with_retries(), 1, 0);
     ata_set_active();
     if (ceata)
     {
@@ -987,7 +1016,7 @@ int ata_soft_reset(void)
 int ata_hard_reset(void)
 {
     mutex_lock(&ata_mutex);
-    PASS_RC(ata_power_up(), 0, 0);
+    PASS_RC(ata_power_up_with_retries(), 0, 0);
     ata_set_active();
     mutex_unlock(&ata_mutex);
     return 0;
@@ -1009,7 +1038,7 @@ static int ata_reset(void)
             rc = ERR_RC((rc << 2) | 1);
             ata_power_down();
             sleep(HZ * 3);
-            int rc2 = ata_power_up();
+            int rc2 = ata_power_up_with_retries();
             if (IS_ERR(rc2))
                 rc = ERR_RC((rc << 2) | 2);
         }
@@ -1155,7 +1184,7 @@ int ata_init(void)
 
     /* get identify_info */
     mutex_lock(&ata_mutex);
-    int rc = ata_power_up(); /* Includes identify() call */
+    int rc = ata_power_up_with_retries(); /* Includes identify() call */
     mutex_unlock(&ata_mutex);
     if (IS_ERR(rc))
         return rc;

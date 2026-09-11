@@ -1,0 +1,16 @@
+# Rekordpod Grey browser/status skin for 320x240 colour displays
+# Deliberately uses native drawing and Rockbox's bundled Tango iconset.
+
+# The browser and menus live below the compact two-row Rekordpod HUD.
+%Vi(-,0,30,-,-,1)
+
+# Graphite title blade.
+%V(0,0,320,15,1)%Vf(E8E8E8)%Vb(111111)
+%al  REKORDPOD%ac%?mp<STOP|PLAY|PAUSE|FFWD|REW|REC|REC PAUSE|FM|FM PAUSE>%ar%?mh<HOLD |>%bl%%  
+
+# Silver system strip. Playback time appears only while audio is loaded.
+%V(0,15,320,14,1)%Vf(A8A8A8)%Vb(202020)
+%al  %?pv<MUTE|VOL %pv dB>%ac%?ia<%ia|ROCKBOX>%ar%?pc<%pc / %pt|READY>  
+
+# Hairline divider between the static HUD and scrolling content.
+%V(0,29,320,1,1)%Vb(707070)

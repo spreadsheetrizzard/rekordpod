@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ INDEX_HEADER_SIZE = 64
 TRACK_RECORD_SIZE = 44
 NODE_RECORD_SIZE = 24
 ROOT_NODE = 0xFFFFFFFF
+TRACK_COLOR_NONE = 8
 
 COLOR_LABELS = {
     "sample": 0,
@@ -99,6 +101,18 @@ def peak_resample(samples: bytes, source_points: int,
     return bytes(output)
 
 
+def pack_import_date(value: object) -> int:
+    """Pack an ISO import date into the standard 16-bit DOS date layout."""
+    text = str(value or "").strip()
+    try:
+        year, month, day = (int(part) for part in text[:10].split("-"))
+    except (TypeError, ValueError):
+        return 0
+    if not (1980 <= year <= 2107 and 1 <= month <= 12 and 1 <= day <= 31):
+        return 0
+    return ((year - 1980) << 9) | (month << 5) | day
+
+
 def build_index(connection: sqlite3.Connection) -> bytes:
     strings = StringTable()
     columns = {
@@ -112,7 +126,7 @@ def build_index(connection: sqlite3.Connection) -> bytes:
     track_rows = connection.execute(
         "SELECT stable_key, rekordbox_track_id, location, title, artist, "
         "genre, musical_key, bpm, rating, color, year, comments, "
-        f"{tags_expression} AS tags FROM tracks "
+        f"{tags_expression} AS tags, date_added FROM tracks "
         "ORDER BY LTRIM(title) COLLATE NOCASE, artist COLLATE NOCASE, "
         "CAST(rekordbox_track_id AS INTEGER)"
     ).fetchall()
@@ -120,14 +134,14 @@ def build_index(connection: sqlite3.Connection) -> bytes:
     track_records = bytearray()
     for index, row in enumerate(track_rows):
         (stable_key, track_id, path, title, artist, genre, musical_key,
-         bpm, rating, color, year, comments, tags) = row
+         bpm, rating, color, year, comments, tags, date_added) = row
         if not has_tags:
             tags = " ".join(
                 token for token in str(comments or "").split()
                 if token.startswith("#")
             )
         search_text = "\x1f".join(str(value or "").strip() for value in (
-            title, artist, genre, musical_key, tags, comments
+            title, artist, genre, musical_key, tags, comments, date_added
         ))
         track_lookup[stable_key] = index
         track_records.extend(struct.pack(
@@ -139,49 +153,99 @@ def build_index(connection: sqlite3.Connection) -> bytes:
             strings.add(str(musical_key or "").strip()),
             max(0, min(65535, round(float(bpm or 0) * 100))),
             max(0, min(5, int(rating or 0))),
-            COLOR_LABELS.get(str(color or "").casefold(), 0),
-            max(0, min(9999, int(year or 0))), 0,
+            COLOR_LABELS.get(str(color or "").casefold(), TRACK_COLOR_NONE),
+            max(0, min(9999, int(year or 0))), pack_import_date(date_added),
             strings.add(str(comments or "").strip()),
             strings.add(str(tags or "").strip()),
             strings.add(search_text),
         ))
 
     nodes: list[dict[str, int | str]] = []
-    folder_lookup: dict[tuple[int, str], int] = {}
     memberships: list[int] = []
-    playlists = connection.execute(
-        "SELECT rekordbox_playlist_id, path FROM playlists ORDER BY path"
-    ).fetchall()
-    for playlist_id, path in playlists:
-        parts = [part.strip() for part in str(path).split(" / ") if part.strip()]
-        if not parts:
-            continue
-        parent = ROOT_NODE
-        for part in parts[:-1]:
-            key = (parent, part)
-            node_index = folder_lookup.get(key)
-            if node_index is None:
-                node_index = len(nodes)
-                folder_lookup[key] = node_index
-                nodes.append({
-                    "parent": parent, "name": part, "first": 0,
-                    "count": 0, "kind": 0, "source_id": 0,
-                })
-            parent = node_index
+    table_names = {
+        str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    smart_ids = {
+        int(row[0]) for row in connection.execute(
+            "SELECT rekordbox_playlist_id FROM smart_playlists"
+        )
+    } if "smart_playlists" in table_names else set()
+    if "playlist_nodes" in table_names:
+        # Preserve the real DeviceSQL tree IDs for folders as well as playlists.
+        # Stable folder IDs are required for reliable create/move operations on
+        # the iPod; older caches synthesized folders with source_id == 0.
+        tree_rows = connection.execute(
+            "SELECT rekordbox_node_id, parent_id, name, is_folder "
+            "FROM playlist_nodes ORDER BY record_order"
+        ).fetchall()
+        node_lookup = {
+            int(node_id): index
+            for index, (node_id, _parent_id, _name, _folder)
+            in enumerate(tree_rows)
+        }
+        for node_id, parent_id, name, is_folder in tree_rows:
+            first_member = len(memberships)
+            if not is_folder:
+                for (stable_key,) in connection.execute(
+                    "SELECT stable_key FROM playlist_tracks "
+                    "WHERE rekordbox_playlist_id=? ORDER BY ordinal",
+                    (node_id,),
+                ):
+                    track_index = track_lookup.get(stable_key)
+                    if track_index is not None:
+                        memberships.append(track_index)
+            nodes.append({
+                "parent": node_lookup.get(int(parent_id), ROOT_NODE),
+                "name": str(name or "UNTITLED"),
+                "first": first_member,
+                "count": len(memberships) - first_member,
+                "kind": 0 if is_folder else
+                        (2 if int(node_id) in smart_ids else 1),
+                "source_id": int(node_id),
+            })
+    else:
+        # Compatibility path for analysis databases created before real folder
+        # nodes were retained by the importer.
+        folder_lookup: dict[tuple[int, str], int] = {}
+        playlists = connection.execute(
+            "SELECT rekordbox_playlist_id, path FROM playlists ORDER BY path"
+        ).fetchall()
+        for playlist_id, path in playlists:
+            parts = [
+                part.strip() for part in str(path).split(" / ") if part.strip()
+            ]
+            if not parts:
+                continue
+            parent = ROOT_NODE
+            for part in parts[:-1]:
+                key = (parent, part)
+                node_index = folder_lookup.get(key)
+                if node_index is None:
+                    node_index = len(nodes)
+                    folder_lookup[key] = node_index
+                    nodes.append({
+                        "parent": parent, "name": part, "first": 0,
+                        "count": 0, "kind": 0, "source_id": 0,
+                    })
+                parent = node_index
 
-        first_member = len(memberships)
-        for (stable_key,) in connection.execute(
-            "SELECT stable_key FROM playlist_tracks "
-            "WHERE rekordbox_playlist_id=? ORDER BY ordinal", (playlist_id,)
-        ):
-            track_index = track_lookup.get(stable_key)
-            if track_index is not None:
-                memberships.append(track_index)
-        nodes.append({
-            "parent": parent, "name": parts[-1], "first": first_member,
-            "count": len(memberships) - first_member, "kind": 1,
-            "source_id": int(playlist_id),
-        })
+            first_member = len(memberships)
+            for (stable_key,) in connection.execute(
+                "SELECT stable_key FROM playlist_tracks "
+                "WHERE rekordbox_playlist_id=? ORDER BY ordinal",
+                (playlist_id,),
+            ):
+                track_index = track_lookup.get(stable_key)
+                if track_index is not None:
+                    memberships.append(track_index)
+            nodes.append({
+                "parent": parent, "name": parts[-1], "first": first_member,
+                "count": len(memberships) - first_member,
+                "kind": 2 if int(playlist_id) in smart_ids else 1,
+                "source_id": int(playlist_id),
+            })
 
     node_records = bytearray()
     for node in nodes:
@@ -220,6 +284,9 @@ def build_index(connection: sqlite3.Connection) -> bytes:
         sorted(range(len(track_rows)),
                key=lambda i: (text_key(track_rows[i][12]),
                               title_tiebreak[i])),
+        sorted(range(len(track_rows)),
+               key=lambda i: (text_key(track_rows[i][13]),
+                              title_tiebreak[i])),
     )
     sort_records = [
         b"".join(struct.pack("<I", value) for value in column)
@@ -239,13 +306,38 @@ def build_index(connection: sqlite3.Connection) -> bytes:
         "<4sHH14I", b"RBI1", 3, INDEX_HEADER_SIZE,
         len(track_rows), len(nodes), len(memberships), track_offset,
         node_offset, member_offset, string_offset, len(strings.data),
-        *sort_offsets, 0,
+        *sort_offsets,
     )
     assert len(header) == INDEX_HEADER_SIZE
     assert len(track_records) == len(track_rows) * TRACK_RECORD_SIZE
     assert len(node_records) == len(nodes) * NODE_RECORD_SIZE
     return (header + track_records + node_records + member_records +
             b"".join(sort_records) + strings.data)
+
+
+def build_smart_query_file(connection: sqlite3.Connection) -> bytes | None:
+    tables = {
+        str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "smart_playlists" not in tables:
+        return None
+    rows = connection.execute(
+        "SELECT rekordbox_playlist_id, flags, native_rule_kind, query "
+        "FROM smart_playlists ORDER BY rekordbox_playlist_id"
+    ).fetchall()
+    if not rows:
+        return None
+    lines = ["RBQ1"]
+    for playlist_id, flags, native_rule_kind, query in rows:
+        # JSON quoting retains tabs, newlines and non-ASCII query text while
+        # the device only needs to inspect the stable ID prefix.
+        lines.append(
+            f"{int(playlist_id)}\t{int(flags)}\t{int(native_rule_kind)}\t"
+            f"{json.dumps(str(query), ensure_ascii=False)}"
+        )
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def build_genre_index(connection: sqlite3.Connection) -> bytes:
@@ -297,7 +389,7 @@ def build_track_cache(connection: sqlite3.Connection, stable_key: str,
         len(cues), min(len(beats), 65535), waveform_duration_ms,
         waveform_duration_ms, max(0, min(65535, round(bpm * 100))),
         WAVEFORM_HZ, phase_ms, max(0, min(5, rating)),
-        COLOR_LABELS.get(str(color or "").casefold(), 0), 0,
+        COLOR_LABELS.get(str(color or "").casefold(), TRACK_COLOR_NONE), 0,
         original_points,
     )
     assert len(header) == 40
@@ -331,6 +423,7 @@ def build(args: argparse.Namespace) -> None:
     ).fetchall()
     index = build_index(connection)
     genres = build_genre_index(connection)
+    smart_queries = build_smart_query_file(connection)
 
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -350,6 +443,11 @@ def build(args: argparse.Namespace) -> None:
                     target.writestr(item, source.read(item.filename))
             target.writestr(zip_info(".rockbox/rbprep/library.rbi"), index)
             target.writestr(zip_info(".rockbox/rbprep/genres.rbg"), genres)
+            if smart_queries is not None:
+                target.writestr(
+                    zip_info(".rockbox/rbprep/smart-playlists.rbq"),
+                    smart_queries,
+                )
             for current, (stable_key, track_id, bpm, rating, color) in enumerate(
                 tracks, 1
             ):
@@ -375,13 +473,46 @@ def build(args: argparse.Namespace) -> None:
     )
 
 
+def build_index_only(args: argparse.Namespace) -> None:
+    connection = sqlite3.connect(args.database)
+    try:
+        payload = build_index(connection)
+    finally:
+        connection.close()
+    output = Path(args.index_output).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=".rbprep-index-", suffix=".rbi", dir=output.parent
+    )
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, output)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+    print(f"Built {output} ({len(payload):,} bytes).")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", required=True, type=Path)
-    parser.add_argument("--rockbox-zip", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
-    return parser.parse_args()
+    parser.add_argument("--rockbox-zip", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--index-output", type=Path)
+    args = parser.parse_args()
+    if args.index_output is None and (args.rockbox_zip is None or
+                                      args.output is None):
+        parser.error("--rockbox-zip and --output are required unless "
+                     "--index-output is used")
+    return args
 
 
 if __name__ == "__main__":
-    build(parse_args())
+    arguments = parse_args()
+    if arguments.index_output is not None:
+        build_index_only(arguments)
+    else:
+        build(arguments)

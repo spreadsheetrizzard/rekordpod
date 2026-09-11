@@ -131,6 +131,14 @@ def create_schema(connection: sqlite3.Connection) -> None:
             name TEXT NOT NULL,
             membership_hash TEXT NOT NULL
         );
+        CREATE TABLE playlist_nodes (
+            rekordbox_node_id INTEGER PRIMARY KEY,
+            parent_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL,
+            is_folder INTEGER NOT NULL,
+            record_order INTEGER NOT NULL
+        );
         CREATE TABLE playlist_tracks (
             rekordbox_playlist_id INTEGER NOT NULL,
             ordinal INTEGER NOT NULL,
@@ -140,6 +148,14 @@ def create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(stable_key) REFERENCES tracks(stable_key)
         );
         CREATE INDEX playlist_tracks_track ON playlist_tracks(stable_key);
+        CREATE TABLE smart_playlists (
+            rekordbox_playlist_id INTEGER PRIMARY KEY,
+            flags INTEGER NOT NULL DEFAULT 0,
+            native_rule_kind INTEGER NOT NULL DEFAULT 0,
+            query TEXT NOT NULL,
+            FOREIGN KEY(rekordbox_playlist_id)
+                REFERENCES playlists(rekordbox_playlist_id)
+        );
         CREATE TABLE beat_grid_points (
             stable_key TEXT NOT NULL,
             ordinal INTEGER NOT NULL,
@@ -289,6 +305,22 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
     cache_path = destination / "rbprep-library.sqlite"
     temporary_cache = destination / ".rbprep-library.sqlite.tmp"
     temporary_cache.unlink(missing_ok=True)
+    preserved_smart_queries: list[tuple[int, int, int, str]] = []
+    if cache_path.exists():
+        previous = sqlite3.connect(cache_path)
+        try:
+            tables = {
+                str(row[0]) for row in previous.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "smart_playlists" in tables:
+                preserved_smart_queries = previous.execute(
+                    "SELECT rekordbox_playlist_id, flags, native_rule_kind, "
+                    "query FROM smart_playlists"
+                ).fetchall()
+        finally:
+            previous.close()
 
     artists = {row.id: row.name for row in db.artists}
     albums = {row.id: row.name for row in db.albums}
@@ -369,6 +401,12 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
 
         playlist_count = 0
         playlist_entry_count = 0
+        connection.executemany(
+            "INSERT INTO playlist_nodes VALUES (?,?,?,?,?,?)",
+            ((node.id, node.parent_id, node.name, node.sort_order,
+              int(node.is_folder), ordinal)
+             for ordinal, node in enumerate(db.playlist_tree)),
+        )
         playlist_nodes = [node for node in db.playlist_tree if not node.is_folder]
         playlist_progress = Progress("Playlists", len(playlist_nodes))
         for node in sorted(playlist_nodes, key=lambda row: (paths[row.id][:-1], row.sort_order)):
@@ -392,6 +430,17 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
             playlist_count += 1
             playlist_entry_count += len(ordered)
             playlist_progress.update(playlist_count)
+
+        imported_playlist_ids = {
+            int(row[0]) for row in connection.execute(
+                "SELECT rekordbox_playlist_id FROM playlists"
+            )
+        }
+        connection.executemany(
+            "INSERT INTO smart_playlists VALUES (?,?,?,?)",
+            (row for row in preserved_smart_queries
+             if int(row[0]) in imported_playlist_ids),
+        )
 
         connection.commit()
     finally:

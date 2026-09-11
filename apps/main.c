@@ -468,7 +468,13 @@ static void init(void)
 /* do USB last so prompt (if enabled) can work correctly if USB was inserted with device off,
  * also doesn't hurt that it will display the nice pretty backdrop this way too. */
 #ifndef USB_NONE
+    /* On the iPod Classic, bringing up the USB PHY while VBUS is already
+     * present can race large PATA-to-flash adapters during their first ATA
+     * IDENTIFY.  Initialise storage first; USB monitoring still starts at
+     * its normal point after the filesystem is ready. */
+#ifndef IPOD_6G
     usb_init();
+#endif
     usb_start_monitoring();
 #endif
 }
@@ -592,6 +598,9 @@ static void init(void)
     CHART(">storage_init");
     rc = storage_init();
     CHART("<storage_init");
+#ifdef IPOD_6G
+    usb_init();
+#endif
     if(rc)
     {
         lcd_clear_display();

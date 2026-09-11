@@ -314,7 +314,7 @@ def resolve_analysis_files(volume: Path, analyze_path: str) -> list[Path]:
 
 
 def current_color_index(color_id: int) -> int:
-    return color_id - 1 if 1 <= color_id <= 8 else 0
+    return color_id - 1 if 1 <= color_id <= 8 else 8
 
 
 def source_bpm_from_cache(volume: Path, track_id: int, fallback: int) -> int:
@@ -353,9 +353,9 @@ def plan_changes(volume: Path, snapshots: dict[int, EditSnapshot],
             if desired >= 0 and current != desired:
                 editor.set_track_field(track_id, field, desired)
                 changes.append(f"track {track_id}: {field} {current} -> {desired}")
-        desired_color = snapshot.color_index + 1
-        if (current_color_index(track.color_id) != snapshot.color_index or
-                (track.color_id == 0 and snapshot.color_index != 0)):
+        desired_color = (snapshot.color_index + 1
+                         if snapshot.color_index < 8 else 0)
+        if current_color_index(track.color_id) != snapshot.color_index:
             editor.set_track_field(track_id, "color_id", desired_color)
             changes.append(
                 f"track {track_id}: color {track.color_id} -> {desired_color}")

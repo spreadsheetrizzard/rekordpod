@@ -24,6 +24,7 @@
 #define RBPREP_ROOT_NODE 0xffffffffu
 #define RBPREP_LIST_ROWS 9
 #define RBPREP_TREE_NODES 2048
+#define RBPREP_STATUS_HEIGHT 8
 #define RBPREP_DECK_X 0
 #define RBPREP_VU_WIDTH 20
 #define RBPREP_DECK_WIDTH (LCD_WIDTH - RBPREP_VU_WIDTH - 1)
@@ -47,9 +48,25 @@
 #define RBPREP_PREVIEW_TICKS MAX(1, HZ * 4 / 25)
 #define RBPREP_OVERVIEW_TICKS MAX(1, HZ / 2)
 #define RBPREP_FRAME_TICKS MAX(1, HZ / 20)
+#define RBPREP_MENU_FRAME_TICKS MAX(1, HZ / 25)
+#define RBPREP_SPECTRUM_TICKS MAX(1, HZ / 12)
 #define RBPREP_HUD_SCROLL_TICKS MAX(1, HZ / 10)
-#define RBPREP_CONFIG_VERSION 3
+#define RBPREP_STATUS_TICKS MAX(1, HZ)
+#define RBPREP_CONFIG_VERSION 4
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
+#define RBPREP_USB_STATUS "/.rockbox/rbprep/usb-status.rbs"
+#define RBPREP_AUTOBOOT_OFF "/.rockbox/rbprep/autoboot.off"
+#define RBPREP_MACRO_FILE "/.rockbox/rbprep/tool-macros.rbm"
+#define RBPREP_MACRO_FILE_TMP "/.rockbox/rbprep/tool-macros.rbm.tmp"
+#define RBPREP_MACRO_FILE_PREV "/.rockbox/rbprep/tool-macros.rbm.prev"
+#define RBPREP_MACRO_RECOVERY_FILE "/.rekordpod-macros.rbm"
+#define RBPREP_MACRO_RECOVERY_TMP "/.rekordpod-macros.rbm.tmp"
+#define RBPREP_MACRO_RECOVERY_PREV "/.rekordpod-macros.rbm.prev"
+#define RBPREP_MACRO_LINK_FILE "/.rekordpod-workflows.rbl"
+#define RBPREP_MACRO_LINK_TMP "/.rekordpod-workflows.rbl.tmp"
+#define RBPREP_MACRO_LINK_LEGACY \
+    "/.rockbox/rbprep/playlist-workflows.rbl"
+#define RBPREP_SMART_QUERY_FILE "/.rockbox/rbprep/smart-playlists.rbq"
 #define RBPREP_PLAYLIST_JOURNAL "/.rockbox/rbprep/playlist-adds.rba"
 #define RBPREP_EDIT_JOURNAL "/.rockbox/rbprep/edits.rbe"
 #define RBPREP_BURN_STATE "/.rockbox/rbprep/local-burn.rbs"
@@ -61,9 +78,26 @@
 #define RBPREP_SEARCH_MAX 8192
 #define RBPREP_SPECTRUM_BANDS 20
 #define RBPREP_PCM_FRAMES 1024
-#define RBPREP_GREEN LCD_RGBPACK(70, 235, 125)
-#define RBPREP_GREEN_DIM LCD_RGBPACK(28, 75, 48)
+#define RBPREP_GREEN theme_accent
+#define RBPREP_GREEN_DIM theme_accent_dim
 #define RBPREP_MENU_TEXT LCD_RGBPACK(188, 205, 193)
+#define RBPREP_TOOL_PAGE_MAX 4
+#define RBPREP_MACRO_COUNT 2
+#define RBPREP_MACRO_STEPS 24
+#define RBPREP_MACRO_NAME 24
+#define RBPREP_MACRO_CHOOSE (-2147483647 - 1)
+#define RBPREP_MACRO_LOCK_WHEEL 0x01
+#define RBPREP_MACRO_LINKS 128
+#define RBPREP_SMART_QUERIES 128
+#define RBPREP_DAC_INITIAL_GAIN_DB (-50)
+#define RBPREP_MACRO_FORMAT 4
+#define RBPREP_MACRO_STEP_SIZE 8
+#define RBPREP_MACRO_STORE_SIZE \
+    (12 + RBPREP_MACRO_COUNT * \
+     (RBPREP_MACRO_NAME + 1 + \
+      RBPREP_MACRO_STEPS * RBPREP_MACRO_STEP_SIZE))
+#define RBPREP_TRACK_COLOR_NONE 8
+#define RBPREP_TRACK_COLOR_COUNT 9
 
 enum rbprep_mode {
     MODE_LIBRARY,
@@ -75,49 +109,79 @@ enum rbprep_mode {
     MODE_PENDING,
     MODE_INDEX,
     MODE_GENRES,
+    MODE_PLAYLIST_ACTIONS,
+    MODE_ACCENT,
+    MODE_MACRO_ACTIONS,
+    MODE_MACRO_EDITOR,
+    MODE_MACRO_PICKER,
+    MODE_MACRO_VALUE,
     MODE_DECK,
+    MODE_TEMPO,
     MODE_GRID,
     MODE_CUES,
     MODE_LOOP,
-    MODE_METADATA
+    MODE_METADATA,
+    MODE_LIST,
+    MODE_PNAV,
+    MODE_VISUALIZER,
+    MODE_MACRO
+};
+
+enum rbprep_color_target {
+    COLOR_TARGET_ACCENT,
+    COLOR_TARGET_BODY,
+    COLOR_TARGET_WHEEL
 };
 
 enum rbprep_tool {
-    TOOL_SEEK,
-    TOOL_SCRUB_STEP,
-    TOOL_ZOOM,
-    TOOL_GAIN,
-    TOOL_HOST_RPM,
-    TOOL_PLAY_RPM,
-    TOOL_PITCH_BEND,
-    TOOL_TEMPO,
-    TOOL_PLAYLIST_MODE,
-    TOOL_ADD_PLAYLIST,
-    TOOL_WAVEFORM_STYLE,
-    TOOL_GRID_NUDGE,
-    TOOL_GRID_BPM,
-    TOOL_GRID_ORIGIN,
-    TOOL_GRID_QUANTIZE,
-    TOOL_CUE_SLOT,
-    TOOL_CUE_MOVE,
-    TOOL_CUE_COLOR,
-    TOOL_CUE_DELETE,
-    TOOL_LOOP_LENGTH,
-    TOOL_LOOP_IN,
-    TOOL_LOOP_OUT,
-    TOOL_LOOP_ACTIVE,
-    TOOL_META_RATING,
-    TOOL_META_COLOR,
-    TOOL_META_YEAR,
-    TOOL_META_GENRE,
-    TOOL_COUNT
+    /* These values are persisted in tool-macros.rbm. Never renumber an
+       existing tool: append new values immediately before TOOL_COUNT. */
+    TOOL_SEEK = 0,
+    TOOL_SCRUB_STEP = 1,
+    TOOL_ZOOM = 2,
+    TOOL_GAIN = 3,
+    TOOL_HOST_RPM = 4,
+    TOOL_PLAY_RPM = 5,
+    TOOL_PITCH_BEND = 6,
+    TOOL_TEMPO = 7,
+    TOOL_PLAYLIST_MODE = 8,
+    TOOL_ADD_PLAYLIST = 9,
+    TOOL_WAVEFORM_STYLE = 10,
+    TOOL_KEYLOCK = 11,
+    TOOL_VIS_BOOMBOX = 12,
+    TOOL_VIS_EQ = 13,
+    TOOL_VIS_TURNTABLE = 14,
+    TOOL_MACRO_ONE = 15,
+    TOOL_MACRO_TWO = 16,
+    TOOL_GRID_NUDGE = 17,
+    TOOL_GRID_BPM = 18,
+    TOOL_GRID_ORIGIN = 19,
+    TOOL_GRID_QUANTIZE = 20,
+    TOOL_CUE_SLOT = 21,
+    TOOL_CUE_MOVE = 22,
+    TOOL_CUE_COLOR = 23,
+    TOOL_CUE_DELETE = 24,
+    TOOL_LOOP_LENGTH = 25,
+    TOOL_LOOP_IN = 26,
+    TOOL_LOOP_OUT = 27,
+    TOOL_LOOP_ACTIVE = 28,
+    TOOL_META_RATING = 29,
+    TOOL_META_COLOR = 30,
+    TOOL_META_YEAR = 31,
+    TOOL_META_GENRE = 32,
+    TOOL_BURN_SONG = 33,
+    TOOL_BURN_ALL = 34,
+    TOOL_PLAYLIST_PREVIOUS = 35,
+    TOOL_PLAYLIST_NEXT = 36,
+    TOOL_RESTART_PLAYBACK = 37,
+    TOOL_RELOAD_TRACK = 38,
+    TOOL_COUNT = 39
 };
 
 enum rbprep_confirm_action {
     CONFIRM_NONE,
     CONFIRM_EXIT,
     CONFIRM_DECK_CUE,
-    CONFIRM_CUE_SET,
     CONFIRM_CUE_DELETE,
     CONFIRM_GRID_ORIGIN,
     CONFIRM_KEEP_EDIT,
@@ -125,7 +189,27 @@ enum rbprep_confirm_action {
     CONFIRM_GENRE,
     CONFIRM_BURN,
     CONFIRM_DELETE_PENDING,
-    CONFIRM_DELETE_PLAYLIST
+    CONFIRM_DELETE_PLAYLIST,
+    CONFIRM_PLAYLIST_CREATE,
+    CONFIRM_PLAYLIST_RENAME,
+    CONFIRM_PLAYLIST_MOVE,
+    CONFIRM_PLAYLIST_NODE_DELETE,
+    CONFIRM_MACRO_CLEAR,
+    CONFIRM_MACRO_DELETE_STEP,
+    CONFIRM_BURN_ALL_NOW
+};
+
+enum rbprep_burn_request {
+    BURN_REQUEST_NONE,
+    BURN_REQUEST_ALL
+};
+
+enum rbprep_playlist_operation {
+    PLAYLIST_OP_ADD = 'A',
+    PLAYLIST_OP_CREATE = 'C',
+    PLAYLIST_OP_RENAME = 'R',
+    PLAYLIST_OP_MOVE = 'M',
+    PLAYLIST_OP_DELETE = 'D'
 };
 
 struct rbprep_wave_column {
@@ -146,8 +230,11 @@ struct rbprep_pending_entry {
 };
 
 struct rbprep_pending_playlist {
+    unsigned char operation;
+    unsigned char kind;
     uint32_t track_id;
     uint32_t playlist_id;
+    uint32_t parent_id;
     char name[64];
 };
 
@@ -162,7 +249,6 @@ static int waveform_column_first;
 static int waveform_column_span;
 static bool waveform_columns_valid;
 static int waveform_points;
-static int waveform_duration_ms = 1;
 static int beat_times[RBPREP_BEATS];
 static unsigned char beat_numbers[RBPREP_BEATS];
 static int beat_count;
@@ -185,20 +271,51 @@ static bool force_full_redraw = true;
 static bool overview_dirty = true;
 static long overview_deadline;
 static long hud_scroll_deadline;
+static long status_deadline;
 static int title_scroll_px;
 static int metadata_scroll_px;
 static bool hud_scroll_active;
 static int deck_tool;
+static int tempo_tool;
 static int grid_tool;
 static int cue_tool;
 static int loop_tool;
 static int metadata_tool;
+static int visualizer_tool;
+static int list_tool;
+static int pnav_tool;
+static int macro_tool;
 static int waveform_half;
 static int visualizer_mode;
 static int save_on_track_load;
+static int auto_burn;
+static int click_sound;
+static int keylock_enabled = 1;
+static int autoplay_enabled = 1;
+static int autoboot_enabled = 1;
+static int total_plays;
+static int accent_hue = 145;
+static int accent_saturation = 70;
+static int accent_brightness = 92;
+static int accent_component;
+static int color_picker_target;
+static int body_hue = 210;
+static int body_saturation = 5;
+static int body_brightness = 88;
+static int wheel_hue;
+static int wheel_saturation;
+static int wheel_brightness = 14;
+static int theme_accent = LCD_RGBPACK(70, 235, 125);
+static int theme_accent_dim = LCD_RGBPACK(28, 75, 48);
+static int theme_body = LCD_RGBPACK(220, 224, 221);
+static int theme_body_shadow = LCD_RGBPACK(70, 76, 72);
+static int theme_wheel = LCD_RGBPACK(25, 28, 26);
+static int theme_wheel_outline = LCD_RGBPACK(145, 153, 148);
 static int scrub_step_index = 4;
 static int settings_selection;
 static int usb_selection;
+static int dac_saved_volume;
+static bool dac_gain_override;
 static int genre_selection;
 static int genre_top;
 static int genre_count;
@@ -214,8 +331,10 @@ static int16_t pcm_pitch[RBPREP_PCM_FRAMES] MEM_ALIGN_ATTR;
 static volatile int pcm_capture_index;
 static volatile int pcm_capture_frames[2];
 static volatile unsigned int pcm_capture_generation;
+static bool spectrum_capture_active;
 static volatile unsigned long pcm_sample_rate = 44100;
 static unsigned int spectrum_generation;
+static long spectrum_deadline;
 static unsigned char spectrum_levels[RBPREP_SPECTRUM_BANDS];
 static unsigned char spectrum_bass;
 static unsigned char spectrum_bass_hit;
@@ -231,9 +350,18 @@ static int32_t original_pitch = PITCH_SPEED_100;
 static int32_t original_stretch = PITCH_SPEED_100;
 static bool original_timestretch_enabled;
 static bool playback_rate_changed;
+static enum rbprep_burn_request burn_request;
 static bool playlist_playback;
 static bool playlist_add_mode;
+static bool playlist_move_mode;
+static int playlist_action_selection;
+static int playlist_action_node = -1;
+static int playlist_action_parent = -1;
+static uint32_t playlist_action_id;
+static uint32_t playlist_action_parent_id;
+static char playlist_action_name[64];
 static int playing_track_row = -1;
+static bool force_track_reload;
 static bool audio_was_running;
 static bool confirm_active;
 static bool confirm_ok;
@@ -243,18 +371,28 @@ static enum rbprep_confirm_action confirm_action;
 static char confirm_message[64];
 static int confirm_slot;
 static int confirm_time;
-static unsigned char confirm_color;
 static int confirm_playlist_node;
 static int staged_tool = -1;
 static int staged_original;
 static int pending_snapshot_count;
 static int pending_playlist_count;
+static bool pending_summary_overflow;
+static bool pending_journal_invalid;
 static int pending_visible_count;
 static struct rbprep_pending_entry pending_entries[RBPREP_PENDING_MAX];
 static struct rbprep_pending_playlist
     pending_playlists[RBPREP_PENDING_MAX];
 static int pending_selection;
 static int pending_top;
+static int recent_tracks_30d;
+static bool recent_tracks_ready;
+static int uptime_tracks_burned;
+static int play_stat_track_id = -1;
+static long play_stat_last_tick;
+static long play_stat_ticks;
+static bool play_stat_counted;
+static long storage_keepalive_deadline;
+static bool config_dirty;
 static bool track_edit_dirty;
 static bool cue_audition_active;
 static bool cue_audition_latched;
@@ -265,15 +403,57 @@ static bool suppress_menu;
 static bool suppress_play;
 static bool suppress_left;
 static bool suppress_right;
+static int macro_chord_button;
 static bool tool_menu_active;
 static enum rbprep_tool tool_menu_original;
 static bool menu_button_down;
 static bool menu_hold_fired;
 static long menu_pressed_tick;
+static int select_pressed_time;
 static int loop_length_index = 7;
 static int loop_in = -1;
 static int loop_out = -1;
 static bool loop_active;
+
+struct rbprep_macro_step {
+    unsigned char tool;
+    unsigned char flags;
+    int value;
+};
+
+struct rbprep_tool_macro {
+    char name[RBPREP_MACRO_NAME];
+    unsigned char count;
+    struct rbprep_macro_step steps[RBPREP_MACRO_STEPS];
+};
+
+static struct rbprep_tool_macro tool_macros[RBPREP_MACRO_COUNT];
+static int macro_active = -1;
+static int macro_position;
+static bool macro_store_valid;
+static bool macro_dirty;
+static int macro_manage_slot;
+static int macro_action_selection;
+static int macro_edit_position;
+static int macro_edit_operation;
+static int macro_picker_page;
+static int macro_picker_tool;
+static int macro_value_draft;
+static bool macro_value_choose;
+static bool macro_value_new_step;
+static enum rbprep_tool macro_value_tool;
+static bool macro_value_lock;
+static bool macro_wheel_locked;
+
+struct rbprep_macro_link {
+    uint32_t playlist_id;
+    signed char slot;
+};
+
+static struct rbprep_macro_link macro_links[RBPREP_MACRO_LINKS];
+static int macro_link_count;
+static uint32_t smart_query_ids[RBPREP_SMART_QUERIES];
+static int smart_query_count;
 
 enum rbprep_seek_state {
     SEEK_IDLE,
@@ -308,6 +488,7 @@ struct rbprep_track_record {
     int rating;
     int color;
     int year;
+    uint16_t import_date;
     uint32_t comments_offset;
     uint32_t tags_offset;
     uint32_t search_offset;
@@ -320,6 +501,7 @@ enum rbprep_track_sort {
     TRACK_SORT_KEY,
     TRACK_SORT_COMMENTS,
     TRACK_SORT_TAGS,
+    TRACK_SORT_IMPORTED,
     TRACK_SORT_COUNT
 };
 
@@ -330,6 +512,15 @@ struct rbprep_node_record {
     uint32_t member_count;
     int kind;
     uint32_t source_id;
+};
+
+struct rbprep_playlist_cache_row {
+    bool valid;
+    uint32_t parent;
+    int ordinal;
+    int node_index;
+    struct rbprep_node_record node;
+    char name[80];
 };
 
 static int library_fd = -1;
@@ -346,12 +537,16 @@ static uint32_t library_track_offset;
 static uint32_t library_node_offset;
 static uint32_t library_member_offset;
 static uint32_t library_string_offset;
+static uint32_t library_string_size;
 static uint32_t library_sort_offsets[TRACK_SORT_COUNT];
 static uint32_t tree_parent = RBPREP_ROOT_NODE;
 static int tree_selection;
 static int tree_top;
 static int tree_child_count;
 static int tree_children[RBPREP_TREE_NODES];
+static struct rbprep_playlist_cache_row
+    playlist_cache[RBPREP_LIST_ROWS];
+static char tree_parent_name[80];
 static int track_selection;
 static int track_top;
 static int track_row_count;
@@ -362,6 +557,7 @@ static char track_search[40];
 static uint32_t search_results[RBPREP_SEARCH_MAX];
 static int search_result_count;
 static bool search_active;
+static bool collection_shuffle_active;
 static int active_playlist_node = -1;
 static int selected_track_index = -1;
 static int selected_track_id = -1;
@@ -370,14 +566,50 @@ static char selected_title[96];
 static char selected_artist[72];
 static char selected_genre[32];
 static char selected_key[24];
+static char selected_comments[96];
 static char selected_extension[12];
+static int usb_armed_selection;
+static bool usb_event_registered;
+static bool usb_extract_event_registered;
 
 static void stop_editor_audio(void);
 static void reset_play_clock(int anchor, long tick);
 static void jump_to_time(int target);
 static bool flush_deferred_edit(void);
+static void start_spectrum_capture(void);
 static void stop_spectrum_capture(void);
 static void restore_playback_rate(void);
+static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color);
+static bool draw_macro_strip(void);
+static void select_tool(enum rbprep_tool tool);
+static void apply_macro_step(const struct rbprep_macro_step *step);
+static void activate_macro(int slot);
+static void rename_macro(int slot);
+static void open_macro_editor(int slot);
+static void apply_macro_picker_tool(void);
+static void save_macro_value(void);
+static void delete_macro_step(int slot, int position);
+static void clear_macro(int slot);
+static bool handle_usb_system_event(int button);
+static bool save_rbprep_config(void);
+static bool save_tool_macros(void);
+
+static void set_output_gain(int volume)
+{
+    volume = MAX(rb->sound_min(SOUND_VOLUME),
+                 MIN(rb->sound_max(SOUND_VOLUME), volume));
+    rb->global_status->volume = volume;
+    rb->sound_set(SOUND_VOLUME, volume);
+}
+
+static void restore_dac_gain(void)
+{
+    if (!dac_gain_override)
+        return;
+
+    set_output_gain(dac_saved_volume);
+    dac_gain_override = false;
+}
 
 static void set_storage_performance_mode(bool enabled)
 {
@@ -392,11 +624,56 @@ static void set_storage_performance_mode(bool enabled)
 #endif
 }
 
+static void rbprep_usb_inserted(unsigned short id, void *event_data)
+{
+    (void)id;
+#if !defined(SIMULATOR) && !defined(USB_NONE) && defined(HAVE_USB_POWER)
+    int *requested_mode = event_data;
+    bool dac_requested = mode == MODE_USB && usb_armed_selection == 2;
+
+    /* This event runs before USB descriptors are configured, so establish
+       the quiet DAC baseline before macOS can open the audio stream. */
+    if (dac_requested && !dac_gain_override) {
+        dac_saved_volume = rb->global_status->volume;
+        dac_gain_override = true;
+        set_output_gain(RBPREP_DAC_INITIAL_GAIN_DB);
+    }
+
+    /* Decide at the physical insertion edge. Mass storage is permitted only
+       while its dedicated page is visible and DATA was explicitly saved;
+       every other Rekordpod screen remains live in charge-only mode. */
+    if (requested_mode)
+        *requested_mode = mode == MODE_USB && usb_armed_selection == 1
+                        ? USB_MODE_MASS_STORAGE : USB_MODE_CHARGE;
+#else
+    (void)event_data;
+#endif
+}
+
+static void rbprep_usb_extracted(unsigned short id, void *event_data)
+{
+    (void)id;
+    (void)event_data;
+    restore_dac_gain();
+}
+
 static void rbprep_cleanup(void)
 {
+    if (usb_event_registered) {
+        rb->remove_event(SYS_EVENT_USB_INSERTED, rbprep_usb_inserted);
+        usb_event_registered = false;
+    }
+    if (usb_extract_event_registered) {
+        rb->remove_event(SYS_EVENT_USB_EXTRACTED, rbprep_usb_extracted);
+        usb_extract_event_registered = false;
+    }
     flush_deferred_edit();
+    if (macro_dirty)
+        save_tool_macros();
+    save_rbprep_config();
     stop_spectrum_capture();
     restore_playback_rate();
+    restore_dac_gain();
     set_storage_performance_mode(false);
     backlight_use_settings();
 }
@@ -410,9 +687,11 @@ static bool service_display_lock(void)
         return false;
     display_locked = locked;
     if (locked) {
+        stop_spectrum_capture();
         set_storage_performance_mode(false);
         backlight_use_settings();
     } else {
+        start_spectrum_capture();
         set_storage_performance_mode(true);
         backlight_ignore_timeout();
 #ifdef HAVE_BACKLIGHT
@@ -428,7 +707,7 @@ static bool service_display_lock(void)
 
 static const char *color_labels[] = {
     "SAMPLE", "OPENER", "BUILDER", "PIVOTER",
-    "MAINTAINER", "PEAK", "RESET", "TOOL"
+    "MAINTAINER", "PEAK", "RESET", "TOOL", "NO COLOR"
 };
 
 static const char *cue_color_names[] = {
@@ -438,8 +717,67 @@ static const char *cue_color_names[] = {
 
 static const char *mode_names[] = {
     "LIBRARY", "PLAYLISTS", "TRACKS", "FILTER", "USB", "SETTINGS", "PENDING",
-    "INDEX", "GENRES", "PLAYBACK", "BEATGRID", "HOT CUES", "LOOP",
-    "METADATA"
+    "INDEX", "GENRES", "PLAYLIST MANAGER", "ACCENT", "WORKFLOW MANAGER",
+    "WORKFLOW EDITOR", "TOOL PICKER", "DEFAULT VALUE", "PLAYBACK", "TEMPO",
+    "BEATGRID", "HOT CUES", "LOOP", "METADATA", "LIST", "PLAYLIST NAV",
+    "VISUALIZER", "WORKFLOWS"
+};
+
+static const char * const tool_names[TOOL_COUNT] = {
+    "SEEK", "SCRUB", "ZOOM", "GAIN", "HOST RPM", "PLAY RPM",
+    "PITCH BEND", "TEMPO", "AUTO-NEXT", "ADD TO PLAYLIST",
+    "RGB WAVEFORM", "PITCH LOCK", "BOOMBOX", "20-BAND EQ",
+    "TURNTABLE", "M1", "M2", "GRID NUDGE",
+    "GRID BPM", "DOWNBEAT", "QUANTIZE", "CUE SLOT", "CUE MOVE",
+    "CUE COLOR", "CUE DELETE", "LOOP SIZE", "LOOP IN", "LOOP OUT",
+    "LOOP ACTIVE", "RATING", "TRACK COLOR", "YEAR", "GENRE",
+    "BURN TRACK", "BURN ALL", "PREV TRACK", "NEXT TRACK",
+    "RESTART", "RELOAD"
+};
+
+/* On-disk workflow identities are deliberately independent of enum order.
+   A new build may rearrange pages or append tools without reinterpreting a
+   user's saved M1/M2 sequence. Never reuse one of these IDs. */
+static const uint16_t macro_tool_storage_ids[TOOL_COUNT] = {
+    [TOOL_SEEK]              = 0x0100,
+    [TOOL_SCRUB_STEP]        = 0x0101,
+    [TOOL_ZOOM]              = 0x0102,
+    [TOOL_GAIN]              = 0x0103,
+    [TOOL_HOST_RPM]          = 0x0104,
+    [TOOL_PLAY_RPM]          = 0x0105,
+    [TOOL_PITCH_BEND]        = 0x0106,
+    [TOOL_TEMPO]             = 0x0107,
+    [TOOL_PLAYLIST_MODE]     = 0x0108,
+    [TOOL_ADD_PLAYLIST]      = 0x0109,
+    [TOOL_WAVEFORM_STYLE]    = 0x010a,
+    [TOOL_KEYLOCK]           = 0x010b,
+    [TOOL_VIS_BOOMBOX]       = 0x010c,
+    [TOOL_VIS_EQ]            = 0x010d,
+    [TOOL_VIS_TURNTABLE]     = 0x010e,
+    [TOOL_MACRO_ONE]         = 0x010f,
+    [TOOL_MACRO_TWO]         = 0x0110,
+    [TOOL_GRID_NUDGE]        = 0x0111,
+    [TOOL_GRID_BPM]          = 0x0112,
+    [TOOL_GRID_ORIGIN]       = 0x0113,
+    [TOOL_GRID_QUANTIZE]     = 0x0114,
+    [TOOL_CUE_SLOT]          = 0x0115,
+    [TOOL_CUE_MOVE]          = 0x0116,
+    [TOOL_CUE_COLOR]         = 0x0117,
+    [TOOL_CUE_DELETE]        = 0x0118,
+    [TOOL_LOOP_LENGTH]       = 0x0119,
+    [TOOL_LOOP_IN]           = 0x011a,
+    [TOOL_LOOP_OUT]          = 0x011b,
+    [TOOL_LOOP_ACTIVE]       = 0x011c,
+    [TOOL_META_RATING]       = 0x011d,
+    [TOOL_META_COLOR]        = 0x011e,
+    [TOOL_META_YEAR]         = 0x011f,
+    [TOOL_META_GENRE]        = 0x0120,
+    [TOOL_BURN_SONG]         = 0x0121,
+    [TOOL_BURN_ALL]          = 0x0122,
+    [TOOL_PLAYLIST_PREVIOUS] = 0x0123,
+    [TOOL_PLAYLIST_NEXT]     = 0x0124,
+    [TOOL_RESTART_PLAYBACK]  = 0x0125,
+    [TOOL_RELOAD_TRACK]      = 0x0126,
 };
 
 static char *waveform_styles[] = { "full", "half" };
@@ -455,8 +793,10 @@ static const char *spectrum_labels[] = {
     "18K", "21K"
 };
 static char *save_on_load_styles[] = { "immediate", "next track" };
+static char *auto_burn_styles[] = { "off", "next track load" };
+static char *off_on_styles[] = { "off", "on" };
 static const char *track_sort_names[] = {
-    "TITLE", "BPM", "YEAR", "KEY", "COMMENTS", "TAGS"
+    "TITLE", "BPM", "YEAR", "KEY", "COMMENTS", "TAGS", "IMPORTED"
 };
 static const int scrub_steps[] = {
     1, 2, 5, 10, 20, 50, 100, 250, 500, 1000
@@ -470,9 +810,218 @@ static const struct configdata rbprep_config[] = {
       "visualizer", visualizer_styles },
     { TYPE_ENUM, 0, 1, { .int_p = &save_on_track_load },
       "save edits", save_on_load_styles },
+    { TYPE_ENUM, 0, 1, { .int_p = &auto_burn },
+      "auto burn", auto_burn_styles },
     { TYPE_INT, 0, ARRAYLEN(scrub_steps) - 1,
-      { .int_p = &scrub_step_index }, "scrub step", NULL }
+      { .int_p = &scrub_step_index }, "scrub step", NULL },
+    { TYPE_ENUM, 0, 1, { .int_p = &click_sound },
+      "wheel click", off_on_styles },
+    { TYPE_ENUM, 0, 1, { .int_p = &keylock_enabled },
+      "keylock", off_on_styles },
+    { TYPE_ENUM, 0, 1, { .int_p = &autoplay_enabled },
+      "autoplay default", off_on_styles },
+    { TYPE_ENUM, 0, 1, { .int_p = &autoboot_enabled },
+      "autoboot rekordpod", off_on_styles },
+    { TYPE_INT, 0, INT_MAX, { .int_p = &total_plays },
+      "total plays", NULL },
+    { TYPE_INT, 0, 359, { .int_p = &accent_hue },
+      "accent hue", NULL },
+    { TYPE_INT, 0, 100, { .int_p = &accent_saturation },
+      "accent saturation", NULL },
+    { TYPE_INT, 10, 100, { .int_p = &accent_brightness },
+      "accent brightness", NULL },
+    { TYPE_INT, 0, 359, { .int_p = &body_hue },
+      "ipod body hue", NULL },
+    { TYPE_INT, 0, 100, { .int_p = &body_saturation },
+      "ipod body saturation", NULL },
+    { TYPE_INT, 10, 100, { .int_p = &body_brightness },
+      "ipod body brightness", NULL },
+    { TYPE_INT, 0, 359, { .int_p = &wheel_hue },
+      "wheel hue", NULL },
+    { TYPE_INT, 0, 100, { .int_p = &wheel_saturation },
+      "wheel saturation", NULL },
+    { TYPE_INT, 5, 100, { .int_p = &wheel_brightness },
+      "wheel brightness", NULL }
 };
+
+/* Never write configuration from the animation/playback hot path. On flash
+   media a tiny config rewrite can still block for seconds while the device
+   performs erase/program housekeeping. Keep the current values live in RAM
+   and commit them only at a playback-safe boundary. */
+static bool save_rbprep_config(void)
+{
+    int fd;
+
+    if (!config_dirty)
+        return true;
+    if (configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
+                        ARRAYLEN(rbprep_config),
+                        RBPREP_CONFIG_VERSION) < 0)
+        return false;
+    if (autoboot_enabled) {
+        if (rb->file_exists(RBPREP_AUTOBOOT_OFF) &&
+            rb->remove(RBPREP_AUTOBOOT_OFF) < 0)
+            return false;
+    } else if (!rb->file_exists(RBPREP_AUTOBOOT_OFF)) {
+        fd = rb->creat(RBPREP_AUTOBOOT_OFF, 0666);
+        if (fd < 0)
+            return false;
+        rb->close(fd);
+    }
+    config_dirty = false;
+    return true;
+}
+
+static void mark_rbprep_config_dirty(void)
+{
+    config_dirty = true;
+}
+
+static void service_config_persistence(void)
+{
+    int status;
+
+    if (!config_dirty || seek_state != SEEK_IDLE)
+        return;
+    status = rb->audio_status();
+    if ((status & AUDIO_STATUS_PLAY) && !(status & AUDIO_STATUS_PAUSE))
+        return;
+    save_rbprep_config();
+}
+
+static void service_storage_keepalive(void)
+{
+    long now = *rb->current_tick;
+
+    if (display_locked || TIME_BEFORE(now, storage_keepalive_deadline))
+        return;
+    /* Some large PATA-to-flash adapters are slow to recover from standby.
+       Keep the already-awake device active while Rekordpod is in use, but
+       immediately restore normal Rockbox power policy when HOLD is engaged,
+       USB takes ownership, or the plugin exits. */
+    rb->storage_spin();
+    storage_keepalive_deadline = now + HZ * 30;
+}
+
+struct rbprep_tool_page {
+    enum rbprep_mode mode;
+    const char *label;
+    unsigned char count;
+    enum rbprep_tool tools[RBPREP_TOOL_PAGE_MAX];
+};
+
+static const struct rbprep_tool_page tool_pages[] = {
+    { MODE_DECK, "PLAYER", 4,
+      { TOOL_SEEK, TOOL_SCRUB_STEP, TOOL_ZOOM, TOOL_GAIN } },
+    { MODE_PNAV, "PLNAV", 4,
+      { TOOL_PLAYLIST_PREVIOUS, TOOL_PLAYLIST_NEXT,
+        TOOL_RESTART_PLAYBACK, TOOL_RELOAD_TRACK } },
+    { MODE_TEMPO, "TEMPO", 4,
+      { TOOL_PITCH_BEND, TOOL_TEMPO, TOOL_HOST_RPM, TOOL_PLAY_RPM } },
+    { MODE_GRID, "BGRID", 4,
+      { TOOL_GRID_NUDGE, TOOL_GRID_BPM, TOOL_GRID_ORIGIN,
+        TOOL_GRID_QUANTIZE } },
+    { MODE_CUES, "HOTCUE", 4,
+      { TOOL_CUE_SLOT, TOOL_CUE_MOVE, TOOL_CUE_COLOR, TOOL_CUE_DELETE } },
+    { MODE_LOOP, "LOOPS", 4,
+      { TOOL_LOOP_LENGTH, TOOL_LOOP_IN, TOOL_LOOP_OUT, TOOL_LOOP_ACTIVE } },
+    { MODE_METADATA, "DETAIL", 4,
+      { TOOL_META_RATING, TOOL_META_COLOR, TOOL_META_YEAR, TOOL_META_GENRE } },
+    { MODE_LIST, "LISTS", 4,
+      { TOOL_PLAYLIST_MODE, TOOL_ADD_PLAYLIST,
+        TOOL_BURN_SONG, TOOL_BURN_ALL } },
+    { MODE_VISUALIZER, "VISUAL", 4,
+      { TOOL_WAVEFORM_STYLE, TOOL_VIS_BOOMBOX, TOOL_VIS_EQ,
+        TOOL_VIS_TURNTABLE } },
+    { MODE_MACRO, "MACROS", 3,
+      { TOOL_MACRO_ONE, TOOL_MACRO_TWO, TOOL_KEYLOCK } }
+};
+
+static int hsb_rgb(int hue, int saturation, int brightness)
+{
+    int sector = (hue % 360) / 60;
+    int remainder = (hue % 60) * 255 / 60;
+    int value = brightness * 255 / 100;
+    int minimum = value * (100 - saturation) / 100;
+    int rising = minimum + (value - minimum) * remainder / 255;
+    int falling = value - (value - minimum) * remainder / 255;
+    int red = minimum;
+    int green = minimum;
+    int blue = minimum;
+
+    if (sector == 0) { red = value; green = rising; }
+    else if (sector == 1) { red = falling; green = value; }
+    else if (sector == 2) { green = value; blue = rising; }
+    else if (sector == 3) { green = falling; blue = value; }
+    else if (sector == 4) { red = rising; blue = value; }
+    else { red = value; blue = falling; }
+    return LCD_RGBPACK(red, green, blue);
+}
+
+static void update_theme_colors(void)
+{
+    theme_accent = hsb_rgb(accent_hue, accent_saturation,
+                           accent_brightness);
+    theme_accent_dim = hsb_rgb(accent_hue,
+                               MIN(100, accent_saturation + 8),
+                               MAX(10, accent_brightness / 3));
+    theme_body = hsb_rgb(body_hue, body_saturation, body_brightness);
+    theme_body_shadow = hsb_rgb(body_hue,
+                                MIN(100, body_saturation + 4),
+                                MAX(10, body_brightness / 3));
+    theme_wheel = hsb_rgb(wheel_hue, wheel_saturation, wheel_brightness);
+    theme_wheel_outline = hsb_rgb(wheel_hue,
+                                  MAX(0, wheel_saturation - 8),
+                                  MIN(100, wheel_brightness + 38));
+}
+
+static void active_color_channels(int **hue, int **saturation,
+                                  int **brightness)
+{
+    if (color_picker_target == COLOR_TARGET_BODY) {
+        *hue = &body_hue;
+        *saturation = &body_saturation;
+        *brightness = &body_brightness;
+    } else if (color_picker_target == COLOR_TARGET_WHEEL) {
+        *hue = &wheel_hue;
+        *saturation = &wheel_saturation;
+        *brightness = &wheel_brightness;
+    } else {
+        *hue = &accent_hue;
+        *saturation = &accent_saturation;
+        *brightness = &accent_brightness;
+    }
+}
+
+static const char *active_color_title(void)
+{
+    if (color_picker_target == COLOR_TARGET_BODY)
+        return "IPOD BODY COLOR";
+    if (color_picker_target == COLOR_TARGET_WHEEL)
+        return "WHEEL / VINYL";
+    return "ACCENT COLOR";
+}
+
+static void adjust_active_color(int direction)
+{
+    int *hue;
+    int *saturation;
+    int *brightness;
+    int minimum_brightness = color_picker_target == COLOR_TARGET_WHEEL
+                           ? 5 : 10;
+
+    active_color_channels(&hue, &saturation, &brightness);
+    if (accent_component == 0)
+        *hue = (*hue + (direction > 0 ? 1 : 359)) % 360;
+    else if (accent_component == 1)
+        *saturation = MAX(0, MIN(100, *saturation + direction));
+    else
+        *brightness = MAX(minimum_brightness,
+                          MIN(100, *brightness + direction));
+    update_theme_colors();
+    mark_rbprep_config_dirty();
+    force_full_redraw = true;
+}
 
 static int rpm_pitch_x100(void)
 {
@@ -496,8 +1045,8 @@ static void apply_playback_rate(void)
 {
     int32_t pitch = deck_pitch_x100();
 
-    rb->dsp_timestretch_enable(true);
-    if (rb->dsp_timestretch_available()) {
+    rb->dsp_timestretch_enable(!!keylock_enabled);
+    if (keylock_enabled && rb->dsp_timestretch_available()) {
         rb->sound_set_pitch(pitch);
         rb->dsp_set_timestretch(tempo_x100);
     } else {
@@ -551,9 +1100,12 @@ static const struct mixer_buffer_cbs spectrum_buffer_cbs = {
 
 static void start_spectrum_capture(void)
 {
+    if (spectrum_capture_active)
+        return;
     pcm_capture_index = 0;
     pcm_capture_frames[0] = pcm_capture_frames[1] = 0;
     pcm_capture_generation = spectrum_generation = 0;
+    spectrum_deadline = *rb->current_tick;
     pcm_sample_rate = rb->mixer_get_frequency();
     rb->memset(spectrum_levels, 0, sizeof(spectrum_levels));
     spectrum_bass = spectrum_bass_hit = 0;
@@ -563,11 +1115,15 @@ static void start_spectrum_capture(void)
     bass_filter_state = 0;
     rb->mixer_channel_set_buffer_hook(PCM_MIXER_CHAN_PLAYBACK,
                                       &spectrum_buffer_cbs);
+    spectrum_capture_active = true;
 }
 
 static void stop_spectrum_capture(void)
 {
+    if (!spectrum_capture_active)
+        return;
     rb->mixer_channel_set_buffer_hook(PCM_MIXER_CHAN_PLAYBACK, NULL);
+    spectrum_capture_active = false;
 }
 
 static const int cue_palette[] = {
@@ -580,6 +1136,19 @@ static const int cue_palette[] = {
     LCD_RGBPACK(175, 90, 255),
     LCD_RGBPACK(255, 80, 185)
 };
+
+static int normalize_track_color(int color)
+{
+    return color >= 0 && color < RBPREP_TRACK_COLOR_COUNT
+         ? color : RBPREP_TRACK_COLOR_NONE;
+}
+
+static int track_color_display(int color)
+{
+    color = normalize_track_color(color);
+    return color == RBPREP_TRACK_COLOR_NONE ? LCD_LIGHTGRAY
+                                            : cue_palette[color];
+}
 
 /* Three-pixel hexadecimal glyphs, packed as five rows of three bits. */
 static const uint16_t micro_hex_glyphs[16] = {
@@ -596,6 +1165,13 @@ static void draw_micro_cue_marker(int center_x, int top, int slot, int color)
     /* Cue slots are presented as 1..9, A..F, 0 in the tiny 3px label. */
     uint16_t glyph = micro_hex_glyphs[(slot + 1) & 15];
 
+    /* A one-pixel dark keyline keeps the five-pixel colored flag and its
+       number readable over white, yellow, or high-energy RGB waveform bins. */
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(center_x - 3, top - 1, 7, 7);
+    rb->lcd_hline(center_x - 2, center_x + 2, top + 6);
+    rb->lcd_hline(center_x - 1, center_x + 1, top + 7);
+    rb->lcd_drawpixel(center_x, top + 8);
     rb->lcd_set_foreground(color);
     rb->lcd_fillrect(center_x - 2, top, 5, 5);
     rb->lcd_hline(center_x - 1, center_x + 1, top + 5);
@@ -695,6 +1271,54 @@ static void centered_text(int left, int width, int y,
     text(left + MAX(0, (width - text_width) / 2), y, s, color);
 }
 
+static void draw_status_bar(void)
+{
+    struct tm *now = rb->get_time();
+    char clock[8];
+    char timecode[28];
+    int level = rb->battery_level();
+    int width;
+    int text_width;
+    bool low;
+
+    level = MAX(0, MIN(100, level));
+    low = level <= 10;
+    width = LCD_WIDTH * level / 100;
+    rb->lcd_set_drawmode(DRMODE_SOLID);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(0, 0, LCD_WIDTH, RBPREP_STATUS_HEIGHT);
+    rb->lcd_set_foreground(low ? LCD_RGBPACK(225, 35, 35) : LCD_WHITE);
+    if (width > 0)
+        rb->lcd_fillrect(0, 0, width, RBPREP_STATUS_HEIGHT - 1);
+    if (now) {
+        int hour = now->tm_hour;
+        if (rb->global_settings->timeformat) {
+            hour %= 12;
+            if (!hour)
+                hour = 12;
+        }
+        rb->snprintf(clock, sizeof(clock), "%02d:%02d", hour, now->tm_min);
+    } else {
+        rb->strlcpy(clock, "--:--", sizeof(clock));
+    }
+    rb->lcd_getstringsize(clock, &text_width, NULL);
+    rb->lcd_set_foreground(LCD_WHITE);
+    if (!low)
+        rb->lcd_set_drawmode(DRMODE_COMPLEMENT);
+    rb->lcd_putsxy((LCD_WIDTH - text_width) / 2, 0, clock);
+    if (mode >= MODE_DECK && selected_track_id >= 0) {
+        rb->snprintf(timecode, sizeof(timecode), "%ds : %ds",
+                     MAX(0, MIN(track_length, playhead)) / 1000,
+                     MAX(0, track_length) / 1000);
+        rb->lcd_getstringsize(timecode, &text_width, NULL);
+        rb->lcd_putsxy(MAX(1, LCD_WIDTH - text_width - 2), 0, timecode);
+    }
+    rb->lcd_set_drawmode(DRMODE_SOLID);
+    rb->lcd_set_foreground(low ? LCD_RGBPACK(125, 20, 20)
+                               : LCD_RGBPACK(72, 72, 72));
+    rb->lcd_hline(0, LCD_WIDTH - 1, RBPREP_STATUS_HEIGHT - 1);
+}
+
 static void format_percent_delta(char *buffer, size_t size, int delta_x100)
 {
     char sign = delta_x100 < 0 ? '-' : '+';
@@ -706,6 +1330,11 @@ static void format_percent_delta(char *buffer, size_t size, int delta_x100)
 
 static void restore_black_canvas(void)
 {
+#if LCD_DEPTH > 1
+    /* Prep Deck owns every pixel; never let the selected Rockbox backdrop
+       leak through after a splash, keyboard, error, or USB handoff. */
+    rb->lcd_set_backdrop(NULL);
+#endif
     rb->lcd_set_background(LCD_BLACK);
     rb->lcd_set_foreground(LCD_WHITE);
     rb->lcd_set_drawmode(DRMODE_SOLID);
@@ -736,6 +1365,542 @@ static void write_u32(unsigned char *data, uint32_t value)
     data[1] = value >> 8;
     data[2] = value >> 16;
     data[3] = value >> 24;
+}
+
+static bool read_exact(int fd, void *buffer, size_t size)
+{
+    unsigned char *cursor = buffer;
+
+    while (size > 0) {
+        ssize_t count = rb->read(fd, cursor, size);
+        if (count <= 0)
+            return false;
+        cursor += count;
+        size -= count;
+    }
+    return true;
+}
+
+static uint32_t macro_checksum(const unsigned char *data, size_t size)
+{
+    uint32_t checksum = 2166136261u;
+    size_t i;
+
+    for (i = 0; i < size; i++) {
+        checksum ^= data[i];
+        checksum *= 16777619u;
+    }
+    return checksum;
+}
+
+static uint16_t macro_tool_storage_id(unsigned char tool)
+{
+    if (tool >= TOOL_COUNT)
+        return 0;
+    return macro_tool_storage_ids[tool];
+}
+
+static bool macro_tool_from_storage_id(uint16_t stored,
+                                       unsigned char *tool)
+{
+    int candidate;
+
+    for (candidate = 0; candidate < TOOL_COUNT; candidate++) {
+        if (macro_tool_storage_ids[candidate] == stored) {
+            *tool = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void reset_tool_macros(void)
+{
+    int slot;
+    int step;
+
+    rb->memset(tool_macros, 0, sizeof(tool_macros));
+    rb->strlcpy(tool_macros[0].name, "WORKFLOW A",
+                sizeof(tool_macros[0].name));
+    rb->strlcpy(tool_macros[1].name, "WORKFLOW B",
+                sizeof(tool_macros[1].name));
+    for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++)
+        for (step = 0; step < RBPREP_MACRO_STEPS; step++)
+            tool_macros[slot].steps[step].value = RBPREP_MACRO_CHOOSE;
+    macro_store_valid = true;
+    macro_dirty = false;
+}
+
+static bool macro_current_file_valid(const char *path)
+{
+    unsigned char data[RBPREP_MACRO_STORE_SIZE];
+    const unsigned char *cursor;
+    bool read_ok;
+    int size;
+    int slot;
+    int step;
+    int fd;
+
+    fd = rb->open(path, O_RDONLY);
+    if (fd < 0)
+        return false;
+    size = rb->filesize(fd);
+    read_ok = size == RBPREP_MACRO_STORE_SIZE &&
+              read_exact(fd, data, sizeof(data));
+    if (rb->close(fd) < 0)
+        read_ok = false;
+    if (!read_ok)
+        return false;
+    if (rb->memcmp(data, "RBM4", 4) ||
+        read_u16(data + 4) != RBPREP_MACRO_FORMAT ||
+        read_u16(data + 6) != RBPREP_MACRO_COUNT ||
+        read_u32(data + 8) != macro_checksum(data + 12,
+                                             sizeof(data) - 12))
+        return false;
+
+    cursor = data + 12;
+    for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++) {
+        int count;
+
+        cursor += RBPREP_MACRO_NAME;
+        count = *cursor++;
+        if (count > RBPREP_MACRO_STEPS)
+            return false;
+        for (step = 0; step < RBPREP_MACRO_STEPS; step++) {
+            unsigned char tool;
+
+            if (!macro_tool_from_storage_id(read_u16(cursor), &tool))
+                return false;
+            cursor += RBPREP_MACRO_STEP_SIZE;
+        }
+    }
+    return cursor == data + sizeof(data);
+}
+
+static bool macro_file_matches(const char *path,
+                               const unsigned char *expected, int size)
+{
+    unsigned char data[RBPREP_MACRO_STORE_SIZE];
+    int fd;
+    bool matches;
+
+    if (size != (int)sizeof(data))
+        return false;
+    fd = rb->open(path, O_RDONLY);
+    if (fd < 0)
+        return false;
+    matches = rb->filesize(fd) == size &&
+              read_exact(fd, data, size) &&
+              !rb->memcmp(data, expected, size);
+    if (rb->close(fd) < 0)
+        matches = false;
+    return matches;
+}
+
+static bool write_macro_store(const char *path, const char *temporary,
+                              const char *previous,
+                              const unsigned char *data, int size)
+{
+    bool current_exists;
+    bool current_valid;
+    bool moved_current = false;
+    int fd;
+
+    fd = rb->open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0)
+        goto failed;
+    if (rb->write(fd, data, size) != (ssize_t)size) {
+        rb->close(fd);
+        goto failed;
+    }
+    if (rb->close(fd) < 0 ||
+        !macro_file_matches(temporary, data, size) ||
+        !macro_current_file_valid(temporary))
+        goto failed;
+
+    current_exists = rb->file_exists(path);
+    current_valid = current_exists && macro_current_file_valid(path);
+    if (current_exists) {
+        if (current_valid) {
+            if (rb->file_exists(previous) && rb->remove(previous) < 0)
+                goto failed;
+            if (rb->rename(path, previous) < 0)
+                goto failed;
+            moved_current = true;
+        } else if (rb->remove(path) < 0) {
+            goto failed;
+        }
+    }
+
+    if (rb->rename(temporary, path) < 0) {
+        if (moved_current)
+            rb->rename(previous, path);
+        goto failed;
+    }
+    if (!macro_file_matches(path, data, size) ||
+        !macro_current_file_valid(path)) {
+        rb->remove(path);
+        if (moved_current)
+            rb->rename(previous, path);
+        goto failed;
+    }
+    return true;
+
+failed:
+    rb->remove(temporary);
+    return false;
+}
+
+static bool save_tool_macros(void)
+{
+    unsigned char data[RBPREP_MACRO_STORE_SIZE];
+    unsigned char *cursor = data + 12;
+    bool primary_ok;
+    bool recovery_ok;
+    int slot;
+    int step;
+
+    /* A caller may be retrying a failed operation at editor exit, USB
+       handoff, or plugin shutdown. Keep this set until the canonical file
+       has been reopened and byte-for-byte verified. */
+    macro_dirty = true;
+    rb->memset(data, 0, sizeof(data));
+    rb->memcpy(data, "RBM4", 4);
+    write_u16(data + 4, RBPREP_MACRO_FORMAT);
+    write_u16(data + 6, RBPREP_MACRO_COUNT);
+    for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++) {
+        rb->memcpy(cursor, tool_macros[slot].name, RBPREP_MACRO_NAME);
+        cursor += RBPREP_MACRO_NAME;
+        *cursor++ = MIN(tool_macros[slot].count, RBPREP_MACRO_STEPS);
+        for (step = 0; step < RBPREP_MACRO_STEPS; step++) {
+            write_u16(cursor, macro_tool_storage_id(
+                                  tool_macros[slot].steps[step].tool));
+            cursor[2] = tool_macros[slot].steps[step].flags;
+            cursor[3] = 0;
+            write_u32(cursor + 4, tool_macros[slot].steps[step].value);
+            cursor += RBPREP_MACRO_STEP_SIZE;
+        }
+    }
+    write_u32(data + 8, macro_checksum(data + 12, sizeof(data) - 12));
+    primary_ok = write_macro_store(RBPREP_MACRO_FILE,
+                                   RBPREP_MACRO_FILE_TMP,
+                                   RBPREP_MACRO_FILE_PREV,
+                                   data, sizeof(data));
+    recovery_ok = write_macro_store(RBPREP_MACRO_RECOVERY_FILE,
+                                    RBPREP_MACRO_RECOVERY_TMP,
+                                    RBPREP_MACRO_RECOVERY_PREV,
+                                    data, sizeof(data));
+
+    /* The original .rockbox store is canonical again. The root copy is a
+       redundant recovery generation, not a competing source of truth. */
+    macro_store_valid = primary_ok || recovery_ok;
+    macro_dirty = !macro_store_valid;
+    return macro_store_valid;
+}
+
+static bool decode_tool_macros(const unsigned char *data, int size,
+                               bool *current_format)
+{
+    const unsigned char *cursor;
+    int legacy_size = 12 + RBPREP_MACRO_COUNT *
+                      (RBPREP_MACRO_NAME + 1 + RBPREP_MACRO_STEPS);
+    int legacy_value_size = 12 + RBPREP_MACRO_COUNT *
+                            (RBPREP_MACRO_NAME + 1 +
+                             RBPREP_MACRO_STEPS * 6);
+    int current_size = 12 + RBPREP_MACRO_COUNT *
+                       (RBPREP_MACRO_NAME + 1 +
+                        RBPREP_MACRO_STEPS * RBPREP_MACRO_STEP_SIZE);
+    bool legacy_v1;
+    bool legacy_v2;
+    bool legacy_v3;
+    bool current_v4;
+    int slot;
+    int step;
+
+    reset_tool_macros();
+    legacy_v1 = size == legacy_size && !rb->memcmp(data, "RBM1", 4) &&
+                read_u16(data + 4) == 1;
+    legacy_v2 = size == legacy_value_size &&
+                !rb->memcmp(data, "RBM2", 4) &&
+                read_u16(data + 4) == 2;
+    legacy_v3 = size == legacy_value_size &&
+                !rb->memcmp(data, "RBM3", 4) &&
+                read_u16(data + 4) == 3;
+    current_v4 = size == current_size && !rb->memcmp(data, "RBM4", 4) &&
+                 read_u16(data + 4) == RBPREP_MACRO_FORMAT;
+    if ((!legacy_v1 && !legacy_v2 && !legacy_v3 && !current_v4) ||
+        read_u16(data + 6) != RBPREP_MACRO_COUNT ||
+        read_u32(data + 8) != macro_checksum(data + 12,
+                                             size - 12)) {
+        goto invalid;
+    }
+    cursor = data + 12;
+    for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++) {
+        rb->memcpy(tool_macros[slot].name, cursor, RBPREP_MACRO_NAME);
+        tool_macros[slot].name[RBPREP_MACRO_NAME - 1] = '\0';
+        cursor += RBPREP_MACRO_NAME;
+        tool_macros[slot].count = MIN(*cursor++, RBPREP_MACRO_STEPS);
+        for (step = 0; step < RBPREP_MACRO_STEPS; step++) {
+            if (current_v4) {
+                if (!macro_tool_from_storage_id(read_u16(cursor),
+                        &tool_macros[slot].steps[step].tool)) {
+                    goto invalid;
+                }
+                tool_macros[slot].steps[step].flags = cursor[2] &
+                                                     RBPREP_MACRO_LOCK_WHEEL;
+                tool_macros[slot].steps[step].value =
+                    (int)read_u32(cursor + 4);
+                cursor += RBPREP_MACRO_STEP_SIZE;
+            } else {
+                tool_macros[slot].steps[step].tool = *cursor++;
+            }
+            if (legacy_v1) {
+                tool_macros[slot].steps[step].flags = 0;
+                tool_macros[slot].steps[step].value = RBPREP_MACRO_CHOOSE;
+            } else if (!current_v4) {
+                tool_macros[slot].steps[step].flags = *cursor++ &
+                                                     RBPREP_MACRO_LOCK_WHEEL;
+                tool_macros[slot].steps[step].value = (int)read_u32(cursor);
+                cursor += 4;
+            }
+        }
+        for (step = 0; step < RBPREP_MACRO_STEPS; step++) {
+            if (tool_macros[slot].steps[step].tool >= TOOL_COUNT &&
+                step < tool_macros[slot].count) {
+                goto invalid;
+            }
+            if (step >= tool_macros[slot].count &&
+                tool_macros[slot].steps[step].tool >= TOOL_COUNT) {
+                tool_macros[slot].steps[step].tool = TOOL_SEEK;
+                tool_macros[slot].steps[step].flags = 0;
+                tool_macros[slot].steps[step].value = RBPREP_MACRO_CHOOSE;
+            }
+        }
+    }
+    *current_format = current_v4;
+    macro_store_valid = true;
+    return true;
+
+invalid:
+    reset_tool_macros();
+    macro_store_valid = false;
+    return false;
+}
+
+static bool load_tool_macros(void)
+{
+    unsigned char data[RBPREP_MACRO_STORE_SIZE];
+    const char *stores[] = {
+        RBPREP_MACRO_FILE_TMP,
+        RBPREP_MACRO_FILE,
+        RBPREP_MACRO_FILE_PREV,
+        RBPREP_MACRO_RECOVERY_TMP,
+        RBPREP_MACRO_RECOVERY_FILE,
+        RBPREP_MACRO_RECOVERY_PREV
+    };
+    bool saw_store = false;
+    bool current_format = false;
+    int source;
+
+    reset_tool_macros();
+    for (source = 0; source < (int)ARRAYLEN(stores); source++) {
+        int fd = rb->open(stores[source], O_RDONLY);
+        int size;
+        bool read_ok;
+
+        if (fd < 0)
+            continue;
+        saw_store = true;
+        size = rb->filesize(fd);
+        read_ok = size >= 12 && size <= (int)sizeof(data) &&
+                  read_exact(fd, data, size);
+        rb->close(fd);
+        if (!read_ok ||
+            !decode_tool_macros(data, size, &current_format))
+            continue;
+
+        /* Recover an interrupted generation, migrate older formats, and
+           heal the redundant root copy when it differs from the canonical
+           store. This also converts the one-off root-store regression back
+           to the original known-good .rockbox location. */
+        if (source != 1 || !current_format ||
+            !macro_file_matches(RBPREP_MACRO_RECOVERY_FILE,
+                                data, size)) {
+            macro_dirty = true;
+            if (!save_tool_macros())
+                macro_store_valid = false;
+        } else {
+            macro_dirty = false;
+        }
+        return macro_store_valid;
+    }
+
+    reset_tool_macros();
+    macro_store_valid = !saw_store;
+    return !saw_store;
+}
+
+static void restore_saved_macro_selection(void)
+{
+    int slot;
+
+    if (macro_active >= 0 && macro_active < RBPREP_MACRO_COUNT &&
+        tool_macros[macro_active].count > 0)
+        return;
+    macro_active = -1;
+    macro_position = 0;
+    for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++) {
+        if (tool_macros[slot].count > 0) {
+            macro_active = slot;
+            break;
+        }
+    }
+}
+
+static int macro_link_for(uint32_t playlist_id)
+{
+    int i;
+    for (i = 0; i < macro_link_count; i++)
+        if (macro_links[i].playlist_id == playlist_id)
+            return macro_links[i].slot;
+    return -1;
+}
+
+static bool save_macro_links(void)
+{
+    unsigned char data[12 + RBPREP_MACRO_LINKS * 5];
+    int size = 12 + macro_link_count * 5;
+    int i;
+    int fd;
+
+    rb->memset(data, 0, sizeof(data));
+    rb->memcpy(data, "RBML", 4);
+    write_u16(data + 4, 1);
+    write_u16(data + 6, macro_link_count);
+    for (i = 0; i < macro_link_count; i++) {
+        write_u32(data + 12 + i * 5, macro_links[i].playlist_id);
+        data[16 + i * 5] = macro_links[i].slot;
+    }
+    write_u32(data + 8, macro_checksum(data + 12, size - 12));
+    fd = rb->open(RBPREP_MACRO_LINK_TMP,
+                  O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0)
+        return false;
+    if (rb->write(fd, data, size) != size) {
+        rb->close(fd);
+        rb->remove(RBPREP_MACRO_LINK_TMP);
+        return false;
+    }
+    rb->close(fd);
+    rb->remove(RBPREP_MACRO_LINK_FILE);
+    if (rb->rename(RBPREP_MACRO_LINK_TMP, RBPREP_MACRO_LINK_FILE) < 0) {
+        rb->remove(RBPREP_MACRO_LINK_TMP);
+        return false;
+    }
+    return true;
+}
+
+static void load_macro_links(void)
+{
+    unsigned char data[12 + RBPREP_MACRO_LINKS * 5];
+    int fd;
+    int size;
+    int count;
+    int i;
+    bool migrate = false;
+
+    macro_link_count = 0;
+    fd = rb->open(RBPREP_MACRO_LINK_FILE, O_RDONLY);
+    if (fd < 0) {
+        fd = rb->open(RBPREP_MACRO_LINK_LEGACY, O_RDONLY);
+        migrate = fd >= 0;
+    }
+    if (fd < 0)
+        return;
+    size = rb->filesize(fd);
+    if (size < 12 || size > (int)sizeof(data) ||
+        rb->read(fd, data, size) != size) {
+        rb->close(fd);
+        return;
+    }
+    rb->close(fd);
+    count = read_u16(data + 6);
+    if (rb->memcmp(data, "RBML", 4) || read_u16(data + 4) != 1 ||
+        count > RBPREP_MACRO_LINKS || size != 12 + count * 5 ||
+        read_u32(data + 8) != macro_checksum(data + 12, size - 12))
+        return;
+    for (i = 0; i < count; i++) {
+        int slot = data[16 + i * 5];
+        uint32_t playlist_id = read_u32(data + 12 + i * 5);
+        if (!playlist_id || slot >= RBPREP_MACRO_COUNT)
+            continue;
+        macro_links[macro_link_count].playlist_id = playlist_id;
+        macro_links[macro_link_count].slot = slot;
+        macro_link_count++;
+    }
+    if (migrate)
+        save_macro_links();
+}
+
+static bool cycle_macro_link(uint32_t playlist_id)
+{
+    int i;
+
+    for (i = 0; i < macro_link_count; i++) {
+        if (macro_links[i].playlist_id != playlist_id)
+            continue;
+        if (macro_links[i].slot + 1 < RBPREP_MACRO_COUNT) {
+            macro_links[i].slot++;
+        } else {
+            for (; i + 1 < macro_link_count; i++)
+                macro_links[i] = macro_links[i + 1];
+            macro_link_count--;
+        }
+        return save_macro_links();
+    }
+    if (macro_link_count >= RBPREP_MACRO_LINKS)
+        return false;
+    macro_links[macro_link_count].playlist_id = playlist_id;
+    macro_links[macro_link_count].slot = 0;
+    macro_link_count++;
+    return save_macro_links();
+}
+
+static bool playlist_has_smart_query(uint32_t playlist_id)
+{
+    int i;
+    for (i = 0; i < smart_query_count; i++)
+        if (smart_query_ids[i] == playlist_id)
+            return true;
+    return false;
+}
+
+static void load_smart_query_flags(void)
+{
+    char line[192];
+    int fd;
+
+    smart_query_count = 0;
+    fd = rb->open(RBPREP_SMART_QUERY_FILE, O_RDONLY);
+    if (fd < 0)
+        return;
+    if (rb->read_line(fd, line, sizeof(line)) <= 0 ||
+        rb->strcmp(line, "RBQ1")) {
+        rb->close(fd);
+        return;
+    }
+    while (smart_query_count < RBPREP_SMART_QUERIES &&
+           rb->read_line(fd, line, sizeof(line)) > 0) {
+        char *separator = rb->strchr(line, '\t');
+        uint32_t playlist_id;
+        if (!separator)
+            continue;
+        *separator = '\0';
+        playlist_id = rb->strtoul(line, NULL, 10);
+        if (playlist_id)
+            smart_query_ids[smart_query_count++] = playlist_id;
+    }
+    rb->close(fd);
 }
 
 static bool read_index_at(uint32_t offset, void *data, size_t size)
@@ -771,11 +1936,13 @@ static bool read_track_record(int index, struct rbprep_track_record *track)
     }
     if (library_index_version >= 3) {
         track->year = read_u16(data + 28);
+        track->import_date = read_u16(data + 30);
         track->comments_offset = read_u32(data + 32);
         track->tags_offset = read_u32(data + 36);
         track->search_offset = read_u32(data + 40);
     } else {
         track->year = 0;
+        track->import_date = 0;
         track->comments_offset = 0;
         track->tags_offset = 0;
         track->search_offset = 0;
@@ -797,6 +1964,8 @@ static bool read_node_record(int index, struct rbprep_node_record *node)
     node->member_count = read_u32(data + 12);
     node->kind = data[16];
     node->source_id = library_index_version >= 2 ? read_u32(data + 20) : 0;
+    if (node->kind != 0 && playlist_has_smart_query(node->source_id))
+        node->kind = 2;
     return true;
 }
 
@@ -971,6 +2140,40 @@ static int child_node_at(uint32_t parent, int ordinal,
     return -1;
 }
 
+static void invalidate_playlist_cache(void)
+{
+    int row;
+
+    for (row = 0; row < RBPREP_LIST_ROWS; row++)
+        playlist_cache[row].valid = false;
+}
+
+static bool cached_playlist_node(int ordinal,
+                                 struct rbprep_playlist_cache_row **result)
+{
+    int slot;
+    struct rbprep_playlist_cache_row *cached;
+
+    if (ordinal < 0 || ordinal >= tree_child_count)
+        return false;
+    slot = ordinal % RBPREP_LIST_ROWS;
+    cached = &playlist_cache[slot];
+    if (!cached->valid || cached->parent != tree_parent ||
+        cached->ordinal != ordinal) {
+        cached->valid = false;
+        cached->parent = tree_parent;
+        cached->ordinal = ordinal;
+        cached->node_index = tree_children[ordinal];
+        if (!read_node_record(cached->node_index, &cached->node) ||
+            !read_index_string(cached->node.name_offset, cached->name,
+                               sizeof(cached->name)))
+            return false;
+        cached->valid = true;
+    }
+    *result = cached;
+    return true;
+}
+
 static void refresh_tree_children(uint32_t parent)
 {
     int index;
@@ -978,12 +2181,17 @@ static void refresh_tree_children(uint32_t parent)
 
     tree_parent = parent;
     tree_child_count = 0;
+    tree_parent_name[0] = '\0';
+    invalidate_playlist_cache();
     for (index = 0; (uint32_t)index < library_node_count; index++) {
         if (!read_node_record(index, &node))
             break;
         if (node.parent == parent && tree_child_count < RBPREP_TREE_NODES)
             tree_children[tree_child_count++] = index;
     }
+    if (parent != RBPREP_ROOT_NODE && read_node_record(parent, &node))
+        read_index_string(node.name_offset, tree_parent_name,
+                          sizeof(tree_parent_name));
 }
 
 static int collection_sorted_index_at(int row)
@@ -1010,7 +2218,7 @@ static int track_index_at_row(int row)
     struct rbprep_node_record node;
 
     if (active_playlist_node < 0) {
-        if (search_active)
+        if (collection_shuffle_active || search_active)
             return row >= 0 && row < search_result_count
                  ? (int)search_results[row] : -1;
         return collection_sorted_index_at(row);
@@ -1082,6 +2290,7 @@ static void rebuild_search_results(void)
 {
     int row;
 
+    collection_shuffle_active = false;
     search_active = track_search[0] != '\0';
     search_result_count = 0;
     if (!search_active) {
@@ -1114,12 +2323,65 @@ static int find_track_index_by_id(uint32_t track_id)
     return -1;
 }
 
+static int date_ordinal(int year, int month, int day)
+{
+    if (month <= 2) {
+        year--;
+        month += 12;
+    }
+    return year * 365 + year / 4 - year / 100 + year / 400 +
+           (153 * (month - 3) + 2) / 5 + day - 1;
+}
+
+static void refresh_recent_track_count(void)
+{
+    struct tm *now = rb->get_time();
+    int today;
+    int cutoff;
+    int index;
+
+    recent_tracks_30d = 0;
+    if (!now || library_fd < 0)
+        return;
+    today = date_ordinal(now->tm_year + 1900, now->tm_mon + 1,
+                         now->tm_mday);
+    cutoff = today - 29;
+    for (index = 0; (uint32_t)index < library_track_count; index++) {
+        struct rbprep_track_record track;
+        int year;
+        int month;
+        int day;
+        int ordinal;
+
+        if (!read_track_record(index, &track) || !track.import_date)
+            continue;
+        year = 1980 + (track.import_date >> 9);
+        month = (track.import_date >> 5) & 15;
+        day = track.import_date & 31;
+        if (month < 1 || month > 12 || day < 1 || day > 31)
+            continue;
+        ordinal = date_ordinal(year, month, day);
+        if (ordinal >= cutoff && ordinal <= today)
+            recent_tracks_30d++;
+    }
+    recent_tracks_ready = true;
+}
+
 static bool open_library_index(void)
 {
     unsigned char header[RBPREP_INDEX_HEADER];
+    uint64_t track_end;
+    uint64_t node_end;
+    uint64_t member_end;
+    uint64_t string_end;
+    uint64_t previous_end;
+    off_t file_size;
     int version;
     int header_size;
+    int i;
 
+    if (library_fd >= 0)
+        rb->close(library_fd);
     library_fd = rb->open(RBPREP_INDEX, O_RDONLY);
     version = 0;
     if (library_fd < 0 ||
@@ -1133,14 +2395,13 @@ static bool open_library_index(void)
         return false;
     }
     header_size = read_u16(header + 6);
-    if (version >= 3 &&
+    file_size = rb->filesize(library_fd);
+    if (file_size < 0 || header_size < 40 || header_size > file_size ||
+        (version >= 3 &&
         (header_size < RBPREP_INDEX_HEADER ||
          rb->read(library_fd, header + 40,
-                  RBPREP_INDEX_HEADER - 40) != RBPREP_INDEX_HEADER - 40)) {
-        rb->close(library_fd);
-        library_fd = -1;
-        return false;
-    }
+                  RBPREP_INDEX_HEADER - 40) != RBPREP_INDEX_HEADER - 40)))
+        goto invalid;
     library_index_version = version;
     library_track_record_size = version >= 3 ? RBPREP_TRACK_RECORD
                               : version >= 2 ? RBPREP_TRACK_RECORD_V2
@@ -1155,6 +2416,7 @@ static bool open_library_index(void)
     library_node_offset = read_u32(header + 24);
     library_member_offset = read_u32(header + 28);
     library_string_offset = read_u32(header + 32);
+    library_string_size = read_u32(header + 36);
     library_sort_offsets[TRACK_SORT_TITLE] = 0;
     library_sort_offsets[TRACK_SORT_BPM] = version >= 3
                                           ? read_u32(header + 40) : 0;
@@ -1166,8 +2428,54 @@ static bool open_library_index(void)
                                                ? read_u32(header + 52) : 0;
     library_sort_offsets[TRACK_SORT_TAGS] = version >= 3
                                            ? read_u32(header + 56) : 0;
+    library_sort_offsets[TRACK_SORT_IMPORTED] = version >= 3
+                                               ? read_u32(header + 60) : 0;
+
+    track_end = (uint64_t)library_track_offset +
+                (uint64_t)library_track_count * library_track_record_size;
+    node_end = (uint64_t)library_node_offset +
+               (uint64_t)library_node_count * library_node_record_size;
+    member_end = (uint64_t)library_member_offset +
+                 (uint64_t)library_member_count * 4;
+    string_end = (uint64_t)library_string_offset + library_string_size;
+    if (library_track_offset < (uint32_t)header_size ||
+        library_node_offset < track_end ||
+        library_member_offset < node_end ||
+        string_end > (uint64_t)file_size)
+        goto invalid;
+    previous_end = member_end;
+    if (version >= 3) {
+        for (i = TRACK_SORT_BPM; i < TRACK_SORT_COUNT; i++) {
+            uint64_t sort_end = (uint64_t)library_sort_offsets[i] +
+                                (uint64_t)library_track_count * 4;
+            /* RBI3 originally reserved its final header word. Accept those
+               older indexes without Import Date and fall back to title order
+               until the compact collection index is refreshed. */
+            if (library_sort_offsets[i] == 0)
+                continue;
+            if (library_sort_offsets[i] < previous_end ||
+                sort_end > library_string_offset)
+                goto invalid;
+            previous_end = sort_end;
+        }
+    }
+    if (library_string_offset < previous_end)
+        goto invalid;
     refresh_tree_children(RBPREP_ROOT_NODE);
+    if (!recent_tracks_ready)
+        refresh_recent_track_count();
     return true;
+
+invalid:
+    rb->close(library_fd);
+    library_fd = -1;
+    library_index_version = 0;
+    library_track_count = library_node_count = library_member_count = 0;
+    recent_tracks_30d = 0;
+    recent_tracks_ready = false;
+    library_track_offset = library_node_offset = library_member_offset = 0;
+    library_string_offset = library_string_size = 0;
+    return false;
 }
 
 static int clamp_playhead(int value)
@@ -1175,11 +2483,45 @@ static int clamp_playhead(int value)
     return MAX(0, MIN(track_length, value));
 }
 
+/* Whole-BPM timing is table driven so the timecode path never has to divide
+   by a changing tempo at frame rate. Fractional BPMs interpolate adjacent
+   entries; exact imported beat markers remain authoritative. */
+static const uint16_t beat_period_lut[231] = {
+    3000,2857,2727,2609,2500,2400,2308,2222,2143,2069,2000,1935,1875,
+    1818,1765,1714,1667,1622,1579,1538,1500,1463,1429,1395,1364,1333,
+    1304,1277,1250,1224,1200,1176,1154,1132,1111,1091,1071,1053,1034,
+    1017,1000,984,968,952,938,923,909,896,882,870,857,845,833,822,811,
+    800,789,779,769,759,750,741,732,723,714,706,698,690,682,674,667,
+    659,652,645,638,632,625,619,612,606,600,594,588,583,577,571,566,
+    561,556,550,545,541,536,531,526,522,517,513,508,504,500,496,492,
+    488,484,480,476,472,469,465,462,458,455,451,448,444,441,438,435,
+    432,429,426,423,420,417,414,411,408,405,403,400,397,395,392,390,
+    387,385,382,380,377,375,373,370,368,366,364,361,359,357,355,353,
+    351,349,347,345,343,341,339,337,335,333,331,330,328,326,324,323,
+    321,319,317,316,314,312,311,309,308,306,305,303,302,300,299,297,
+    296,294,293,291,290,288,287,286,284,283,282,280,279,278,276,275,
+    274,273,271,270,269,268,267,265,264,263,262,261,260,259,258,256,
+    255,254,253,252,251,250,249,248,247,246,245,244,243,242,241,240
+};
+
 static int beat_period_ms(void)
 {
+    int whole;
+    int fraction;
+    int first;
+    int second;
+
     if (grid_bpm_x100 <= 0)
         return 500;
-    return MAX(1, 6000000 / grid_bpm_x100);
+    if (grid_bpm_x100 < 2000 || grid_bpm_x100 > 25000)
+        return MAX(1, 6000000 / grid_bpm_x100);
+    whole = grid_bpm_x100 / 100;
+    fraction = grid_bpm_x100 % 100;
+    first = beat_period_lut[whole - 20];
+    if (!fraction || whole >= 250)
+        return first;
+    second = beat_period_lut[whole - 19];
+    return MAX(1, (first * (100 - fraction) + second * fraction + 50) / 100);
 }
 
 static int adjusted_beat_number(int index)
@@ -1251,9 +2593,8 @@ static int quantized_time(int time_ms)
     if (!quantize)
         return clamp_playhead(time_ms);
 
-    /* DJ cue quantize floors to the beat currently under the playhead.
-       It must never pull a late-in-beat cue forward into the next beat. */
-    index = current_beat_index(time_ms);
+    /* Cue and loop placement follows the nearest imported grid marker. */
+    index = nearest_beat_index(time_ms);
     if (index >= 0)
         return clamp_playhead(adjusted_beat_time(index));
 
@@ -1261,10 +2602,20 @@ static int quantized_time(int time_ms)
     base = grid_phase_ms + grid_offset;
     delta = (long long)time_ms - base;
     if (delta >= 0)
-        beat = delta / period;
+        beat = (delta + period / 2) / period;
     else
-        beat = (delta - period + 1) / period;
+        beat = (delta - period / 2) / period;
     return clamp_playhead(base + beat * period);
+}
+
+static int cue_slot_for_delete(int preferred)
+{
+    /* Delete is deliberately slot-exact.  Falling back to the cue nearest
+       the playhead made an empty, newly-advanced slot silently target the
+       most recently dropped cue instead of the slot shown in the HUD. */
+    if (preferred >= 0 && preferred < 16 && hotcues[preferred] >= 0)
+        return preferred;
+    return -1;
 }
 
 static int scrub_step_ms(void)
@@ -1316,8 +2667,12 @@ static void viewport(int *first, int *span)
     }
 
     *span = MAX(1, waveform_points / zoom);
+    /* Stretch the fixed analysis cache across Rockbox's authoritative track
+       duration. Codec/container padding can differ from Rekordbox's sample
+       count; using the cache duration here made drift accumulate until the
+       waveform reached its end early and appeared frozen. */
     center = (long long)playhead * waveform_points /
-             MAX(1, waveform_duration_ms);
+             MAX(1, track_length);
     *first = zoom == 1 ? 0 : center - *span / 2;
 }
 
@@ -1328,7 +2683,7 @@ static int time_to_x(int time_ms, int first, int span)
     if (waveform_points <= 0 || track_length <= 0)
         return -1;
     sample = (long long)time_ms * waveform_points /
-             MAX(1, waveform_duration_ms);
+             MAX(1, track_length);
     return RBPREP_DECK_X +
            (sample - first) * RBPREP_DECK_WIDTH / span;
 }
@@ -1346,22 +2701,32 @@ static void draw_beatgrid(int first, int span)
     if (waveform_points <= 0)
         return;
 
-    view_start = MAX(0, (long long)first * waveform_duration_ms /
+    view_start = MAX(0, (long long)first * track_length /
                         waveform_points);
     view_end = MIN(track_length,
-                   (long long)(first + span) * waveform_duration_ms /
+                   (long long)(first + span) * track_length /
                    waveform_points);
     pixels_per_beat = (long long)period * RBPREP_DECK_WIDTH /
                       MAX(1, view_end - view_start);
 
     if (beat_count > 0) {
-        for (i = 0; i < beat_count; i++) {
+        int low = 0;
+        int high = beat_count;
+
+        /* Imported beat times are monotonic. Start at the first visible beat
+           instead of rescanning the song from beat zero on every frame. */
+        while (low < high) {
+            int middle = low + (high - low) / 2;
+            if (adjusted_beat_time(middle) < view_start)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        for (i = low; i < beat_count; i++) {
             int time_ms = adjusted_beat_time(i);
             int number = adjusted_beat_number(i);
             int x;
 
-            if (time_ms < view_start)
-                continue;
             if (time_ms > view_end)
                 break;
             if (pixels_per_beat < 3 && number != 1)
@@ -1386,11 +2751,15 @@ static void draw_beatgrid(int first, int span)
         stride = 4;
     if (pixels_per_beat * 4 < 3)
         stride = 16;
-    for (i = 0; base + i * period <= view_end; i += stride) {
+    i = 0;
+    if (view_start > base)
+        i = (view_start - base + period - 1) / period;
+    if (i % stride)
+        i += stride - i % stride;
+    for (; (long long)base + (long long)i * period <= view_end;
+         i += stride) {
         int time_ms = base + i * period;
         int x;
-        if (time_ms < view_start)
-            continue;
         x = time_to_x(time_ms, first, span);
         if (x >= RBPREP_DECK_X &&
             x < RBPREP_DECK_X + RBPREP_DECK_WIDTH) {
@@ -1405,11 +2774,9 @@ static void draw_beatgrid(int first, int span)
 static void draw_cues(int first, int span)
 {
     int i;
-    char label[3];
 
     for (i = 0; i < 16; i++) {
         int x;
-        int box_x;
         int box_y;
         int color;
 
@@ -1421,16 +2788,19 @@ static void draw_cues(int first, int span)
             continue;
 
         color = cue_palette[hotcue_colors[i] & 7];
-        box_x = MAX(RBPREP_DECK_X,
-                    MIN(RBPREP_DECK_X + RBPREP_DECK_WIDTH - 11, x - 5));
-        box_y = RBPREP_WAVE_TOP + 3 + (i & 1) * 12;
-        rb->lcd_set_foreground(color);
-        rb->lcd_fillrect(box_x, box_y, 11, 11);
-        /* The stem is registered to the cue's exact time, at box center. */
-        rb->lcd_vline(x, box_y + 10, RBPREP_WAVE_BOTTOM);
+        box_y = RBPREP_WAVE_TOP + 3 + (i & 1) * 9;
+        /* Key the exact-position line out from the RGB waveform before
+           laying the cue color over it. */
         rb->lcd_set_foreground(LCD_BLACK);
-        rb->snprintf(label, sizeof(label), "%X", i + 1);
-        rb->lcd_putsxy(box_x + 2, box_y + 1, label);
+        if (x > RBPREP_DECK_X)
+            rb->lcd_vline(x - 1, box_y + 5, RBPREP_WAVE_BOTTOM);
+        if (x + 1 < RBPREP_DECK_X + RBPREP_DECK_WIDTH)
+            rb->lcd_vline(x + 1, box_y + 5, RBPREP_WAVE_BOTTOM);
+        /* The colored body remains five pixels wide; its dark keyline and
+           black three-pixel glyph preserve the number on bright peaks. */
+        draw_micro_cue_marker(x, box_y, i, color);
+        rb->lcd_set_foreground(color);
+        rb->lcd_vline(x, box_y + 5, RBPREP_WAVE_BOTTOM);
     }
 }
 
@@ -1633,7 +3003,7 @@ static void update_bass_pitch(int frames)
     }
 }
 
-static void update_spectrum_levels(void)
+static void update_spectrum_levels(bool need_pitch)
 {
     static const int32_t coefficients_44100[RBPREP_SPECTRUM_BANDS] = {
         2097109, 2097068, 2096980, 2096819, 2096462, 2095822,
@@ -1655,6 +3025,9 @@ static void update_spectrum_levels(void)
     int band;
     int bass_raw;
 
+    if (TIME_BEFORE(*rb->current_tick, spectrum_deadline))
+        return;
+    spectrum_deadline = *rb->current_tick + RBPREP_SPECTRUM_TICKS;
     generation = pcm_capture_generation;
     if (generation == spectrum_generation) {
         if (!(rb->audio_status() & AUDIO_STATUS_PLAY) ||
@@ -1686,8 +3059,10 @@ static void update_spectrum_levels(void)
                       (int)pcm_snapshot[i * 2 + 1]) >> 1;
         /* About a 110 Hz one-pole low pass at 44.1 kHz keeps the pitch
            detector focused on the woofer range instead of upper harmonics. */
-        bass_filter_state += (sample - bass_filter_state) / 64;
-        pcm_pitch[i] = bass_filter_state >> 4;
+        if (need_pitch) {
+            bass_filter_state += (sample - bass_filter_state) / 64;
+            pcm_pitch[i] = bass_filter_state >> 4;
+        }
         pcm_mono[i] = (sample * weight / MAX(1, frames / 2)) >> 8;
     }
     coefficients = pcm_sample_rate >= 46000
@@ -1727,7 +3102,8 @@ static void update_spectrum_levels(void)
     else
         spectrum_bass_hit = spectrum_bass_hit * 3 / 4;
     spectrum_bass = (spectrum_bass * 3 + bass_raw) / 4;
-    update_bass_pitch(frames);
+    if (need_pitch)
+        update_bass_pitch(frames);
 }
 
 static void draw_boombox(void)
@@ -1939,13 +3315,23 @@ static void draw_turntable(void)
     xlcd_drawcircle(cx, cy, 27);
     xlcd_drawcircle(cx, cy, 18);
 
-    /* Platter strobe dots rotate at the selected played RPM. */
+    lamp_phase = (long long)*rb->current_tick *
+                 target_rpm_x100[played_rpm_index] * 8 /
+                 (HZ * 6000);
+
+    /* Platter strobe dots rotate at the selected played RPM. The physical
+       arc under the red target lamp is illuminated like a real SL-1200. */
     for (point = 0; point < 24; point++) {
         int angle = (point * 64 / 24 + phase) & 63;
         int x = cx + cosine[angle] * 65 / 256;
         int y = cy + sine[angle] * 65 / 256;
+        bool lamp_arc = angle >= 54 && angle <= 62;
 
-        rb->lcd_set_foreground((point + (phase >> 1)) % 6 == 0
+        rb->lcd_set_foreground(lamp_arc
+                               ? ((lamp_phase & 1)
+                                  ? LCD_RGBPACK(255, 48, 36)
+                                  : LCD_RGBPACK(130, 12, 9))
+                               : (point + (phase >> 1)) % 6 == 0
                                ? LCD_WHITE : LCD_RGBPACK(48, 66, 55));
         if ((point + phase) % 6 == 0)
             xlcd_fillcircle(x, y, 1);
@@ -1979,8 +3365,11 @@ static void draw_turntable(void)
         previous_y = y;
     }
 
-    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_set_foreground(LCD_RGBPACK(112, 116, 113));
     xlcd_fillcircle(cx, cy, 13);
+    rb->lcd_set_foreground(LCD_RGBPACK(37, 40, 38));
+    xlcd_drawcircle(cx, cy, 13);
+    xlcd_drawcircle(cx, cy, 9);
 
     /* Cue flags are record-relative: their timeline position chooses a groove
        angle and the platter phase rotates the whole cue map. */
@@ -2040,30 +3429,71 @@ static void draw_turntable(void)
     rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
     xlcd_fillcircle(arm_mid1_x, arm_mid1_y, 1);
     xlcd_fillcircle(arm_mid2_x, arm_mid2_y, 1);
+    /* Black keyline around the headshell and diamond keeps the pickup
+       readable where it crosses a bright waveform or cue flag. */
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_drawline(stylus_x - 3, stylus_y - 2,
+                     stylus_x + 3, stylus_y + 2);
+    rb->lcd_drawline(stylus_x - 3, stylus_y - 1,
+                     stylus_x + 3, stylus_y + 3);
+    rb->lcd_drawline(stylus_x - 1, stylus_y + 2,
+                     stylus_x, stylus_y + 5);
+    rb->lcd_set_foreground(LCD_RGBPACK(205, 211, 207));
     rb->lcd_drawline(stylus_x - 2, stylus_y - 1,
                      stylus_x + 2, stylus_y + 2);
-    rb->lcd_drawpixel(stylus_x, stylus_y + 3);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_drawpixel(stylus_x, stylus_y + 4);
     rb->lcd_set_foreground(LCD_RGBPACK(115, 124, 119));
     xlcd_fillcircle(192, RBPREP_WAVE_TOP + 30, 10);
     rb->lcd_set_foreground(LCD_BLACK);
     xlcd_fillcircle(192, RBPREP_WAVE_TOP + 30, 4);
-    rb->lcd_set_foreground(LCD_RGBPACK(115, 124, 119));
-    rb->lcd_drawline(198, RBPREP_WAVE_TOP + 22,
-                     209, RBPREP_WAVE_TOP + 10);
-    rb->lcd_fillrect(205, RBPREP_WAVE_TOP + 7, 11, 7);
+    /* Rear arm stub and a shaded, banded cylindrical counterweight. */
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_drawline(197, RBPREP_WAVE_TOP + 23,
+                     207, RBPREP_WAVE_TOP + 13);
+    rb->lcd_drawline(198, RBPREP_WAVE_TOP + 24,
+                     208, RBPREP_WAVE_TOP + 14);
+    rb->lcd_set_foreground(LCD_RGBPACK(168, 176, 171));
+    rb->lcd_drawline(198, RBPREP_WAVE_TOP + 23,
+                     208, RBPREP_WAVE_TOP + 13);
+    rb->lcd_set_foreground(LCD_BLACK);
+    xlcd_fillcircle(209, RBPREP_WAVE_TOP + 11, 6);
+    xlcd_fillcircle(213, RBPREP_WAVE_TOP + 7, 5);
+    rb->lcd_drawline(204, RBPREP_WAVE_TOP + 14,
+                     215, RBPREP_WAVE_TOP + 3);
+    rb->lcd_drawline(206, RBPREP_WAVE_TOP + 16,
+                     217, RBPREP_WAVE_TOP + 5);
+    rb->lcd_set_foreground(LCD_RGBPACK(92, 99, 95));
+    xlcd_fillcircle(209, RBPREP_WAVE_TOP + 11, 4);
+    xlcd_fillcircle(213, RBPREP_WAVE_TOP + 7, 3);
+    rb->lcd_drawline(206, RBPREP_WAVE_TOP + 14,
+                     215, RBPREP_WAVE_TOP + 5);
+    rb->lcd_drawline(207, RBPREP_WAVE_TOP + 15,
+                     216, RBPREP_WAVE_TOP + 6);
+    rb->lcd_set_foreground(LCD_RGBPACK(185, 192, 188));
+    rb->lcd_drawline(206, RBPREP_WAVE_TOP + 11,
+                     212, RBPREP_WAVE_TOP + 5);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_drawline(211, RBPREP_WAVE_TOP + 12,
+                     216, RBPREP_WAVE_TOP + 7);
 
-    lamp_phase = (long long)*rb->current_tick *
-                 target_rpm_x100[played_rpm_index] * 8 /
-                 (HZ * 6000);
+    /* Angled target lamp housing and beam point directly at the red strobe
+       section instead of floating vertically beside the platter. */
+    rb->lcd_set_foreground(LCD_RGBPACK(82, 88, 84));
+    rb->lcd_drawline(166, RBPREP_WAVE_TOP + 8,
+                     141, RBPREP_WAVE_TOP + 29);
+    rb->lcd_drawline(166, RBPREP_WAVE_TOP + 9,
+                     141, RBPREP_WAVE_TOP + 30);
     rb->lcd_set_foreground((rb->audio_status() & AUDIO_STATUS_PLAY) &&
                            !(rb->audio_status() & AUDIO_STATUS_PAUSE)
                            ? ((lamp_phase & 1) ? LCD_RGBPACK(255, 60, 45)
                                                : LCD_RGBPACK(120, 12, 8))
                            : LCD_RGBPACK(45, 9, 7));
-    rb->lcd_vline(164, RBPREP_WAVE_TOP + 7, RBPREP_WAVE_TOP + 19);
-    xlcd_fillcircle(164, RBPREP_WAVE_TOP + 20, 3);
+    xlcd_fillcircle(140, RBPREP_WAVE_TOP + 30, 3);
+    rb->lcd_drawline(138, RBPREP_WAVE_TOP + 32,
+                     130, RBPREP_WAVE_TOP + 39);
     if (lamp_phase & 1)
-        xlcd_drawcircle(164, RBPREP_WAVE_TOP + 20, 5);
+        xlcd_drawcircle(140, RBPREP_WAVE_TOP + 30, 5);
 
     /* Compact transport in clear chassis space below-left of the platter. */
     {
@@ -2100,37 +3530,62 @@ static void draw_turntable(void)
              selected ? LCD_BLACK : LCD_RGBPACK(145, 158, 149));
     }
 
-    /* The pitch-bend tool owns this fader; the white tick is exact zero. */
-    rb->lcd_set_foreground(LCD_RGBPACK(65, 75, 69));
-    rb->lcd_vline(288, RBPREP_WAVE_TOP + 31, RBPREP_WAVE_BOTTOM - 18);
-    rb->lcd_hline(284, 292, RBPREP_WAVE_TOP + 75);
-    rb->lcd_set_foreground(LCD_WHITE);
-    rb->lcd_hline(282, 294, RBPREP_WAVE_TOP + 75);
-    pitch_slider_y = RBPREP_WAVE_TOP + 75 -
-                     pitch_bend_x100 * 42 / 1600;
-    rb->lcd_set_foreground(RBPREP_GREEN);
-    rb->lcd_fillrect(282, pitch_slider_y - 2, 13, 5);
+    /* Put the pitch fader immediately beside and below the tonearm base, as on
+       a real SL-1200.  The zero detent remains geometrically exact. */
+    {
+        int fader_x = 198;
+        int fader_top = RBPREP_WAVE_TOP + 51;
+        int fader_bottom = RBPREP_WAVE_BOTTOM - 18;
+        int fader_center = (fader_top + fader_bottom) / 2;
+        int fader_travel = MAX(1, (fader_bottom - fader_top) / 2 - 2);
+        int tick;
 
-    /* Keep the readout to the right of the tonearm's entire sweep. */
-    text(218, RBPREP_WAVE_TOP + 7, "QUARTZ DD", RBPREP_GREEN);
-    rb->snprintf(line, sizeof(line), "%s>%s RPM",
+        text(fader_x + 7, fader_top - 13, "+", LCD_RGBPACK(105, 118, 110));
+        text(fader_x + 7, fader_bottom - 5, "-", LCD_RGBPACK(105, 118, 110));
+        rb->lcd_set_foreground(LCD_RGBPACK(32, 38, 34));
+        rb->lcd_fillrect(fader_x - 4, fader_top - 2, 9,
+                         fader_bottom - fader_top + 5);
+        rb->lcd_set_foreground(LCD_RGBPACK(100, 111, 104));
+        rb->lcd_vline(fader_x, fader_top, fader_bottom);
+        for (tick = fader_top; tick <= fader_bottom; tick += 8)
+            rb->lcd_hline(fader_x - 3, fader_x + 3, tick);
+        rb->lcd_hline(fader_x - 6, fader_x + 6, fader_center);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_hline(fader_x - 7, fader_x + 7, fader_center);
+        pitch_slider_y = fader_center -
+                         pitch_bend_x100 * fader_travel / 1600;
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        rb->lcd_fillrect(fader_x - 7, pitch_slider_y - 2, 15, 5);
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_hline(fader_x - 5, fader_x + 5, pitch_slider_y);
+    }
+
+    /* Metrics live in a discrete instrument box instead of floating around
+       the arm and platter controls. */
+    rb->lcd_set_foreground(LCD_RGBPACK(10, 14, 12));
+    rb->lcd_fillrect(218, RBPREP_WAVE_TOP + 7, 77, 98);
+    rb->lcd_set_foreground(LCD_RGBPACK(72, 82, 76));
+    rb->lcd_drawrect(218, RBPREP_WAVE_TOP + 7, 77, 98);
+    rb->lcd_hline(218, 294, RBPREP_WAVE_TOP + 24);
+    text(224, RBPREP_WAVE_TOP + 11, "DECK DATA", RBPREP_GREEN);
+    rb->snprintf(line, sizeof(line), "RPM %s>%s",
                  rpm_styles[host_rpm_index], rpm_styles[played_rpm_index]);
-    text(212, RBPREP_WAVE_TOP + 26, line, LCD_WHITE);
+    text(222, RBPREP_WAVE_TOP + 29, line, LCD_WHITE);
     format_percent_delta(delta, sizeof(delta),
                          deck_pitch_x100() - PITCH_SPEED_100);
-    rb->snprintf(line, sizeof(line), "P %s%%", delta);
-    text(212, RBPREP_WAVE_TOP + 45, line, LCD_WHITE);
+    rb->snprintf(line, sizeof(line), "PIT %s%%", delta);
+    text(222, RBPREP_WAVE_TOP + 46, line, LCD_WHITE);
     format_percent_delta(delta, sizeof(delta), pitch_bend_x100);
-    rb->snprintf(line, sizeof(line), "B %s%%", delta);
-    text(212, RBPREP_WAVE_TOP + 64, line, RBPREP_GREEN);
+    rb->snprintf(line, sizeof(line), "BND %s%%", delta);
+    text(222, RBPREP_WAVE_TOP + 63, line, RBPREP_GREEN);
     format_percent_delta(delta, sizeof(delta),
                          tempo_x100 - PITCH_SPEED_100);
-    rb->snprintf(line, sizeof(line), "T %s%%", delta);
-    text(212, RBPREP_WAVE_TOP + 83, line, RBPREP_GREEN);
+    rb->snprintf(line, sizeof(line), "TMP %s%%", delta);
+    text(222, RBPREP_WAVE_TOP + 80, line, RBPREP_GREEN);
     format_percent_delta(delta, sizeof(delta),
                          deck_speed_x100() - PITCH_SPEED_100);
-    rb->snprintf(line, sizeof(line), "R %s%%", delta);
-    text(212, RBPREP_WAVE_TOP + 102, line,
+    rb->snprintf(line, sizeof(line), "RATE%s%%", delta);
+    text(222, RBPREP_WAVE_TOP + 97, line,
          LCD_RGBPACK(155, 174, 161));
 }
 
@@ -2142,7 +3597,7 @@ static void draw_waveform(void)
     int mid = (RBPREP_SIGNAL_TOP + RBPREP_SIGNAL_BOTTOM) / 2;
 
     if (visualizer_mode == 1 || visualizer_mode == 2)
-        update_spectrum_levels();
+        update_spectrum_levels(visualizer_mode == 1);
     if (visualizer_mode == 1) {
         draw_boombox();
         return;
@@ -2234,6 +3689,9 @@ static void draw_overview_waveform(void)
     int x;
     int mid = RBPREP_OVERVIEW_Y + RBPREP_OVERVIEW_HEIGHT / 2;
     int max_height = RBPREP_OVERVIEW_HEIGHT / 2 - 2;
+
+    if (draw_macro_strip())
+        return;
 
     rb->lcd_set_foreground(LCD_RGBPACK(7, 14, 10));
     rb->lcd_fillrect(RBPREP_OVERVIEW_X, RBPREP_OVERVIEW_Y,
@@ -2354,7 +3812,6 @@ static void clear_analysis(void)
     waveform_points = 0;
     waveform_columns_valid = false;
     rb->memset(overview_waveform, 0, sizeof(overview_waveform));
-    waveform_duration_ms = 1;
     beat_count = 0;
     grid_offset = 0;
     grid_phase_ms = 0;
@@ -2384,7 +3841,7 @@ static void apply_edit_record(const unsigned char *data)
     int i;
 
     rating = MIN(5, data[16]);
-    color_index = data[17] & 7;
+    color_index = normalize_track_color(data[17]);
     quantize = !!data[18];
     grid_beat_shift = data[19] & 3;
     track_year = read_u16(data + 20);
@@ -2522,34 +3979,159 @@ static bool write_burn_offsets(uint32_t edit_offset,
     return true;
 }
 
-static void refresh_pending_summary(void)
+static bool parse_playlist_journal_line(
+    char *line, struct rbprep_pending_playlist *entry)
+{
+    char *field[6];
+    int count = 1;
+    char *cursor;
+
+    rb->memset(entry, 0, sizeof(*entry));
+    field[0] = line;
+    for (cursor = line; *cursor && count < (int)ARRAYLEN(field); cursor++) {
+        if (*cursor == '\t') {
+            *cursor = '\0';
+            field[count++] = cursor + 1;
+        }
+    }
+    if (count == 3) {
+        /* RBI1/RBI2 compatibility: track<TAB>playlist<TAB>name. */
+        entry->operation = PLAYLIST_OP_ADD;
+        entry->kind = 1;
+        entry->track_id = rb->strtoul(field[0], NULL, 10);
+        entry->playlist_id = rb->strtoul(field[1], NULL, 10);
+        rb->strlcpy(entry->name, field[2], sizeof(entry->name));
+        return entry->track_id && entry->playlist_id;
+    }
+    if (count != 6 || field[0][1] != '\0' ||
+        !rb->strchr("ACRMD", field[0][0]))
+        return false;
+    entry->operation = field[0][0];
+    entry->track_id = rb->strtoul(field[1], NULL, 10);
+    entry->playlist_id = rb->strtoul(field[2], NULL, 10);
+    entry->parent_id = rb->strtoul(field[3], NULL, 10);
+    entry->kind = MIN(2, rb->strtoul(field[4], NULL, 10));
+    rb->strlcpy(entry->name, field[5], sizeof(entry->name));
+    return entry->playlist_id &&
+           (entry->operation != PLAYLIST_OP_ADD || entry->track_id);
+}
+
+static void remove_pending_playlist_at(int slot)
+{
+    for (; slot + 1 < pending_playlist_count; slot++)
+        pending_playlists[slot] = pending_playlists[slot + 1];
+    pending_playlist_count--;
+}
+
+static void merge_pending_playlist(
+    const struct rbprep_pending_playlist *incoming)
+{
+    int i;
+
+    if (incoming->operation == PLAYLIST_OP_DELETE) {
+        bool cancels_create = false;
+        for (i = pending_playlist_count - 1; i >= 0; i--) {
+            if (pending_playlists[i].playlist_id != incoming->playlist_id)
+                continue;
+            if (pending_playlists[i].operation == PLAYLIST_OP_CREATE)
+                cancels_create = true;
+            remove_pending_playlist_at(i);
+        }
+        if (cancels_create)
+            return;
+    } else if (incoming->operation == PLAYLIST_OP_RENAME ||
+               incoming->operation == PLAYLIST_OP_MOVE) {
+        for (i = 0; i < pending_playlist_count; i++) {
+            struct rbprep_pending_playlist *current = &pending_playlists[i];
+            if (current->playlist_id != incoming->playlist_id)
+                continue;
+            if (current->operation == PLAYLIST_OP_DELETE)
+                return;
+            if (current->operation == PLAYLIST_OP_CREATE) {
+                if (incoming->operation == PLAYLIST_OP_RENAME)
+                    rb->strlcpy(current->name, incoming->name,
+                                sizeof(current->name));
+                else
+                    current->parent_id = incoming->parent_id;
+                return;
+            }
+            if (current->operation == incoming->operation) {
+                *current = *incoming;
+                return;
+            }
+        }
+    } else if (incoming->operation == PLAYLIST_OP_ADD) {
+        for (i = 0; i < pending_playlist_count; i++) {
+            struct rbprep_pending_playlist *current = &pending_playlists[i];
+            if (current->playlist_id == incoming->playlist_id &&
+                (current->operation == PLAYLIST_OP_DELETE ||
+                 (current->operation == PLAYLIST_OP_ADD &&
+                  current->track_id == incoming->track_id)))
+                return;
+        }
+    } else if (incoming->operation == PLAYLIST_OP_CREATE) {
+        for (i = 0; i < pending_playlist_count; i++) {
+            if (pending_playlists[i].playlist_id == incoming->playlist_id) {
+                pending_playlists[i] = *incoming;
+                return;
+            }
+        }
+    }
+    if (pending_playlist_count < RBPREP_PENDING_MAX)
+        pending_playlists[pending_playlist_count++] = *incoming;
+    else
+        pending_summary_overflow = true;
+}
+
+static void refresh_pending_summary_from_offsets(uint32_t edit_offset,
+                                                 uint32_t playlist_offset,
+                                                 uint32_t strict_edit_offset,
+                                                 uint32_t strict_playlist_offset)
 {
     unsigned char data[RBPREP_EDIT_RECORD_SIZE];
     char line[160];
     int fd;
     int i;
     int length;
-    uint32_t edit_offset;
-    uint32_t playlist_offset;
-
-    read_burn_offsets(&edit_offset, &playlist_offset);
+    bool line_overflow;
+    off_t journal_size;
+    uint32_t record_offset;
+    uint32_t playlist_cursor;
+    uint32_t playlist_line_offset;
 
     pending_snapshot_count = 0;
     pending_playlist_count = 0;
+    pending_summary_overflow = false;
+    pending_journal_invalid = false;
     pending_visible_count = 0;
     fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
     if (fd >= 0) {
-        if (edit_offset > (uint32_t)rb->filesize(fd) ||
-            edit_offset % RBPREP_EDIT_RECORD_SIZE)
+        journal_size = rb->filesize(fd);
+        if (journal_size < 0 || edit_offset > (uint32_t)journal_size ||
+            edit_offset % RBPREP_EDIT_RECORD_SIZE) {
+            pending_journal_invalid = true;
             edit_offset = 0;
+        }
+        if (journal_size >= 0 &&
+            ((uint32_t)journal_size - edit_offset) %
+                RBPREP_EDIT_RECORD_SIZE &&
+            (uint32_t)journal_size > strict_edit_offset)
+            pending_journal_invalid = true;
         if (edit_offset > 0)
             rb->lseek(fd, edit_offset, SEEK_SET);
+        record_offset = edit_offset;
         while (rb->read(fd, data, sizeof(data)) == sizeof(data)) {
             struct rbprep_pending_entry *entry;
             int slot = -1;
+            uint32_t current_record_offset = record_offset;
 
-            if (!valid_edit_record(data))
+            record_offset += sizeof(data);
+
+            if (!valid_edit_record(data)) {
+                if (current_record_offset >= strict_edit_offset)
+                    pending_journal_invalid = true;
                 continue;
+            }
             for (i = 0; i < pending_snapshot_count; i++) {
                 if (pending_entries[i].track_id == read_u32(data + 8)) {
                     slot = i;
@@ -2565,13 +4147,14 @@ static void refresh_pending_summary(void)
             } else if (pending_snapshot_count < RBPREP_PENDING_MAX) {
                 slot = pending_snapshot_count++;
             } else {
+                pending_summary_overflow = true;
                 continue;
             }
             entry = &pending_entries[slot];
             entry->track_id = read_u32(data + 8);
             entry->saved_tick = read_u32(data + 12);
             entry->rating = MIN(5, data[16]);
-            entry->color = data[17] & 7;
+            entry->color = normalize_track_color(data[17]);
             entry->bpm_x100 = read_u32(data + 24);
             rb->memcpy(entry->title, data + 152, sizeof(entry->title));
             entry->title[sizeof(entry->title) - 1] = '\0';
@@ -2580,54 +4163,60 @@ static void refresh_pending_summary(void)
     }
     fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
     if (fd >= 0) {
-        if (playlist_offset <= (uint32_t)rb->filesize(fd)) {
+        journal_size = rb->filesize(fd);
+        if (journal_size >= 0 &&
+            playlist_offset <= (uint32_t)journal_size) {
             rb->lseek(fd, playlist_offset, SEEK_SET);
         } else {
+            pending_journal_invalid = true;
             playlist_offset = 0;
         }
         length = 0;
+        line_overflow = false;
+        playlist_cursor = playlist_offset;
+        playlist_line_offset = playlist_offset;
         while (true) {
             unsigned char value;
             int got = rb->read(fd, &value, 1);
-            if (got != 1 && length == 0)
-                break;
-            if (got != 1 || value == '\n') {
-                char *first;
-                char *second;
-                uint32_t track;
-                uint32_t playlist;
-                int slot = -1;
+            if (got != 1) {
+                if (length > 0 && !line_overflow) {
+                    struct rbprep_pending_playlist entry;
 
-                line[length] = '\0';
-                first = rb->strchr(line, '\t');
-                second = first ? rb->strchr(first + 1, '\t') : NULL;
-                if (first && second) {
-                    *first = *second = '\0';
-                    track = rb->strtoul(line, NULL, 10);
-                    playlist = rb->strtoul(first + 1, NULL, 10);
-                    for (i = 0; i < pending_playlist_count; i++) {
-                        if (pending_playlists[i].track_id == track &&
-                            pending_playlists[i].playlist_id == playlist) {
-                            slot = i;
-                            break;
-                        }
-                    }
-                    if (slot < 0 &&
-                        pending_playlist_count < RBPREP_PENDING_MAX)
-                        slot = pending_playlist_count++;
-                    if (slot >= 0) {
-                        pending_playlists[slot].track_id = track;
-                        pending_playlists[slot].playlist_id = playlist;
-                        rb->strlcpy(pending_playlists[slot].name, second + 1,
-                                    sizeof(pending_playlists[slot].name));
-                    }
+                    line[length] = '\0';
+                    if (parse_playlist_journal_line(line, &entry))
+                        merge_pending_playlist(&entry);
+                    else if (playlist_line_offset >=
+                             strict_playlist_offset)
+                        pending_journal_invalid = true;
+                } else if (line_overflow && playlist_line_offset >=
+                           strict_playlist_offset) {
+                    pending_journal_invalid = true;
+                }
+                break;
+            }
+            playlist_cursor++;
+            if (value == '\n') {
+                struct rbprep_pending_playlist entry;
+
+                if (line_overflow) {
+                    if (playlist_line_offset >= strict_playlist_offset)
+                        pending_journal_invalid = true;
+                } else if (length > 0) {
+                    line[length] = '\0';
+                    if (parse_playlist_journal_line(line, &entry))
+                        merge_pending_playlist(&entry);
+                    else if (playlist_line_offset >=
+                             strict_playlist_offset)
+                        pending_journal_invalid = true;
                 }
                 length = 0;
-                if (got != 1)
-                    break;
+                line_overflow = false;
+                playlist_line_offset = playlist_cursor;
             } else if (value != '\r' &&
                        length + 1 < (int)sizeof(line)) {
                 line[length++] = value;
+            } else if (value != '\r') {
+                line_overflow = true;
             }
         }
         rb->close(fd);
@@ -2641,6 +4230,16 @@ static void refresh_pending_summary(void)
     pending_top = MAX(0, MIN(MAX(0, pending_snapshot_count +
                                 pending_playlist_count -
                                 RBPREP_PENDING_ROWS), pending_top));
+}
+
+static void refresh_pending_summary(void)
+{
+    uint32_t edit_offset;
+    uint32_t playlist_offset;
+
+    read_burn_offsets(&edit_offset, &playlist_offset);
+    refresh_pending_summary_from_offsets(edit_offset, playlist_offset,
+                                         edit_offset, playlist_offset);
 }
 
 static bool delete_pending_edit(uint32_t track_id)
@@ -2694,7 +4293,9 @@ static bool delete_pending_edit(uint32_t track_id)
     return true;
 }
 
-static bool delete_pending_playlist(uint32_t track_id, uint32_t playlist_id)
+static bool delete_pending_playlist(unsigned char operation,
+                                    uint32_t track_id,
+                                    uint32_t playlist_id)
 {
     const char *temporary = RBPREP_PLAYLIST_JOURNAL ".rbprep-new";
     const char *previous = RBPREP_PLAYLIST_JOURNAL ".rbprep-prev";
@@ -2733,19 +4334,16 @@ static bool delete_pending_playlist(uint32_t track_id, uint32_t playlist_id)
         }
         if (got != 1 || value == '\n') {
             char parse[160];
-            char *first;
-            char *second;
+            struct rbprep_pending_playlist entry;
             bool remove = false;
 
             line[length] = '\0';
             rb->strlcpy(parse, line, sizeof(parse));
-            first = rb->strchr(parse, '\t');
-            second = first ? rb->strchr(first + 1, '\t') : NULL;
-            if (first && second) {
-                *first = *second = '\0';
-                remove = rb->strtoul(parse, NULL, 10) == track_id &&
-                         rb->strtoul(first + 1, NULL, 10) == playlist_id;
-            }
+            if (parse_playlist_journal_line(parse, &entry))
+                remove = entry.operation == operation &&
+                         entry.playlist_id == playlist_id &&
+                         (operation != PLAYLIST_OP_ADD ||
+                          entry.track_id == track_id);
             if (!remove) {
                 if ((length > 0 &&
                      rb->write(output, line, length) != length) ||
@@ -2781,7 +4379,294 @@ playlist_delete_failed:
     return false;
 }
 
+/* Keep the validated, rollback-safe DeviceSQL/RBI transaction out of the UI
+   core while sharing its already-coalesced pending state. */
 #include "rbprep_burn.h"
+
+static int find_node_index_by_source_id(uint32_t source_id)
+{
+    struct rbprep_node_record node;
+    int index;
+
+    for (index = 0; (uint32_t)index < library_node_count; index++) {
+        if (read_node_record(index, &node) && node.source_id == source_id)
+            return index;
+    }
+    return -1;
+}
+
+static int find_track_row_in_playlist(int node_index, int track_index)
+{
+    struct rbprep_node_record node;
+    unsigned char data[4];
+    uint32_t row;
+
+    if (track_index < 0 || !read_node_record(node_index, &node))
+        return -1;
+    for (row = 0; row < node.member_count; row++) {
+        if (!read_index_at(library_member_offset +
+                           (node.first_member + row) * 4,
+                           data, sizeof(data)))
+            break;
+        if ((int)read_u32(data) == track_index)
+            return row;
+    }
+    return -1;
+}
+
+static void refresh_active_playlist_context(uint32_t active_source_id)
+{
+    struct rbprep_node_record active;
+    int linked_macro;
+
+    if (selected_track_id >= 0)
+        selected_track_index = find_track_index_by_id(selected_track_id);
+    if (!active_source_id)
+        return;
+    active_playlist_node = find_node_index_by_source_id(active_source_id);
+    if (active_playlist_node >= 0) {
+        if (read_node_record(active_playlist_node, &active))
+            track_row_count = active.member_count;
+        playing_track_row = find_track_row_in_playlist(
+                                active_playlist_node, selected_track_index);
+        if (playing_track_row >= 0)
+            track_selection = playing_track_row;
+        track_top = MAX(0, MIN(track_selection,
+                        MAX(0, track_row_count - RBPREP_LIST_ROWS)));
+        linked_macro = macro_link_for(active_source_id);
+        if (linked_macro >= 0)
+            macro_active = linked_macro;
+        macro_position = 0;
+    } else {
+        playing_track_row = -1;
+        collection_shuffle_active = false;
+        track_row_count = library_track_count;
+    }
+}
+
+static bool burn_playlist_changes_now(void)
+{
+    struct rbprep_node_record active;
+    uint32_t active_source_id = 0;
+    bool saved_playlist_playback = playlist_playback;
+    bool success;
+
+    if (active_playlist_node >= 0 &&
+        read_node_record(active_playlist_node, &active))
+        active_source_id = active.source_id;
+    success = rbprep_burn_playlists();
+    refresh_pending_summary();
+    playlist_playback = saved_playlist_playback;
+    if (!success)
+        return false;
+
+    refresh_active_playlist_context(active_source_id);
+    force_full_redraw = true;
+    return true;
+}
+
+static bool auto_burn_pending_changes(void)
+{
+    if (!auto_burn)
+        return true;
+    /* Auto Burn records intent immediately, but the transaction itself runs
+       only at the next real track-load boundary so playback is never stopped
+       halfway through a song for analysis workspace. */
+    if (!flush_deferred_edit()) {
+        rb->splash(HZ * 2, "Auto Burn: journal write failed");
+        restore_black_canvas();
+        return false;
+    }
+    refresh_pending_summary();
+    if (pending_snapshot_count == 0 && pending_playlist_count == 0 &&
+        !pending_summary_overflow && !pending_journal_invalid)
+        return true;
+    burn_request = BURN_REQUEST_ALL;
+    return true;
+}
+
+static void service_deferred_burn(void)
+{
+    bool success;
+    int track_burns;
+
+    if (burn_request == BURN_REQUEST_NONE)
+        return;
+    refresh_pending_summary();
+    track_burns = pending_snapshot_count;
+    success = rbprep_burn_all();
+    refresh_pending_summary();
+    if (success) {
+        uptime_tracks_burned += track_burns;
+        burn_request = BURN_REQUEST_NONE;
+        rb->splash(HZ, "Burn all complete");
+    } else {
+        rb->splash(HZ * 2, "Automatic burn remains pending");
+    }
+    restore_black_canvas();
+}
+
+static bool burn_loaded_track_now(void)
+{
+    int status;
+    int resume_index = 0;
+    int resume_position;
+    bool had_audio;
+    bool was_paused;
+    bool saved_playlist_playback;
+    bool capture_was_active;
+    bool success;
+
+    if (selected_track_id < 0)
+        return false;
+    if (!flush_deferred_edit()) {
+        rb->splash(HZ * 2, "Track burn: journal write failed");
+        restore_black_canvas();
+        return false;
+    }
+
+    status = rb->audio_status();
+    had_audio = !!(status & AUDIO_STATUS_PLAY);
+    was_paused = !!(status & AUDIO_STATUS_PAUSE);
+    if (had_audio)
+        rb->playlist_get_resume_info(&resume_index);
+    resume_position = clamp_playhead(playhead);
+    saved_playlist_playback = playlist_playback;
+    capture_was_active = spectrum_capture_active;
+    stop_spectrum_capture();
+
+    success = rbprep_burn_song((uint32_t)selected_track_id);
+    refresh_pending_summary();
+    if (success && pending_snapshot_count == 0 &&
+        pending_playlist_count == 0 && !pending_summary_overflow &&
+        !pending_journal_invalid)
+        burn_request = BURN_REQUEST_NONE;
+
+    /* A track transaction borrows Rockbox's audio buffer. Reconstitute the
+       one-track playback context at the exact deck position afterwards. */
+    playlist_playback = saved_playlist_playback;
+    if (had_audio && !(rb->audio_status() & AUDIO_STATUS_PLAY)) {
+        rb->playlist_start(resume_index, resume_position, 0);
+        if (was_paused)
+            rb->audio_pause();
+    }
+    if (had_audio)
+        audio_was_running = true;
+    playhead = resume_position;
+    reset_play_clock(playhead, *rb->current_tick);
+    if (capture_was_active && !display_locked)
+        start_spectrum_capture();
+    overview_dirty = true;
+    force_full_redraw = true;
+    if (success) {
+        uptime_tracks_burned++;
+        rb->splash(HZ, "Track burn complete");
+    }
+    restore_black_canvas();
+    return success;
+}
+
+static bool burn_all_now(void)
+{
+    struct rbprep_node_record active;
+    uint32_t active_source_id = 0;
+    int status;
+    int resume_index = 0;
+    int resume_position = clamp_playhead(playhead);
+    int track_burns;
+    bool had_audio;
+    bool was_paused;
+    bool saved_playlist_playback = playlist_playback;
+    bool capture_was_active = spectrum_capture_active;
+    bool success;
+
+    if (!flush_deferred_edit()) {
+        rb->splash(HZ * 2, "Instant burn: journal write failed");
+        restore_black_canvas();
+        return false;
+    }
+    refresh_pending_summary();
+    if (pending_snapshot_count == 0 && pending_playlist_count == 0) {
+        rb->splash(HZ, "Nothing to burn");
+        restore_black_canvas();
+        return true;
+    }
+    track_burns = pending_snapshot_count;
+    if (active_playlist_node >= 0 &&
+        read_node_record(active_playlist_node, &active))
+        active_source_id = active.source_id;
+    status = rb->audio_status();
+    had_audio = !!(status & AUDIO_STATUS_PLAY);
+    was_paused = !!(status & AUDIO_STATUS_PAUSE);
+    if (had_audio)
+        rb->playlist_get_resume_info(&resume_index);
+    stop_spectrum_capture();
+
+    success = rbprep_burn_all();
+    refresh_pending_summary();
+    playlist_playback = saved_playlist_playback;
+    if (success) {
+        uptime_tracks_burned += track_burns;
+        burn_request = BURN_REQUEST_NONE;
+        refresh_active_playlist_context(active_source_id);
+    }
+
+    /* A user-triggered full burn is immediate. If analysis work borrowed the
+       audio buffer, rebuild the current one-track transport in place. */
+    if (had_audio && !(rb->audio_status() & AUDIO_STATUS_PLAY)) {
+        rb->playlist_start(resume_index, resume_position, 0);
+        if (was_paused)
+            rb->audio_pause();
+    }
+    if (had_audio)
+        audio_was_running = true;
+    playhead = resume_position;
+    reset_play_clock(playhead, *rb->current_tick);
+    if (capture_was_active && !display_locked)
+        start_spectrum_capture();
+    overview_dirty = true;
+    force_full_redraw = true;
+    if (success)
+        rb->splash(HZ, "Instant burn complete");
+    restore_black_canvas();
+    return success;
+}
+
+static void reset_play_stat(int track_id)
+{
+    play_stat_track_id = track_id;
+    play_stat_last_tick = *rb->current_tick;
+    play_stat_ticks = 0;
+    play_stat_counted = false;
+}
+
+static void service_play_statistics(void)
+{
+    long now = *rb->current_tick;
+    long elapsed;
+    int status;
+
+    if (selected_track_id < 0)
+        return;
+    if (play_stat_track_id != selected_track_id)
+        reset_play_stat(selected_track_id);
+    elapsed = now - play_stat_last_tick;
+    play_stat_last_tick = now;
+    status = rb->audio_status();
+    if (!(status & AUDIO_STATUS_PLAY) || (status & AUDIO_STATUS_PAUSE) ||
+        seek_state != SEEK_IDLE || elapsed <= 0 || elapsed > HZ * 2)
+        return;
+    play_stat_ticks += elapsed;
+    if (!play_stat_counted && play_stat_ticks >= HZ * 60) {
+        play_stat_counted = true;
+        if (total_plays < INT_MAX)
+            total_plays++;
+        /* This used to rewrite rbprep.cfg synchronously at exactly 60 s.
+           iFlash erase/program latency then froze the render loop for several
+           seconds. Persist at pause, track change, USB, or plugin exit. */
+        mark_rbprep_config_dirty();
+    }
+}
 
 static bool load_waveform(int track_id)
 {
@@ -2799,7 +4684,7 @@ static bool load_waveform(int track_id)
     fd = rb->open(filename, O_RDONLY);
     if (fd < 0)
         return false;
-    if (rb->read(fd, header, sizeof(header)) != sizeof(header) ||
+    if (!read_exact(fd, header, sizeof(header)) ||
         rb->memcmp(header, "RBW3", 4) || read_u16(header + 4) != 40) {
         rb->close(fd);
         return false;
@@ -2809,16 +4694,14 @@ static bool load_waveform(int track_id)
     cue_count = read_u16(header + 12);
     declared_beats = read_u16(header + 14);
     track_length = MAX(1, (int)read_u32(header + 16));
-    waveform_duration_ms = MAX(1, (int)read_u32(header + 20));
     grid_bpm_x100 = read_u16(header + 24);
     grid_source_bpm_x100 = grid_bpm_x100;
     grid_phase_ms = read_u32(header + 28);
     rating = MIN(5, header[32]);
-    color_index = header[33] & 7;
+    color_index = normalize_track_color(header[33]);
 
     waveform_points = MIN(declared_points, RBPREP_POINTS);
-    if (rb->read(fd, waveform, waveform_points * 4) !=
-        waveform_points * 4) {
+    if (!read_exact(fd, waveform, waveform_points * 4)) {
         clear_analysis();
         rb->close(fd);
         return false;
@@ -2831,7 +4714,7 @@ static bool load_waveform(int track_id)
     for (i = 0; i < cue_count; i++) {
         unsigned char cue[8];
         int slot;
-        if (rb->read(fd, cue, sizeof(cue)) != sizeof(cue))
+        if (!read_exact(fd, cue, sizeof(cue)))
             break;
         slot = cue[5];
         if (slot > 0 && slot <= 16) {
@@ -2842,7 +4725,7 @@ static bool load_waveform(int track_id)
     beat_count = MIN(declared_beats, RBPREP_BEATS);
     for (i = 0; i < beat_count; i++) {
         unsigned char beat[8];
-        if (rb->read(fd, beat, sizeof(beat)) != sizeof(beat)) {
+        if (!read_exact(fd, beat, sizeof(beat))) {
             beat_count = i;
             break;
         }
@@ -2868,14 +4751,19 @@ static bool load_waveform(int track_id)
 static void open_track_browser(int playlist_node)
 {
     struct rbprep_node_record node;
+    int linked_macro;
 
     active_playlist_node = playlist_node;
     track_selection = 0;
     track_top = 0;
     if (playlist_node < 0) {
-        track_row_count = search_active ? search_result_count
-                                        : (int)library_track_count;
+        track_row_count = (search_active || collection_shuffle_active)
+                        ? search_result_count : (int)library_track_count;
     } else if (read_node_record(playlist_node, &node)) {
+        linked_macro = macro_link_for(node.source_id);
+        if (linked_macro >= 0)
+            macro_active = linked_macro;
+        macro_position = 0;
         track_row_count = node.member_count;
     } else {
         track_row_count = 0;
@@ -2892,6 +4780,7 @@ static bool play_track_index(int index, int row,
     char path[MAX_PATH];
     const char *extension;
     bool already_loaded;
+    bool force_reload = force_track_reload;
 
     if (!read_track_record(index, &track) ||
         !read_index_string(track.path_offset, path, sizeof(path)))
@@ -2901,20 +4790,29 @@ static bool play_track_index(int index, int row,
         restore_black_canvas();
         return false;
     }
+    if (index != selected_track_index)
+        save_rbprep_config();
     if (!rb->file_exists(path)) {
         rb->splashf(HZ * 2, "Missing: %s", path);
         restore_black_canvas();
         return false;
     }
+    if (index != selected_track_index || force_reload)
+        service_deferred_burn();
 
     id3 = rb->audio_current_track();
-    already_loaded = id3 && id3->path && !rb->strcmp(id3->path, path);
-    if (index == selected_track_index && id3 && id3->path &&
+    already_loaded = !force_reload && id3 && id3->path &&
+                     !rb->strcmp(id3->path, path);
+    if (!force_reload && index == selected_track_index && id3 && id3->path &&
         !rb->strcmp(id3->path, path)) {
+        if (waveform_points <= 0)
+            load_waveform(track.id);
         playhead = clamp_playhead(id3->elapsed);
         playing_track_row = row;
         deck_return_mode = return_mode;
         mode = MODE_DECK;
+        if (macro_active >= 0 && tool_macros[macro_active].count > 0)
+            apply_macro_step(&tool_macros[macro_active].steps[0]);
         reset_play_clock(playhead, *rb->current_tick);
         force_full_redraw = true;
         return true;
@@ -2929,6 +4827,11 @@ static bool play_track_index(int index, int row,
     }
     if (!already_loaded) {
         stop_editor_audio();
+        if (force_reload) {
+            rb->audio_stop();
+            rb->yield();
+            audio_was_running = false;
+        }
         if (rb->playlist_create(NULL, NULL) < 0 ||
             rb->playlist_insert_track(NULL, path, PLAYLIST_INSERT_LAST,
                                       false, true) < 0) {
@@ -2940,6 +4843,7 @@ static bool play_track_index(int index, int row,
 
     selected_track_index = index;
     selected_track_id = track.id;
+    reset_play_stat(selected_track_id);
     title_scroll_px = metadata_scroll_px = 0;
     extension = rb->strrchr(path, '.');
     rb->strlcpy(selected_extension, extension ? extension : "",
@@ -2955,10 +4859,15 @@ static bool play_track_index(int index, int row,
                           sizeof(selected_key));
     else
         selected_key[0] = '\0';
+    if (track.comments_offset)
+        read_index_string(track.comments_offset, selected_comments,
+                          sizeof(selected_comments));
+    else
+        selected_comments[0] = '\0';
     grid_bpm_x100 = track.bpm_x100;
     grid_source_bpm_x100 = grid_bpm_x100;
     rating = track.rating;
-    color_index = track.color & 7;
+    color_index = normalize_track_color(track.color);
     track_year = track.year;
     load_waveform(track.id);
     load_latest_edit(track.id);
@@ -2976,6 +4885,8 @@ static bool play_track_index(int index, int row,
     audio_was_running = true;
     deck_return_mode = return_mode;
     mode = MODE_DECK;
+    if (macro_active >= 0 && tool_macros[macro_active].count > 0)
+        apply_macro_step(&tool_macros[macro_active].steps[0]);
     force_full_redraw = true;
     return true;
 }
@@ -3008,6 +4919,73 @@ static bool play_track_row(int row)
     return play_track_index(track_index_at_row(row), row, MODE_TRACKS);
 }
 
+static void start_shuffled_collection(void)
+{
+    int count = MIN((int)library_track_count, RBPREP_SEARCH_MAX);
+    int index;
+
+    if (count <= 0) {
+        rb->splash(HZ * 2, "Collection is empty");
+        restore_black_canvas();
+        return;
+    }
+    search_active = false;
+    track_search[0] = '\0';
+    active_playlist_node = -1;
+    collection_shuffle_active = true;
+    search_result_count = count;
+    for (index = 0; index < count; index++)
+        search_results[index] = index;
+    rb->srand((unsigned int)(*rb->current_tick ^ library_track_count));
+    for (index = count - 1; index > 0; index--) {
+        int other = rb->rand() % (index + 1);
+        uint32_t swap = search_results[index];
+        search_results[index] = search_results[other];
+        search_results[other] = swap;
+    }
+    track_row_count = count;
+    track_selection = track_top = 0;
+    playing_track_row = -1;
+    playlist_playback = true;
+    macro_active = -1;
+    play_track_row(0);
+}
+
+static bool navigate_playlist_track(int direction)
+{
+    int target = playing_track_row + direction;
+    bool success;
+
+    if (playing_track_row < 0 || target < 0 || target >= track_row_count)
+        return false;
+    track_selection = target;
+    if (track_selection < track_top)
+        track_top = track_selection;
+    else if (track_selection >= track_top + RBPREP_LIST_ROWS)
+        track_top = track_selection - RBPREP_LIST_ROWS + 1;
+    success = play_track_row(track_selection);
+    if (success && macro_active < 0)
+        mode = MODE_PNAV;
+    return success;
+}
+
+static bool reload_current_track(void)
+{
+    int index = selected_track_index;
+    int row = playing_track_row;
+    enum rbprep_mode return_mode = deck_return_mode;
+    bool success;
+
+    if (index < 0)
+        return false;
+    force_track_reload = true;
+    success = play_track_index(index, row, return_mode);
+    force_track_reload = false;
+    if (success && macro_active < 0)
+        mode = MODE_PNAV;
+    return success;
+}
+
 static void draw_record_badge(int cx, int cy, int radius, int color,
                               bool selected)
 {
@@ -3025,13 +5003,22 @@ static void draw_blade_shell(const char *title, int accent)
     rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
     rb->lcd_set_foreground(LCD_RGBPACK(4, 13, 8));
-    rb->lcd_fillrect(0, 0, LCD_WIDTH, 22);
+    rb->lcd_fillrect(0, RBPREP_STATUS_HEIGHT, LCD_WIDTH, 22);
     rb->lcd_set_foreground(accent);
-    rb->lcd_fillrect(0, 0, 5, LCD_HEIGHT);
-    xlcd_drawcircle(LCD_WIDTH - 10, 9, 27);
-    xlcd_drawcircle(LCD_WIDTH - 10, 9, 20);
-    xlcd_fillcircle(LCD_WIDTH - 10, 9, 3);
-    text(10, 4, title, LCD_WHITE);
+    rb->lcd_fillrect(0, RBPREP_STATUS_HEIGHT, 5,
+                     LCD_HEIGHT - RBPREP_STATUS_HEIGHT);
+    rb->lcd_set_foreground(theme_wheel_outline);
+    xlcd_drawcircle(LCD_WIDTH - 10, RBPREP_STATUS_HEIGHT + 9, 27);
+    xlcd_drawcircle(LCD_WIDTH - 10, RBPREP_STATUS_HEIGHT + 9, 20);
+    rb->lcd_set_foreground(theme_wheel);
+    xlcd_fillcircle(LCD_WIDTH - 10, RBPREP_STATUS_HEIGHT + 9, 3);
+    text(10, RBPREP_STATUS_HEIGHT + 4, title, LCD_WHITE);
+    rb->lcd_set_foreground(LCD_RGBPACK(240, 100, 45));
+    rb->lcd_fillrect(272, RBPREP_STATUS_HEIGHT + 6, 5, 5);
+    rb->lcd_set_foreground(LCD_RGBPACK(80, 180, 245));
+    rb->lcd_fillrect(281, RBPREP_STATUS_HEIGHT + 6, 5, 5);
+    rb->lcd_set_foreground(accent);
+    rb->lcd_fillrect(290, RBPREP_STATUS_HEIGHT + 6, 5, 5);
 }
 
 static void draw_blade_selection(int y, int height, int color)
@@ -3085,28 +5072,33 @@ static void draw_main_glyph(int cx, int cy, int item, bool selected)
         xlcd_drawcircle(cx, cy, 4);
         xlcd_fillcircle(cx, cy, 1);
     } else if (item == 1) {
-        draw_playlist_node_glyph(cx, cy, true, selected);
+        rb->lcd_drawline(cx - 5, cy - 4, cx + 5, cy + 4);
+        rb->lcd_drawline(cx - 5, cy + 4, cx - 2, cy + 1);
+        rb->lcd_drawline(cx + 5, cy + 4, cx + 2, cy + 4);
+        rb->lcd_drawline(cx + 5, cy + 4, cx + 5, cy + 1);
+        rb->lcd_drawline(cx - 5, cy + 4, cx + 5, cy - 4);
+        rb->lcd_drawline(cx + 5, cy - 4, cx + 2, cy - 4);
+        rb->lcd_drawline(cx + 5, cy - 4, cx + 5, cy - 1);
     } else if (item == 2) {
+        draw_playlist_node_glyph(cx, cy, true, selected);
+    } else if (item == 3) {
         xlcd_drawcircle(cx - 1, cy, 4);
         xlcd_fillcircle(cx - 1, cy, 1);
         rb->lcd_drawline(cx + 5, cy - 5, cx + 2, cy + 3);
-    } else if (item == 3) {
+    } else if (item == 4) {
         rb->lcd_vline(cx, cy - 5, cy + 4);
         rb->lcd_drawline(cx, cy - 3, cx - 4, cy - 1);
         rb->lcd_drawline(cx, cy, cx + 4, cy - 2);
         rb->lcd_fillrect(cx - 5, cy - 2, 2, 2);
         xlcd_fillcircle(cx + 4, cy - 2, 1);
         xlcd_fillcircle(cx, cy + 5, 1);
-    } else if (item == 4) {
+    } else if (item == 5) {
         rb->lcd_vline(cx - 4, cy - 5, cy + 5);
         rb->lcd_vline(cx, cy - 5, cy + 5);
         rb->lcd_vline(cx + 4, cy - 5, cy + 5);
         rb->lcd_fillrect(cx - 5, cy - 2, 3, 3);
         rb->lcd_fillrect(cx - 1, cy + 1, 3, 3);
         rb->lcd_fillrect(cx + 3, cy - 4, 3, 3);
-    } else if (item == 5) {
-        rb->lcd_drawline(cx - 5, cy, cx - 1, cy + 4);
-        rb->lcd_drawline(cx - 1, cy + 4, cx + 5, cy - 5);
     } else if (item == 6) {
         rb->lcd_hline(cx - 4, cx + 4, cy - 4);
         rb->lcd_hline(cx - 4, cx + 4, cy);
@@ -3127,57 +5119,100 @@ static void draw_main_glyph(int cx, int cy, int item, bool selected)
 static void draw_playlist_browser(void)
 {
     int row;
-    char name[80];
     char line[96];
 
-    draw_blade_shell(playlist_add_mode ? "ADD TO PLAYLIST" : "PLAYLISTS",
+    draw_blade_shell(playlist_add_mode ? "ADD TO PLAYLIST" :
+                     playlist_move_mode ? "MOVE PLAYLIST" : "PLAYLISTS",
                      RBPREP_GREEN);
     if (tree_parent == RBPREP_ROOT_NODE) {
-        text(112, 3, "/", LCD_LIGHTGRAY);
-    } else {
-        struct rbprep_node_record parent;
-        if (read_node_record(tree_parent, &parent) &&
-            read_index_string(parent.name_offset, name, sizeof(name)))
-            text(112, 4, name, LCD_LIGHTGRAY);
-    }
+        text(112, RBPREP_STATUS_HEIGHT + 3, "/", LCD_LIGHTGRAY);
+    } else if (tree_parent_name[0])
+        text(112, RBPREP_STATUS_HEIGHT + 4, tree_parent_name,
+             LCD_LIGHTGRAY);
 
     for (row = 0; row < RBPREP_LIST_ROWS; row++) {
         int ordinal = tree_top + row;
-        int node_index;
-        int y = 24 + row * 20;
-        struct rbprep_node_record node;
+        int y = 34 + row * 19;
+        struct rbprep_playlist_cache_row *cached;
+        struct rbprep_node_record *node;
 
         if (ordinal >= tree_child_count)
             break;
-        node_index = child_node_at(tree_parent, ordinal, &node);
-        if (node_index < 0 ||
-            !read_index_string(node.name_offset, name, sizeof(name)))
+        if (!cached_playlist_node(ordinal, &cached))
             continue;
+        node = &cached->node;
         if (ordinal == tree_selection) {
             draw_blade_selection(y - 2, 19,
-                                 node.kind == 0
+                                 node->kind == 0
                                  ? LCD_RGBPACK(34, 105, 73)
                                  : LCD_RGBPACK(27, 78, 128));
         }
-        draw_playlist_node_glyph(16, y + 7, node.kind == 0,
+        draw_playlist_node_glyph(16, y + 7, node->kind == 0,
                                  ordinal == tree_selection);
-        rb->snprintf(line, sizeof(line), "%.38s", name);
+        rb->snprintf(line, sizeof(line), "%.38s", cached->name);
         text(30, y + 2, line, LCD_WHITE);
-        if (node.kind != 0) {
+        if (node->kind != 0) {
+            int macro_slot = macro_link_for(node->source_id);
+            if (node->kind == 2)
+                text(212, y + 2, "SMART", RBPREP_GREEN);
+            if (macro_slot >= 0)
+                text(258, y + 2, macro_slot ? "M2" : "M1",
+                     LCD_RGBPACK(255, 145, 40));
             rb->snprintf(line, sizeof(line), "%lu",
-                         (unsigned long)node.member_count);
-            text(280, y + 2, line, LCD_LIGHTGRAY);
+                         (unsigned long)node->member_count);
+            text(282, y + 2, line, LCD_LIGHTGRAY);
         }
     }
     rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
     rb->lcd_fillrect(0, 210, LCD_WIDTH, 30);
     rb->snprintf(line, sizeof(line), "%d/%d", tree_selection + 1,
                  tree_child_count);
-    text(7, 213, line, LCD_RGBPACK(70, 235, 125));
+    text(7, 213, line, RBPREP_GREEN);
     text(70, 213, "WHEEL: BROWSE", LCD_LIGHTGRAY);
     text(7, 226, playlist_add_mode
          ? "SELECT: CHOOSE DESTINATION     MENU: CANCEL"
-         : "SELECT: OPEN     MENU: BACK", LCD_WHITE);
+         : playlist_move_mode
+         ? "SELECT: OPEN FOLDER   PLAY: MOVE HERE   MENU: CANCEL"
+         : "SELECT: OPEN   HOLD: MANAGE   MENU: BACK", LCD_WHITE);
+}
+
+static void draw_playlist_actions(void)
+{
+    static const char * const actions[] = {
+        "CREATE PLAYLIST HERE", "RENAME PLAYLIST",
+        "MOVE PLAYLIST", "DELETE PLAYLIST", "WORKFLOW PAD"
+    };
+    struct rbprep_node_record node;
+    char name[64];
+    char line[96];
+    bool editable = playlist_action_node >= 0 &&
+                    read_node_record(playlist_action_node, &node) &&
+                    node.kind != 0;
+    int i;
+
+    draw_blade_shell("PLAYLIST MANAGER", RBPREP_GREEN);
+    if (editable && read_index_string(node.name_offset, name, sizeof(name)))
+        rb->snprintf(line, sizeof(line), "SELECTED: %.42s", name);
+    else
+        rb->snprintf(line, sizeof(line), "DESTINATION: CURRENT FOLDER");
+    text(12, 35, line, LCD_RGBPACK(145, 165, 151));
+    for (i = 0; i < (int)ARRAYLEN(actions); i++) {
+        int y = 52 + i * 28;
+        bool enabled = i == 0 || editable;
+        if (i == playlist_action_selection)
+            draw_blade_selection(y - 3, 23, RBPREP_GREEN);
+        draw_playlist_node_glyph(20, y + 7, false,
+                                 i == playlist_action_selection);
+        text(40, y + 3, actions[i],
+             enabled ? LCD_WHITE : LCD_RGBPACK(65, 75, 68));
+        if (i == 4 && editable) {
+            int macro_slot = macro_link_for(node.source_id);
+            text(255, y + 3, macro_slot < 0 ? "OFF" :
+                 macro_slot == 0 ? "M1" : "M2", RBPREP_GREEN);
+        }
+    }
+    text(7, 210, "WHEEL: CHOOSE    SELECT: OPEN", LCD_WHITE);
+    text(7, 226, "MENU: BACK", LCD_LIGHTGRAY);
 }
 
 static void draw_track_browser(void)
@@ -3185,6 +5220,8 @@ static void draw_track_browser(void)
     int row;
     char title_buffer[96];
     char artist_buffer[72];
+    char genre_buffer[48];
+    char key_buffer[24];
     char name[80];
     char line[96];
 
@@ -3193,21 +5230,30 @@ static void draw_track_browser(void)
     if (active_playlist_node >= 0) {
         struct rbprep_node_record node;
         if (read_node_record(active_playlist_node, &node) &&
-            read_index_string(node.name_offset, name, sizeof(name)))
-            text(75, 4, name, LCD_LIGHTGRAY);
+            read_index_string(node.name_offset, name, sizeof(name))) {
+            text(75, RBPREP_STATUS_HEIGHT + 4, name, LCD_LIGHTGRAY);
+            if (node.kind == 2)
+                text(272, RBPREP_STATUS_HEIGHT + 4, "SMART", RBPREP_GREEN);
+        }
     } else {
-        rb->snprintf(line, sizeof(line), "%s %s%s",
-                     track_sort_names[track_sort_key],
-                     track_sort_descending ? "v" : "^",
-                     search_active ? "  FILTERED" : "");
-        text(184, 4, line, search_active
-             ? LCD_RGBPACK(255, 145, 40) : LCD_RGBPACK(105, 125, 112));
+        if (collection_shuffle_active) {
+            rb->strlcpy(line, "SHUFFLED  /  AUTO-NEXT", sizeof(line));
+            text(154, RBPREP_STATUS_HEIGHT + 4, line, RBPREP_GREEN);
+        } else {
+            rb->snprintf(line, sizeof(line), "%s %s%s",
+                         track_sort_names[track_sort_key],
+                         track_sort_descending ? "v" : "^",
+                         search_active ? "  FILTERED" : "");
+            text(184, RBPREP_STATUS_HEIGHT + 4, line, search_active
+                 ? LCD_RGBPACK(255, 145, 40)
+                 : LCD_RGBPACK(105, 125, 112));
+        }
     }
 
     for (row = 0; row < RBPREP_LIST_ROWS; row++) {
         int ordinal = track_top + row;
         int index;
-        int y = 22 + row * 20;
+        int y = 32 + row * 20;
         struct rbprep_track_record track;
 
         if (ordinal >= track_row_count)
@@ -3219,40 +5265,67 @@ static void draw_track_browser(void)
                           sizeof(title_buffer));
         read_index_string(track.artist_offset, artist_buffer,
                           sizeof(artist_buffer));
+        if (!read_index_string(track.genre_offset, genre_buffer,
+                               sizeof(genre_buffer)))
+            genre_buffer[0] = '\0';
+        if (!read_index_string(track.key_offset, key_buffer,
+                               sizeof(key_buffer)))
+            key_buffer[0] = '\0';
         if (track_sort_key == TRACK_SORT_COMMENTS)
             read_index_string(track.comments_offset, artist_buffer,
                               sizeof(artist_buffer));
         else if (track_sort_key == TRACK_SORT_TAGS)
             read_index_string(track.tags_offset, artist_buffer,
                               sizeof(artist_buffer));
+        else if (track_sort_key == TRACK_SORT_YEAR) {
+            rb->strlcpy(name, artist_buffer, sizeof(name));
+            rb->snprintf(artist_buffer, sizeof(artist_buffer),
+                         "%04d  %.24s", track.year, name);
+        } else if (track_sort_key == TRACK_SORT_IMPORTED) {
+            rb->strlcpy(name, artist_buffer, sizeof(name));
+            if (track.import_date) {
+                int year = 1980 + (track.import_date >> 9);
+                int month = (track.import_date >> 5) & 15;
+                int day = track.import_date & 31;
+                rb->snprintf(artist_buffer, sizeof(artist_buffer),
+                             "%04d-%02d-%02d  %.18s", year, month, day,
+                             name);
+            } else {
+                rb->snprintf(artist_buffer, sizeof(artist_buffer),
+                             "DATE --  %.22s", name);
+            }
+        }
+        if (genre_buffer[0]) {
+            rb->strlcat(artist_buffer, " [", sizeof(artist_buffer));
+            rb->strlcat(artist_buffer, genre_buffer, sizeof(artist_buffer));
+            rb->strlcat(artist_buffer, "]", sizeof(artist_buffer));
+        }
         if (ordinal == track_selection) {
             draw_blade_selection(y - 1, 20,
                                  LCD_RGBPACK(25, 91, 148));
         }
         draw_record_badge(12, y + 8, 5,
-                          cue_palette[track.color & 7],
+                          track_color_display(track.color),
                           ordinal == track_selection);
         rb->snprintf(line, sizeof(line), "%.38s", title_buffer);
         text(22, y, line, LCD_WHITE);
-        rb->snprintf(line, sizeof(line), "%.38s", artist_buffer);
+        /* Let the secondary metadata run beneath the fixed DJ columns. BPM
+           and Key are drawn afterwards, so they remain authoritative when a
+           long Artist + [Genre] string reaches the right-hand side. */
+        rb->snprintf(line, sizeof(line), "%.46s", artist_buffer);
         text(28, y + 10, line, LCD_RGBPACK(145, 165, 151));
         rb->snprintf(line, sizeof(line), "%d.%02d",
                      track.bpm_x100 / 100, track.bpm_x100 % 100);
-        if (track_sort_key == TRACK_SORT_YEAR)
-            rb->snprintf(line, sizeof(line), "%04d", track.year);
-        else if (track_sort_key == TRACK_SORT_KEY)
-            read_index_string(track.key_offset, line, sizeof(line));
-        else if (track_sort_key == TRACK_SORT_COMMENTS)
-            rb->snprintf(line, sizeof(line), "CMT");
-        else if (track_sort_key == TRACK_SORT_TAGS)
-            rb->snprintf(line, sizeof(line), "TAG");
-        text(276, y + 10, line, RBPREP_GREEN);
+        text(232, y + 10, line, RBPREP_GREEN);
+        rb->snprintf(line, sizeof(line), "%.6s",
+                     key_buffer[0] ? key_buffer : "--");
+        text(276, y + 10, line, LCD_WHITE);
     }
     rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
     rb->lcd_fillrect(0, 210, LCD_WIDTH, 30);
     rb->snprintf(line, sizeof(line), "%d/%d", track_selection + 1,
                  track_row_count);
-    text(7, 213, line, LCD_RGBPACK(70, 235, 125));
+    text(7, 213, line, RBPREP_GREEN);
     text(78, 213, "WHEEL: BROWSE", LCD_LIGHTGRAY);
     if (search_active) {
         rb->snprintf(line, sizeof(line), "SEARCH: %.31s", track_search);
@@ -3267,7 +5340,8 @@ static void draw_collection_filter(void)
 {
     static const char *items[] = {
         "SEARCH...", "CLEAR SEARCH", "SORT TITLE", "SORT BPM",
-        "SORT YEAR", "SORT KEY", "SORT COMMENTS", "SORT TAGS"
+        "SORT YEAR", "SORT KEY", "SORT COMMENTS", "SORT TAGS",
+        "SORT IMPORT DATE"
     };
     char line[80];
     int row;
@@ -3276,10 +5350,10 @@ static void draw_collection_filter(void)
                      RBPREP_GREEN);
     rb->snprintf(line, sizeof(line), "QUERY  %s",
                  track_search[0] ? track_search : "<ALL TRACKS>");
-    text(7, 20, line, track_search[0]
+    text(7, 34, line, track_search[0]
          ? RBPREP_GREEN : LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < (int)ARRAYLEN(items); row++) {
-        int y = 43 + row * 21;
+        int y = 52 + row * 19;
         bool selected = row == filter_selection;
         bool active = row >= 2 && row - 2 == track_sort_key;
         if (selected) {
@@ -3290,48 +5364,74 @@ static void draw_collection_filter(void)
         draw_record_badge(12, y + 5, 5,
                           RBPREP_GREEN, selected);
         text(24, y, items[row], selected ? LCD_WHITE
-             : active ? LCD_RGBPACK(70, 235, 125)
+             : active ? RBPREP_GREEN
                       : LCD_RGBPACK(178, 192, 183));
         if (active)
             text(286, y, track_sort_descending ? "v" : "^",
-                 LCD_RGBPACK(70, 235, 125));
+                 RBPREP_GREEN);
     }
     text(7, 226, "WHEEL: CHOOSE   SELECT: APPLY   MENU: TRACKS", LCD_WHITE);
 }
 
 static enum rbprep_tool active_tool(void)
 {
-    if (mode == MODE_DECK)
-        return TOOL_SEEK + deck_tool;
-    if (mode == MODE_GRID)
-        return TOOL_GRID_NUDGE + grid_tool;
-    if (mode == MODE_CUES)
-        return TOOL_CUE_SLOT + cue_tool;
-    if (mode == MODE_LOOP)
-        return TOOL_LOOP_LENGTH + loop_tool;
-    return TOOL_META_RATING + metadata_tool;
+    int page;
+    int selected;
+
+    for (page = 0; page < (int)ARRAYLEN(tool_pages); page++) {
+        if (tool_pages[page].mode != mode)
+            continue;
+        if (mode == MODE_DECK) selected = deck_tool;
+        else if (mode == MODE_TEMPO) selected = tempo_tool;
+        else if (mode == MODE_GRID) selected = grid_tool;
+        else if (mode == MODE_CUES) selected = cue_tool;
+        else if (mode == MODE_LOOP) selected = loop_tool;
+        else if (mode == MODE_METADATA) selected = metadata_tool;
+        else if (mode == MODE_LIST) selected = list_tool;
+        else if (mode == MODE_PNAV) selected = pnav_tool;
+        else if (mode == MODE_VISUALIZER) selected = visualizer_tool;
+        else selected = macro_tool;
+        selected = MAX(0, MIN(tool_pages[page].count - 1, selected));
+        return tool_pages[page].tools[selected];
+    }
+    return TOOL_SEEK;
+}
+
+static int tool_page_index(void)
+{
+    int page;
+    for (page = 0; page < (int)ARRAYLEN(tool_pages); page++)
+        if (tool_pages[page].mode == mode)
+            return page;
+    return 0;
 }
 
 static int tool_count(void)
 {
-    if (mode == MODE_DECK)
-        return 11;
-    if (mode == MODE_GRID || mode == MODE_CUES || mode == MODE_LOOP)
-        return 4;
-    return 4;
+    return tool_pages[tool_page_index()].count;
 }
 
 static int *tool_selection(void)
 {
     if (mode == MODE_DECK)
         return &deck_tool;
+    if (mode == MODE_TEMPO)
+        return &tempo_tool;
     if (mode == MODE_GRID)
         return &grid_tool;
     if (mode == MODE_CUES)
         return &cue_tool;
     if (mode == MODE_LOOP)
         return &loop_tool;
-    return &metadata_tool;
+    if (mode == MODE_METADATA)
+        return &metadata_tool;
+    if (mode == MODE_LIST)
+        return &list_tool;
+    if (mode == MODE_PNAV)
+        return &pnav_tool;
+    if (mode == MODE_VISUALIZER)
+        return &visualizer_tool;
+    return &macro_tool;
 }
 
 static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
@@ -3379,23 +5479,80 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
         rb->lcd_drawline(x + 5, y + 5, x + 8, y);
         rb->lcd_hline(x, x + 8, y + 8);
     } else if (tool == TOOL_PLAYLIST_MODE) {
-        rb->lcd_hline(x, x + 5, y + 1);
-        rb->lcd_hline(x, x + 5, y + 4);
-        rb->lcd_hline(x, x + 5, y + 7);
-        rb->lcd_drawline(x + 5, y + 2, x + 8, y + 4);
-        rb->lcd_drawline(x + 8, y + 4, x + 5, y + 6);
+        /* Continuous-play/auto-next: two forward play heads and an end bar.
+           The old three-line glyph was too easy to mistake for bookmarks. */
+        rb->lcd_drawline(x, y + 1, x, y + 7);
+        rb->lcd_drawline(x, y + 1, x + 3, cy);
+        rb->lcd_drawline(x + 3, cy, x, y + 7);
+        rb->lcd_drawline(x + 4, y + 1, x + 7, cy);
+        rb->lcd_drawline(x + 7, cy, x + 4, y + 7);
+        rb->lcd_vline(x + 8, y + 1, y + 7);
     } else if (tool == TOOL_ADD_PLAYLIST) {
         rb->lcd_hline(x, x + 4, y + 1);
         rb->lcd_hline(x, x + 4, y + 4);
         rb->lcd_hline(x, x + 4, y + 7);
         rb->lcd_hline(x + 5, x + 9, y + 5);
         rb->lcd_vline(x + 7, y + 3, y + 7);
+    } else if (tool == TOOL_PLAYLIST_PREVIOUS ||
+               tool == TOOL_PLAYLIST_NEXT) {
+        bool previous = tool == TOOL_PLAYLIST_PREVIOUS;
+        int direction = previous ? -1 : 1;
+        int bar_x = previous ? x : x + 8;
+        int tip_x = cx + direction * 4;
+
+        rb->lcd_vline(bar_x, y + 1, y + 7);
+        rb->lcd_drawline(cx - direction * 3, y + 1, tip_x, cy);
+        rb->lcd_drawline(tip_x, cy, cx - direction * 3, y + 7);
+    } else if (tool == TOOL_RESTART_PLAYBACK) {
+        rb->lcd_vline(x, y + 1, y + 7);
+        rb->lcd_drawline(x + 2, cy, x + 5, y + 1);
+        rb->lcd_drawline(x + 2, cy, x + 5, y + 7);
+        rb->lcd_drawline(x + 5, y + 1, x + 8, cy);
+        rb->lcd_drawline(x + 8, cy, x + 5, y + 7);
+    } else if (tool == TOOL_RELOAD_TRACK) {
+        xlcd_drawcircle(cx, cy, 4);
+        rb->lcd_drawline(cx - 4, cy - 1, cx - 1, cy - 4);
+        rb->lcd_drawline(cx - 4, cy - 1, cx, cy - 1);
+    } else if (tool == TOOL_BURN_SONG || tool == TOOL_BURN_ALL) {
+        rb->lcd_drawline(cx, y, cx, y + 6);
+        rb->lcd_drawline(cx, y + 6, cx - 3, y + 3);
+        rb->lcd_drawline(cx, y + 6, cx + 3, y + 3);
+        rb->lcd_hline(x, x + 8, y + 8);
+        if (tool == TOOL_BURN_ALL)
+            rb->lcd_hline(x + 1, x + 7, y + 6);
     } else if (tool == TOOL_WAVEFORM_STYLE) {
         rb->lcd_vline(x, cy - 1, cy + 1);
         rb->lcd_vline(x + 2, cy - 3, cy + 3);
         rb->lcd_vline(x + 4, cy - 4, cy + 4);
         rb->lcd_vline(x + 6, cy - 2, cy + 2);
         rb->lcd_vline(x + 8, cy - 1, cy + 1);
+    } else if (tool == TOOL_KEYLOCK) {
+        rb->lcd_drawrect(x + 1, cy - 1, 7, 6);
+        rb->lcd_hline(cx - 2, cx + 2, cy - 4);
+        rb->lcd_vline(cx - 3, cy - 3, cy - 1);
+        rb->lcd_vline(cx + 3, cy - 3, cy - 1);
+        rb->lcd_vline(cx, cy + 1, cy + 3);
+    } else if (tool == TOOL_VIS_BOOMBOX) {
+        rb->lcd_drawrect(x, y + 1, 9, 8);
+        xlcd_drawcircle(cx - 2, cy + 1, 2);
+        xlcd_drawcircle(cx + 3, cy + 1, 2);
+        rb->lcd_hline(x + 1, x + 7, y + 2);
+    } else if (tool == TOOL_VIS_EQ) {
+        rb->lcd_vline(x, cy - 1, cy + 4);
+        rb->lcd_vline(x + 2, cy - 4, cy + 4);
+        rb->lcd_vline(x + 4, cy, cy + 4);
+        rb->lcd_vline(x + 6, cy - 3, cy + 4);
+        rb->lcd_vline(x + 8, cy - 1, cy + 4);
+    } else if (tool == TOOL_VIS_TURNTABLE) {
+        xlcd_drawcircle(cx, cy, 4);
+        xlcd_fillcircle(cx, cy, 1);
+        rb->lcd_drawline(cx + 3, cy - 4, cx + 5, cy + 2);
+    } else if (tool == TOOL_MACRO_ONE || tool == TOOL_MACRO_TWO) {
+        rb->lcd_drawrect(x, y + 1, 9, 7);
+        rb->lcd_fillrect(x + 2, y + 3, 2, 2);
+        rb->lcd_fillrect(x + 5, y + 3, 2, 2);
+        if (tool == TOOL_MACRO_TWO)
+            rb->lcd_hline(x + 2, x + 6, y + 7);
     } else if (tool == TOOL_GRID_NUDGE) {
         rb->lcd_vline(cx, y, y + 8);
         rb->lcd_drawline(x, cy, x + 3, cy - 3);
@@ -3473,28 +5630,383 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
     }
 }
 
+static bool draw_macro_strip(void)
+{
+    int active = macro_active;
+    int slot;
+
+    if (active < 0 || active >= RBPREP_MACRO_COUNT)
+        return false;
+    rb->lcd_set_foreground(LCD_RGBPACK(5, 10, 7));
+    rb->lcd_fillrect(RBPREP_OVERVIEW_X, RBPREP_OVERVIEW_Y,
+                     RBPREP_OVERVIEW_WIDTH, RBPREP_OVERVIEW_HEIGHT);
+    for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++) {
+        int count = tool_macros[slot].count;
+        int visible = MIN(count, 20);
+        int first = MAX(0, MIN(count - visible,
+                        macro_position - visible / 2));
+        int cy = RBPREP_OVERVIEW_Y + 7 + slot * 14;
+        int i;
+
+        text(2, cy - 4, slot == 0 ? "M1" : "M2",
+             active == slot ? RBPREP_GREEN : LCD_RGBPACK(82, 100, 88));
+        if (count <= 0) {
+            text(25, cy - 4, "EMPTY - HOLD ORB TO PROGRAM",
+                 LCD_RGBPACK(90, 110, 97));
+            continue;
+        }
+        for (i = 0; i < visible; i++) {
+            int step = first + i;
+            int cx = 31 + i * 14;
+            bool selected = slot == active && step == macro_position;
+            int color = selected ? LCD_WHITE :
+                        slot == active ? LCD_RGBPACK(42, 78, 55) :
+                                         LCD_RGBPACK(30, 44, 35);
+
+            rb->lcd_set_foreground(color);
+            xlcd_fillcircle(cx, cy, selected ? 6 : 5);
+            draw_tool_icon(cx, cy, tool_macros[slot].steps[step].tool,
+                           selected ? LCD_BLACK : LCD_RGBPACK(170, 192, 177));
+            if (tool_macros[slot].steps[step].value != RBPREP_MACRO_CHOOSE) {
+                rb->lcd_set_foreground(LCD_RGBPACK(255, 145, 40));
+                rb->lcd_fillrect(cx + 4, cy - 6, 2, 2);
+            }
+        }
+    }
+    if (!macro_store_valid)
+        text(278, RBPREP_OVERVIEW_Y + 1, "!", LCD_RGBPACK(255, 145, 40));
+    rb->lcd_set_foreground(LCD_RGBPACK(55, 75, 62));
+    rb->lcd_drawrect(RBPREP_OVERVIEW_X, RBPREP_OVERVIEW_Y,
+                     RBPREP_OVERVIEW_WIDTH, RBPREP_OVERVIEW_HEIGHT);
+    return true;
+}
+
+static int macro_picker_count_for_page(int page)
+{
+    int count = 0;
+    int item;
+
+    page = MAX(0, MIN((int)ARRAYLEN(tool_pages) - 1, page));
+    /* A workflow may select ordinary deck tools, but never another workflow.
+       Filter them by identity so their visual position on MACR is irrelevant. */
+    for (item = 0; item < tool_pages[page].count; item++) {
+        enum rbprep_tool tool = tool_pages[page].tools[item];
+
+        if (tool != TOOL_MACRO_ONE && tool != TOOL_MACRO_TWO)
+            count++;
+    }
+    return count;
+}
+
+static enum rbprep_tool macro_picker_tool_at(int page, int ordinal)
+{
+    int item;
+
+    page = MAX(0, MIN((int)ARRAYLEN(tool_pages) - 1, page));
+    for (item = 0; item < tool_pages[page].count; item++) {
+        enum rbprep_tool tool = tool_pages[page].tools[item];
+
+        if (tool == TOOL_MACRO_ONE || tool == TOOL_MACRO_TWO)
+            continue;
+        if (ordinal-- == 0)
+            return tool;
+    }
+    return TOOL_SEEK;
+}
+
+static int macro_picker_page_count(void)
+{
+    return macro_picker_count_for_page(macro_picker_page);
+}
+
+static bool macro_tool_supports_fixed_value(enum rbprep_tool tool)
+{
+    return tool == TOOL_SCRUB_STEP || tool == TOOL_ZOOM ||
+           tool == TOOL_GAIN || tool == TOOL_HOST_RPM ||
+           tool == TOOL_PLAY_RPM || tool == TOOL_PITCH_BEND ||
+           tool == TOOL_TEMPO || tool == TOOL_PLAYLIST_MODE ||
+           tool == TOOL_KEYLOCK || tool == TOOL_GRID_BPM ||
+           tool == TOOL_GRID_QUANTIZE || tool == TOOL_CUE_SLOT ||
+           tool == TOOL_CUE_MOVE || tool == TOOL_CUE_COLOR ||
+           tool == TOOL_CUE_DELETE || tool == TOOL_LOOP_LENGTH ||
+           tool == TOOL_LOOP_ACTIVE;
+}
+
+static int macro_current_tool_value(enum rbprep_tool tool)
+{
+    if (tool == TOOL_SCRUB_STEP)
+        return scrub_step_index;
+    if (tool == TOOL_ZOOM)
+        return zoom;
+    if (tool == TOOL_GAIN)
+        return rb->global_status->volume;
+    if (tool == TOOL_HOST_RPM)
+        return host_rpm_index;
+    if (tool == TOOL_PLAY_RPM)
+        return played_rpm_index;
+    if (tool == TOOL_PITCH_BEND)
+        return pitch_bend_x100;
+    if (tool == TOOL_TEMPO)
+        return tempo_x100;
+    if (tool == TOOL_PLAYLIST_MODE)
+        return playlist_playback;
+    if (tool == TOOL_KEYLOCK)
+        return keylock_enabled;
+    if (tool == TOOL_GRID_BPM)
+        return grid_bpm_x100;
+    if (tool == TOOL_GRID_QUANTIZE)
+        return quantize;
+    if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE ||
+        tool == TOOL_CUE_COLOR || tool == TOOL_CUE_DELETE)
+        return cue_slot;
+    if (tool == TOOL_LOOP_LENGTH)
+        return loop_length_index;
+    if (tool == TOOL_LOOP_ACTIVE)
+        return loop_active;
+    return RBPREP_MACRO_CHOOSE;
+}
+
+static void format_macro_value(char *buffer, size_t size,
+                               enum rbprep_tool tool, int value)
+{
+    if (value == RBPREP_MACRO_CHOOSE) {
+        rb->strlcpy(buffer, "CHOOSE WHEN USED", size);
+    } else if (tool == TOOL_SCRUB_STEP) {
+        value = MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1, value));
+        rb->snprintf(buffer, size, "%d ms / TICK", scrub_steps[value]);
+    } else if (tool == TOOL_ZOOM) {
+        rb->snprintf(buffer, size, "%d x ZOOM", value);
+    } else if (tool == TOOL_GAIN) {
+        rb->snprintf(buffer, size, "%d %s",
+                     rb->sound_val2phys(SOUND_VOLUME, value),
+                     rb->sound_unit(SOUND_VOLUME));
+    } else if (tool == TOOL_HOST_RPM || tool == TOOL_PLAY_RPM) {
+        value = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1, value));
+        rb->snprintf(buffer, size, "%s RPM", rpm_styles[value]);
+    } else if (tool == TOOL_PITCH_BEND) {
+        format_percent_delta(buffer, size, value);
+        rb->strlcat(buffer, "% BEND", size);
+    } else if (tool == TOOL_TEMPO) {
+        rb->snprintf(buffer, size, "%d.%02d %%", value / 100,
+                     ABS(value % 100));
+    } else if (tool == TOOL_GRID_BPM) {
+        rb->snprintf(buffer, size, "%d.%02d BPM", value / 100,
+                     ABS(value % 100));
+    } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE ||
+               tool == TOOL_CUE_COLOR || tool == TOOL_CUE_DELETE) {
+        rb->snprintf(buffer, size, "CUE %02d", value + 1);
+    } else if (tool == TOOL_LOOP_LENGTH) {
+        value = MAX(0, MIN((int)ARRAYLEN(loop_length_names) - 1, value));
+        rb->snprintf(buffer, size, "%s BEATS", loop_length_names[value]);
+    } else {
+        rb->strlcpy(buffer, value ? "ON" : "OFF", size);
+    }
+}
+
+static void draw_macro_actions(void)
+{
+    static const char * const actions[] = {
+        "RENAME", "EDIT SEQUENCE", "CLEAR"
+    };
+    struct rbprep_tool_macro *macro = &tool_macros[macro_manage_slot];
+    char line[80];
+    int i;
+
+    draw_blade_shell("WORKFLOW MANAGER", RBPREP_GREEN);
+    rb->snprintf(line, sizeof(line), "M%d  %.23s  /  %d STEPS",
+                 macro_manage_slot + 1, macro->name, macro->count);
+    text(12, 29, line, LCD_RGBPACK(145, 165, 151));
+    for (i = 0; i < (int)ARRAYLEN(actions); i++) {
+        int y = 62 + i * 38;
+        bool selected = i == macro_action_selection;
+
+        if (selected)
+            draw_blade_selection(y - 5, 25, RBPREP_GREEN);
+        rb->lcd_set_foreground(selected ? LCD_WHITE : RBPREP_GREEN);
+        xlcd_drawcircle(24, y + 7, 7);
+        if (i == 0) {
+            rb->lcd_drawline(20, y + 10, 28, y + 2);
+            rb->lcd_drawline(25, y + 2, 28, y + 5);
+        } else if (i == 1) {
+            rb->lcd_hline(19, 29, y + 3);
+            rb->lcd_hline(19, 29, y + 7);
+            rb->lcd_hline(19, 29, y + 11);
+        } else {
+            rb->lcd_drawrect(20, y + 3, 9, 9);
+            rb->lcd_hline(19, 30, y + 1);
+        }
+        text(44, y + 3, actions[i],
+             selected ? LCD_WHITE : LCD_RGBPACK(160, 181, 166));
+    }
+    text(8, 205, "WHEEL / LEFT RIGHT: CHOOSE", LCD_WHITE);
+    text(8, 222, "SELECT: OPEN     HOLD MENU: BACK", LCD_LIGHTGRAY);
+}
+
+static void draw_macro_editor(void)
+{
+    static const char * const operations[] = {
+        "INSERT", "REPLACE", "DELETE", "DEFAULT"
+    };
+    struct rbprep_tool_macro *macro = &tool_macros[macro_manage_slot];
+    char line[80];
+    int i;
+
+    draw_blade_shell("WORKFLOW EDITOR", RBPREP_GREEN);
+    rb->snprintf(line, sizeof(line), "M%d  %.23s  /  %d OF %d",
+                 macro_manage_slot + 1, macro->name, macro->count,
+                 RBPREP_MACRO_STEPS);
+    text(9, 27, line, LCD_RGBPACK(155, 179, 161));
+    for (i = 0; i < 4; i++) {
+        int left = 7 + i * 77;
+        int color = i == macro_edit_operation ? RBPREP_GREEN
+                                               : LCD_RGBPACK(55, 76, 63);
+
+        rb->lcd_set_foreground(color);
+        rb->lcd_fillrect(left, 43, 73, 19);
+        centered_text(left, 73, 47, operations[i],
+                      i == macro_edit_operation ? LCD_BLACK : LCD_LIGHTGRAY);
+    }
+    for (i = 0; i < RBPREP_MACRO_STEPS; i++) {
+        int column = i % 8;
+        int row = i / 8;
+        int cx = 23 + column * 39;
+        int cy = 82 + row * 36;
+        bool used = i < macro->count;
+        bool insertion = macro_edit_operation == 0 &&
+                         i == macro->count && macro->count < RBPREP_MACRO_STEPS;
+        bool selected = i == macro_edit_position && (used || insertion);
+        int color = selected ? LCD_WHITE : used ? LCD_RGBPACK(40, 78, 54)
+                                                 : LCD_RGBPACK(21, 31, 25);
+
+        rb->lcd_set_foreground(color);
+        if (used)
+            xlcd_fillcircle(cx, cy, selected ? 10 : 8);
+        else
+            xlcd_drawcircle(cx, cy, selected ? 10 : 8);
+        if (used)
+            draw_tool_icon(cx, cy, macro->steps[i].tool,
+                           selected ? LCD_BLACK : LCD_RGBPACK(190, 213, 197));
+        else if (insertion)
+            text(cx - 3, cy - 5, "+", selected ? LCD_WHITE : RBPREP_GREEN);
+        if (used && macro->steps[i].value != RBPREP_MACRO_CHOOSE) {
+            rb->lcd_set_foreground(LCD_RGBPACK(255, 145, 40));
+            rb->lcd_fillrect(cx + 7, cy - 9, 3, 3);
+        }
+        rb->snprintf(line, sizeof(line), "%02d", i + 1);
+        centered_text(cx - 12, 24, cy + 11, line,
+                      selected ? RBPREP_GREEN : LCD_RGBPACK(68, 84, 73));
+    }
+    text(8, 193, "WHEEL / LEFT RIGHT: POSITION", LCD_WHITE);
+    text(8, 208, "MENU / PLAY: INSERT REPLACE DELETE DEFAULT", LCD_LIGHTGRAY);
+    text(8, 223, "SELECT: APPLY     HOLD MENU: BACK", RBPREP_GREEN);
+}
+
+static void draw_macro_picker(void)
+{
+    static const char * const operations[] = {
+        "INSERT", "REPLACE", "DELETE"
+    };
+    int page = MAX(0, MIN((int)ARRAYLEN(tool_pages) - 1,
+                          macro_picker_page));
+    int count = macro_picker_page_count();
+    char line[80];
+    int i;
+
+    draw_blade_shell("CHOOSE WORKFLOW TOOL", RBPREP_GREEN);
+    rb->snprintf(line, sizeof(line), "%s AT %02d  /  PAGE %s",
+                 operations[macro_edit_operation], macro_edit_position + 1,
+                 tool_pages[page].label);
+    text(10, 28, line, LCD_RGBPACK(155, 179, 161));
+    for (i = 0; i < count; i++) {
+        enum rbprep_tool tool = macro_picker_tool_at(page, i);
+        int column = i % 3;
+        int row = i / 3;
+        int left = 7 + column * 104;
+        int cx = left + 52;
+        int cy = 82 + row * 65;
+        bool selected = i == macro_picker_tool;
+
+        if (selected)
+            draw_blade_selection(cy - 18, 35, RBPREP_GREEN);
+        rb->lcd_set_foreground(selected ? LCD_WHITE
+                                        : LCD_RGBPACK(42, 76, 53));
+        xlcd_fillcircle(cx, cy - 2, selected ? 13 : 11);
+        draw_tool_icon(cx, cy - 2, tool,
+                       selected ? LCD_BLACK : LCD_RGBPACK(188, 209, 194));
+        centered_text(left, 104, cy + 15, tool_names[tool],
+                      selected ? LCD_WHITE : LCD_RGBPACK(142, 164, 149));
+    }
+    text(8, 203, "WHEEL / LEFT RIGHT: TOOL", LCD_WHITE);
+    text(8, 219, "MENU / PLAY: PAGE   SELECT: CHOOSE", RBPREP_GREEN);
+}
+
+static void draw_macro_value_editor(void)
+{
+    char value[64];
+    const char *choice = macro_value_choose ? "CHOOSE WHEN USED"
+                                            : "USE STORED VALUE";
+
+    draw_blade_shell("WORKFLOW DEFAULT", RBPREP_GREEN);
+    text(10, 37, tool_names[macro_value_tool], LCD_WHITE);
+    text(10, 55, macro_value_new_step ? "NEW CELL" : "EXISTING CELL",
+         LCD_RGBPACK(130, 151, 136));
+    rb->lcd_set_foreground(LCD_RGBPACK(17, 24, 20));
+    rb->lcd_fillrect(9, 78, LCD_WIDTH - 18, 54);
+    rb->lcd_set_foreground(macro_value_choose ? LCD_RGBPACK(80, 180, 245)
+                                              : RBPREP_GREEN);
+    rb->lcd_drawrect(9, 78, LCD_WIDTH - 18, 54);
+    format_macro_value(value, sizeof(value), macro_value_tool,
+                       macro_value_choose ? RBPREP_MACRO_CHOOSE
+                                          : macro_value_draft);
+    centered_text(9, LCD_WIDTH - 18, 91, value, LCD_WHITE);
+    centered_text(9, LCD_WIDTH - 18, 112, choice,
+                  macro_value_choose ? LCD_RGBPACK(80, 180, 245)
+                                     : RBPREP_GREEN);
+
+    rb->lcd_set_foreground(LCD_RGBPACK(24, 30, 27));
+    rb->lcd_fillrect(9, 145, LCD_WIDTH - 18, 27);
+    text(18, 153, "WHEEL TOUCH", LCD_LIGHTGRAY);
+    text(224, 153, macro_value_choose ? "LIVE" :
+         macro_value_lock ? "LOCKED" : "LIVE",
+         !macro_value_choose && macro_value_lock
+         ? LCD_RGBPACK(255, 145, 40) : RBPREP_GREEN);
+
+    text(8, 188, "WHEEL: VALUE    MENU: FIXED / CHOOSE", LCD_WHITE);
+    text(8, 204, "PLAY: WHEEL LOCK    SELECT: SAVE", RBPREP_GREEN);
+    text(8, 220, "HOLD MENU: BACK", LCD_LIGHTGRAY);
+}
+
 static void draw_beat_phase(void)
 {
+    char position[8];
+    int bar = 1;
     int beat = 1;
     int index = current_beat_index(playhead);
     int i;
 
     if (index >= 0) {
+        int first_beat = adjusted_beat_number(0);
+
         beat = adjusted_beat_number(index);
+        bar = (index + first_beat - 1) / 4 + 1;
     } else if (beat_count <= 0) {
         int ordinal = (playhead - grid_phase_ms - grid_offset) /
                       beat_period_ms();
         if (ordinal >= 0) {
             beat = (ordinal & 3) + 1;
+            bar = ordinal / 4 + 1;
         }
     }
 
+    rb->snprintf(position, sizeof(position), "%d.%d", MIN(999, bar), beat);
+    text(232, 69, position, LCD_WHITE);
+
     for (i = 0; i < 4; i++) {
-        int x = 246 + i * 7;
+        int x = 264 + i * 5;
         rb->lcd_set_foreground(i + 1 == beat
-                              ? LCD_RGBPACK(70, 235, 125)
+                              ? RBPREP_GREEN
                               : LCD_RGBPACK(35, 53, 42));
-        rb->lcd_fillrect(x, 71, 5, 7);
+        rb->lcd_fillrect(x, 70, 3, 7);
     }
 }
 
@@ -3551,33 +6063,65 @@ static void advance_hud_scroll(int *position, int content_width,
 
 static void draw_track_header(bool advance_scroll)
 {
-    char title[192];
+    char title[320];
+    char identity[220];
     char fixed[64];
     char tail[96];
     char fitted[64];
     int width;
     bool title_overflow;
     bool metadata_overflow;
+    const char *extension = selected_extension;
+    int title_cycle;
 
     rb->lcd_set_foreground(LCD_RGBPACK(13, 13, 13));
-    rb->lcd_fillrect(0, 0, LCD_WIDTH, 16);
+    rb->lcd_fillrect(0, RBPREP_STATUS_HEIGHT, LCD_WIDTH, 13);
     rb->lcd_set_foreground(LCD_RGBPACK(8, 8, 8));
-    rb->lcd_fillrect(0, 16, LCD_WIDTH, 16);
+    rb->lcd_fillrect(0, RBPREP_STATUS_HEIGHT + 13, LCD_WIDTH, 13);
 
-    rb->snprintf(title, sizeof(title), "%s - %s%s",
-                 selected_artist[0] ? selected_artist : "RBPREP",
-                 selected_title[0] ? selected_title : mode_names[mode],
-                 selected_extension);
+    if (extension[0] == '.')
+        extension++;
+    if (track_year > 0)
+        rb->snprintf(identity, sizeof(identity), "[%04d] %s - %s",
+                     track_year,
+                     selected_artist[0] ? selected_artist : "RBPREP",
+                     selected_title[0] ? selected_title : mode_names[mode]);
+    else
+        rb->snprintf(identity, sizeof(identity), "%s - %s",
+                     selected_artist[0] ? selected_artist : "RBPREP",
+                     selected_title[0] ? selected_title : mode_names[mode]);
+    if (selected_comments[0]) {
+        if (extension[0])
+            rb->snprintf(title, sizeof(title), "%s [%s] || %s ||",
+                         identity,
+                         extension, selected_comments);
+        else
+            rb->snprintf(title, sizeof(title), "%s || %s ||",
+                         identity,
+                         selected_comments);
+    } else {
+        rb->snprintf(title, sizeof(title), extension[0]
+                     ? "%s [%s]" : "%s",
+                     identity,
+                     extension);
+    }
     rb->lcd_getstringsize(title, &width, NULL);
     title_overflow = width > LCD_WIDTH - 4;
     if (!title_overflow)
         title_scroll_px = 0;
-    else if (advance_scroll)
-        advance_hud_scroll(&title_scroll_px, width, LCD_WIDTH - 4);
-    text(2 - title_scroll_px, 3, title, LCD_WHITE);
+    else if (advance_scroll) {
+        title_cycle = width + 24;
+        title_scroll_px = (title_scroll_px + 2) % title_cycle;
+    }
+    text(2 - title_scroll_px, RBPREP_STATUS_HEIGHT + 2, title, LCD_WHITE);
+    if (title_overflow) {
+        title_cycle = width + 24;
+        text(2 - title_scroll_px + title_cycle,
+             RBPREP_STATUS_HEIGHT + 2, title, LCD_WHITE);
+    }
 
     rb->snprintf(tail, sizeof(tail), "%s  /  %s",
-                 color_labels[color_index & 7],
+                 color_labels[normalize_track_color(color_index)],
                  selected_genre[0] ? selected_genre : "--");
     rb->lcd_getstringsize(tail, &width, NULL);
     metadata_overflow = width > LCD_WIDTH - 132;
@@ -3585,43 +6129,62 @@ static void draw_track_header(bool advance_scroll)
         metadata_scroll_px = 0;
     else if (advance_scroll)
         advance_hud_scroll(&metadata_scroll_px, width, LCD_WIDTH - 132);
-    text(132 - metadata_scroll_px, 19, tail,
-         cue_palette[color_index & 7]);
+    text(132 - metadata_scroll_px, RBPREP_STATUS_HEIGHT + 15, tail,
+         track_color_display(color_index));
 
     /* The left metadata block also acts as a clip for the scrolling tail. */
     rb->lcd_set_foreground(LCD_RGBPACK(8, 8, 8));
-    rb->lcd_fillrect(0, 16, 132, 16);
+    rb->lcd_fillrect(0, RBPREP_STATUS_HEIGHT + 13, 132, 13);
     rb->snprintf(fixed, sizeof(fixed), "%d.%02d  %s",
                  grid_bpm_x100 / 100, grid_bpm_x100 % 100,
                  selected_key[0] ? selected_key : "--");
     fit_text(fitted, sizeof(fitted), fixed, 72);
-    text(2, 19, fitted, LCD_RGBPACK(85, 220, 255));
-    draw_rating_stars(76, 21);
-    rb->lcd_set_foreground(cue_palette[color_index & 7]);
-    rb->lcd_fillrect(120, 20, 7, 7);
+    text(2, RBPREP_STATUS_HEIGHT + 15, fitted,
+         LCD_RGBPACK(85, 220, 255));
+    draw_rating_stars(76, RBPREP_STATUS_HEIGHT + 17);
+    rb->lcd_set_foreground(track_color_display(color_index));
+    if (normalize_track_color(color_index) == RBPREP_TRACK_COLOR_NONE)
+        rb->lcd_drawrect(120, RBPREP_STATUS_HEIGHT + 16, 7, 7);
+    else
+        rb->lcd_fillrect(120, RBPREP_STATUS_HEIGHT + 16, 7, 7);
     hud_scroll_active = title_overflow || metadata_overflow;
+}
+
+static bool pnav_tool_available(enum rbprep_tool tool)
+{
+    if (tool == TOOL_PLAYLIST_PREVIOUS)
+        return playing_track_row > 0 && track_row_count > 0;
+    if (tool == TOOL_PLAYLIST_NEXT)
+        return playing_track_row >= 0 &&
+               playing_track_row + 1 < track_row_count;
+    if (tool == TOOL_RESTART_PLAYBACK || tool == TOOL_RELOAD_TRACK)
+        return selected_track_index >= 0;
+    return true;
 }
 
 static void draw_tool_orbs(void)
 {
+    int page = tool_page_index();
     int count = tool_count();
     int selected = *tool_selection();
     int i;
 
+    text(2, 69, tool_pages[page].label,
+         tool_menu_active ? LCD_WHITE : RBPREP_GREEN);
     for (i = 0; i < count; i++) {
-        enum rbprep_tool tool = active_tool() - selected + i;
-        int cx = count > 7 ? 7 + i * 12
-                           : count > 4 ? 38 + i * 17 : 50 + i * 26;
-        int color = i == selected
-                                  ? (tool_menu_active
-                                     ? LCD_WHITE
-                                     : RBPREP_GREEN)
-                                  : LCD_RGBPACK(48, 70, 56);
+        enum rbprep_tool tool = tool_pages[page].tools[i];
+        int cx = 51 + i * 18;
+        bool enabled = pnav_tool_available(tool);
+        int color = !enabled ? LCD_RGBPACK(8, 10, 9) : i == selected
+                  ? (tool_menu_active ? LCD_WHITE : RBPREP_GREEN)
+                  : LCD_RGBPACK(48, 70, 56);
         rb->lcd_set_foreground(color);
-        xlcd_fillcircle(cx, 74, count > 7
-                               ? (i == selected ? 6 : 5)
-                               : (i == selected ? 7 : 6));
-        draw_tool_icon(cx, 74, tool,
+        if (enabled)
+            xlcd_fillcircle(cx, 73, i == selected ? 7 : 6);
+        else
+            xlcd_drawcircle(cx, 73, i == selected ? 7 : 6);
+        draw_tool_icon(cx, 73, tool,
+                       !enabled ? LCD_RGBPACK(25, 29, 26) :
                        i == selected ? LCD_BLACK
                                      : LCD_RGBPACK(195, 215, 201));
     }
@@ -3633,7 +6196,7 @@ static void draw_tool_status(void)
     char fitted[96];
     enum rbprep_tool tool = active_tool();
     int color = tool_menu_active ? LCD_WHITE : RBPREP_GREEN;
-    int status_x = tool_count() > 7 ? 132 : 150;
+    int status_x = 116;
 
     if (tool == TOOL_SEEK)
         rb->snprintf(line, sizeof(line), "SEEK  %dms/tick", scrub_step_ms());
@@ -3651,12 +6214,12 @@ static void draw_tool_status(void)
                      rpm_styles[host_rpm_index],
                      rpm_styles[played_rpm_index]);
     else if (tool == TOOL_PLAY_RPM)
-        rb->snprintf(line, sizeof(line), "PLAY %s  HOST %s",
+        rb->snprintf(line, sizeof(line), "PLAY RPM %s  HOST %s",
                      rpm_styles[played_rpm_index], rpm_styles[host_rpm_index]);
     else if (tool == TOOL_PITCH_BEND) {
         char delta[16];
         format_percent_delta(delta, sizeof(delta), pitch_bend_x100);
-        rb->snprintf(line, sizeof(line), "BEND %s%%", delta);
+        rb->snprintf(line, sizeof(line), "PITCH BEND %s%%", delta);
     }
     else if (tool == TOOL_TEMPO)
         rb->snprintf(line, sizeof(line), "TEMPO  %d.%02d%%  RATE %d.%02d%%",
@@ -3667,32 +6230,57 @@ static void draw_tool_status(void)
                      playlist_playback ? "ON" : "OFF");
     else if (tool == TOOL_ADD_PLAYLIST)
         rb->snprintf(line, sizeof(line), "ADD TO PLAYLIST");
+    else if (tool == TOOL_BURN_SONG)
+        rb->snprintf(line, sizeof(line), "BURN TRACK  NOW");
+    else if (tool == TOOL_BURN_ALL)
+        rb->snprintf(line, sizeof(line), "BURN ALL  INSTANT");
+    else if (tool == TOOL_PLAYLIST_PREVIOUS)
+        rb->snprintf(line, sizeof(line), "PREV TRACK IN PLAYLIST");
+    else if (tool == TOOL_PLAYLIST_NEXT)
+        rb->snprintf(line, sizeof(line), "NEXT TRACK IN PLAYLIST");
+    else if (tool == TOOL_RESTART_PLAYBACK)
+        rb->snprintf(line, sizeof(line), "RESTART  PLAYBACK");
+    else if (tool == TOOL_RELOAD_TRACK)
+        rb->snprintf(line, sizeof(line), "RELOAD  CURRENT TRACK");
     else if (tool == TOOL_WAVEFORM_STYLE)
-        rb->snprintf(line, sizeof(line), "VISUALIZER  %s",
-                     visualizer_styles[visualizer_mode]);
+        rb->snprintf(line, sizeof(line), "RGB WAVEFORM");
+    else if (tool == TOOL_KEYLOCK)
+        rb->snprintf(line, sizeof(line), "PITCH LOCK  %s",
+                     keylock_enabled ? "ON" : "OFF");
+    else if (tool == TOOL_VIS_BOOMBOX)
+        rb->snprintf(line, sizeof(line), "BOOMBOX  BASS");
+    else if (tool == TOOL_VIS_EQ)
+        rb->snprintf(line, sizeof(line), "20-BAND EQ");
+    else if (tool == TOOL_VIS_TURNTABLE)
+        rb->snprintf(line, sizeof(line), "TURNTABLE  TECHNICS");
+    else if (tool == TOOL_MACRO_ONE || tool == TOOL_MACRO_TWO) {
+        int slot = tool == TOOL_MACRO_ONE ? 0 : 1;
+        rb->snprintf(line, sizeof(line), "M%d %.16s [%d]", slot + 1,
+                     tool_macros[slot].name, tool_macros[slot].count);
+    }
     else if (tool == TOOL_GRID_NUDGE)
-        rb->snprintf(line, sizeof(line), "GRID  %+dms", grid_offset);
+        rb->snprintf(line, sizeof(line), "GRID NUDGE  %+dms", grid_offset);
     else if (tool == TOOL_GRID_BPM)
-        rb->snprintf(line, sizeof(line), "BPM  %d.%02d",
+        rb->snprintf(line, sizeof(line), "GRID BPM  %d.%02d",
                      grid_bpm_x100 / 100, grid_bpm_x100 % 100);
     else if (tool == TOOL_GRID_ORIGIN)
-        rb->snprintf(line, sizeof(line), "SET DOWNBEAT");
+        rb->snprintf(line, sizeof(line), "DOWNBEAT  SET");
     else if (tool == TOOL_GRID_QUANTIZE)
         rb->snprintf(line, sizeof(line), "QUANTIZE  %s",
                      quantize ? "ON" : "OFF");
     else if (tool == TOOL_CUE_SLOT) {
-        rb->snprintf(line, sizeof(line), "CUE %02d  %s", cue_slot + 1,
+        rb->snprintf(line, sizeof(line), "CUE SLOT %02d  %s", cue_slot + 1,
                      hotcues[cue_slot] >= 0 ? "SET" : "EMPTY");
     } else if (tool == TOOL_CUE_MOVE)
-        rb->snprintf(line, sizeof(line), "MOVE CUE %02d", cue_slot + 1);
+        rb->snprintf(line, sizeof(line), "CUE MOVE  %02d", cue_slot + 1);
     else if (tool == TOOL_CUE_COLOR)
         rb->snprintf(line, sizeof(line), "CUE COLOR  %s",
                      cue_color_names[hotcue_colors[cue_slot] & 7]);
     else if (tool == TOOL_CUE_DELETE) {
-        rb->snprintf(line, sizeof(line), "DELETE CUE %02d", cue_slot + 1);
+        rb->snprintf(line, sizeof(line), "CUE DELETE  %02d", cue_slot + 1);
         color = LCD_RGBPACK(255, 90, 70);
     } else if (tool == TOOL_LOOP_LENGTH)
-        rb->snprintf(line, sizeof(line), "LOOP  %s BEAT%s",
+        rb->snprintf(line, sizeof(line), "LOOP SIZE  %s BEAT%s",
                      loop_length_names[loop_length_index],
                      loop_length_index == 5 ? "" : "S");
     else if (tool == TOOL_LOOP_IN) {
@@ -3706,17 +6294,22 @@ static void draw_tool_status(void)
         else
             rb->snprintf(line, sizeof(line), "OUT  --");
     } else if (tool == TOOL_LOOP_ACTIVE)
-        rb->snprintf(line, sizeof(line), "LOOP  %s",
+        rb->snprintf(line, sizeof(line), "LOOP ACTIVE  %s",
                      loop_active ? "ACTIVE" : "EXIT");
     else if (tool == TOOL_META_RATING)
         rb->snprintf(line, sizeof(line), "RATING  %d/5", rating);
     else if (tool == TOOL_META_COLOR)
-        rb->snprintf(line, sizeof(line), "COLOR  %s", color_labels[color_index]);
+        rb->snprintf(line, sizeof(line), "TRACK COLOR  %s",
+                     color_labels[color_index]);
     else if (tool == TOOL_META_YEAR)
         rb->snprintf(line, sizeof(line), "YEAR  %04d", track_year);
     else
         rb->snprintf(line, sizeof(line), "GENRE  %.30s", selected_genre);
-    fit_text(fitted, sizeof(fitted), line, 234 - status_x);
+    if (macro_wheel_locked)
+        rb->strlcat(line, " [LOCK/SEEK]", sizeof(line));
+    if (!pnav_tool_available(tool))
+        color = LCD_RGBPACK(38, 43, 40);
+    fit_text(fitted, sizeof(fitted), line, 232 - status_x);
     text(status_x, 69, fitted, color);
 }
 
@@ -3726,10 +6319,10 @@ static void draw_tool_indicators(void)
                                    : LCD_RGBPACK(82, 87, 84);
 
     draw_beat_phase();
-    text(280, 69, "Q",
+    text(284, 69, "Q",
          quantize ? RBPREP_GREEN
                   : LCD_RGBPACK(105, 115, 108));
-    text(294, 69, "CUE", color);
+    text(299, 69, "CUE", color);
 }
 
 static void draw_tool_row(void)
@@ -3748,59 +6341,138 @@ static void draw_top_hud(void)
     draw_track_header(false);
     draw_overview_waveform();
     draw_tool_row();
+    draw_status_bar();
 }
 
 static void draw_settings(void)
 {
-    char line[64];
     int row;
+    int value_width;
+    int value_x;
     const char *names[] = {
-        "VISUALIZER", "WAVEFORM SHAPE", "SAVE EDITS"
+        "AUTOBOOT REKORDPOD", "AUTO-NEXT DEFAULT", "WAVEFORM SHAPE",
+        "SAVE EDITS", "TRACK AUTO BURN", "WHEEL CLICK", "ACCENT COLOR",
+        "IPOD BODY COLOR", "WHEEL / VINYL COLOR"
     };
     const char *values[] = {
-        visualizer_styles[visualizer_mode],
+        autoboot_enabled ? "ON" : "OFF",
+        autoplay_enabled ? "ON" : "OFF",
         waveform_half ? "HALF" : "FULL",
-        save_on_track_load ? "ON NEXT TRACK" : "IMMEDIATELY"
+        save_on_track_load ? "ON NEXT TRACK" : "IMMEDIATELY",
+        auto_burn ? "CONFIRMED EDITS" : "OFF",
+        click_sound ? "ON" : "OFF", "HSB", "HSB", "HSB"
     };
+    const char *description;
 
-    text(7, 3, "RBPREP SETTINGS", RBPREP_GREEN);
-    text(7, 20, "DECK DISPLAY", LCD_RGBPACK(105, 125, 112));
-    for (row = 0; row < 3; row++) {
-        int y = 43 + row * 31;
+    draw_blade_shell("REKORDPOD SETTINGS", RBPREP_GREEN);
+    text(10, 29, "PLAYBACK  /  WORKFLOW  /  DISPLAY",
+         LCD_RGBPACK(105, 125, 112));
+    for (row = 0; row < (int)ARRAYLEN(names); row++) {
+        int y = 37 + row * 18;
         if (row == settings_selection)
-            draw_blade_selection(y - 3, 27, RBPREP_GREEN);
-        text(10, y + 3, names[row], LCD_WHITE);
-        rb->snprintf(line, sizeof(line), "%s", values[row]);
-        text(row == 0 ? 184 : row == 1 ? 260 : 215, y + 3, line,
-             RBPREP_GREEN);
+            draw_blade_selection(y - 2, 17, RBPREP_GREEN);
+        rb->lcd_set_foreground(row == settings_selection
+                               ? LCD_WHITE : RBPREP_GREEN);
+        xlcd_fillcircle(17, y + 6, row == settings_selection ? 5 : 4);
+        rb->lcd_set_foreground(row == settings_selection
+                               ? LCD_BLACK : LCD_RGBPACK(10, 38, 23));
+        xlcd_fillcircle(17, y + 6, 1);
+        text(30, y + 1, names[row], LCD_WHITE);
+        rb->lcd_getstringsize(values[row], &value_width, NULL);
+        value_x = MAX(192, LCD_WIDTH - value_width - 13);
+        rb->lcd_set_foreground(row == settings_selection
+                               ? LCD_RGBPACK(7, 25, 15)
+                               : LCD_RGBPACK(17, 25, 20));
+        rb->lcd_fillrect(value_x - 5, y, value_width + 10, 13);
+        text(value_x, y + 1, values[row], RBPREP_GREEN);
     }
-    text(10, 145, settings_selection == 0
-         ? "Boombox + EQ analyze live PCM; turntable follows deck rate"
+    description = settings_selection == 0
+         ? (autoboot_enabled ? "Launch Rekordpod automatically after boot"
+                             : "Boot into the normal Rockbox main menu")
          : settings_selection == 1
+         ? (autoplay_enabled ? "New deck sessions advance automatically"
+                             : "New deck sessions stop after each track")
+         : settings_selection == 2
          ? (waveform_half ? "One-sided RGB waveform" : "Mirrored RGB waveform")
-         : (save_on_track_load
-            ? "One compact snapshot is written when the next track loads"
-            : "Confirmed edits are journaled immediately"),
-         LCD_RGBPACK(145, 165, 151));
-    text(10, 216, "WHEEL: CHOOSE   SELECT: CHANGE   MENU: BACK", LCD_WHITE);
+         : settings_selection == 3
+         ? (save_on_track_load
+            ? "One snapshot is written when the next track loads"
+            : "Confirmed edits are journaled immediately")
+         : settings_selection == 4
+         ? (auto_burn
+            ? "Each confirmation atomically updates PDB + Rekordpod index"
+            : "Track edits stay journaled until Burn Track / Burn All")
+         : settings_selection == 5
+         ? (click_sound ? "Audible feedback on clickwheel scroll"
+                        : "Silent clickwheel navigation")
+         : settings_selection == 6
+         ? "Color used for controls, selections and accents"
+         : settings_selection == 7
+         ? "Color of the iPod body in the boot animation"
+         : "Color of the boot record, wheel and record motifs";
+    rb->lcd_set_foreground(LCD_RGBPACK(13, 19, 16));
+    rb->lcd_fillrect(8, 198, LCD_WIDTH - 16, 22);
+    text(13, 204, description, LCD_RGBPACK(145, 165, 151));
+    text(8, 226, "WHEEL: CHOOSE   SELECT: CHANGE   MENU: BACK", LCD_WHITE);
+}
+
+static void draw_accent_picker(void)
+{
+    char line[64];
+    const char *labels[] = { "HUE", "SATURATION", "BRIGHTNESS" };
+    int *hue;
+    int *saturation;
+    int *brightness;
+    int values[3];
+    int maximums[] = { 359, 100, 100 };
+    int preview;
+    int row;
+
+    active_color_channels(&hue, &saturation, &brightness);
+    values[0] = *hue;
+    values[1] = *saturation;
+    values[2] = *brightness;
+    preview = hsb_rgb(*hue, *saturation, *brightness);
+    draw_blade_shell(active_color_title(), RBPREP_GREEN);
+    rb->lcd_set_foreground(preview);
+    rb->lcd_fillrect(245, 34, 65, 10);
+    for (row = 0; row < 3; row++) {
+        int y = 52 + row * 48;
+        text(12, y, labels[row], row == accent_component
+             ? LCD_WHITE : LCD_RGBPACK(145, 165, 151));
+        rb->snprintf(line, sizeof(line), "%d", values[row]);
+        text(275, y, line, preview);
+        rb->lcd_set_foreground(LCD_RGBPACK(28, 36, 31));
+        rb->lcd_fillrect(12, y + 18, 296, 8);
+        rb->lcd_set_foreground(preview);
+        rb->lcd_fillrect(12, y + 18,
+                         MAX(1, 296 * values[row] / maximums[row]), 8);
+        if (row == accent_component) {
+            rb->lcd_set_foreground(LCD_WHITE);
+            rb->lcd_drawrect(10, y + 16, 300, 12);
+        }
+    }
+    text(7, 216, "WHEEL: VALUE   LEFT/RIGHT: H S B", LCD_WHITE);
+    text(7, 229, "SELECT: SAVE   MENU: CANCEL", LCD_LIGHTGRAY);
 }
 
 static void apply_usb_choice(int choice)
 {
-    usb_selection = !!choice;
+    usb_selection = MAX(0, MIN(2, choice));
+    usb_armed_selection = usb_selection;
 #ifdef USB_ENABLE_HID
     rb->global_settings->usb_hid = false;
     rb->usb_set_hid(false);
 #endif
 #ifdef USB_ENABLE_AUDIO
-    rb->global_settings->usb_audio = usb_selection ? 1 : 0;
+    rb->global_settings->usb_audio = usb_selection == 2 ? 1 : 0;
     rb->usb_set_audio(rb->global_settings->usb_audio);
 #endif
 #if !defined(SIMULATOR) && !defined(USB_NONE) && \
     (defined(HAVE_USB_ADB) || defined(HAVE_USB_POWER))
-    rb->global_settings->usb_mode = usb_selection
-                                  ? USB_MODE_CHARGE
-                                  : USB_MODE_MASS_STORAGE;
+    rb->global_settings->usb_mode = usb_selection == 1
+                                  ? USB_MODE_MASS_STORAGE
+                                  : USB_MODE_CHARGE;
     rb->usb_set_mode(rb->global_settings->usb_mode);
 #endif
     rb->settings_save();
@@ -3809,23 +6481,24 @@ static void apply_usb_choice(int choice)
 static void draw_usb_mode(void)
 {
     int row;
-    const char *names[] = { "DATA TRANSFER", "USB DAC" };
+    const char *names[] = { "POWER ONLY", "DATA TRANSFER", "USB DAC" };
     const char *details[] = {
+        "Charge safely; data, DAC and HID stay hidden",
         "Rekordbox FAT volume over USB; audio class disabled",
         "Mac audio to iPod headphone output; storage hidden"
     };
 
-    text(7, 3, "USB MODE", RBPREP_GREEN);
-    text(7, 20, "TAKES EFFECT ON NEXT USB CONNECTION",
+    draw_blade_shell("USB MODE", RBPREP_GREEN);
+    text(9, 34, "TAKES EFFECT ON NEXT USB CONNECTION",
          LCD_RGBPACK(105, 125, 112));
-    for (row = 0; row < 2; row++) {
-        int y = 55 + row * 55;
+    for (row = 0; row < 3; row++) {
+        int y = 54 + row * 44;
         if (row == usb_selection)
             draw_blade_selection(y - 5, 45, RBPREP_GREEN);
         text(12, y, names[row], LCD_WHITE);
         text(12, y + 18, details[row], LCD_RGBPACK(135, 155, 141));
     }
-    text(7, 183, "USB HID IS KEPT OFF IN BOTH MODES", RBPREP_GREEN);
+    text(7, 193, "USB HID IS ALWAYS KEPT OFF", RBPREP_GREEN);
     text(7, 226, "WHEEL: CHOOSE   SELECT: SAVE   MENU: BACK", LCD_WHITE);
 }
 
@@ -3835,12 +6508,13 @@ static void draw_genre_picker(void)
     char name[32];
     char line[48];
 
-    text(7, 3, "GENRE ROLLUP", RBPREP_GREEN);
+    draw_blade_shell("GENRE ROLLUP", RBPREP_GREEN);
     rb->snprintf(line, sizeof(line), "%d LIBRARY GENRES", genre_count);
-    text(205, 3, line, LCD_RGBPACK(105, 125, 112));
+    text(185, RBPREP_STATUS_HEIGHT + 4, line,
+         LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < RBPREP_LIST_ROWS; row++) {
         int ordinal = genre_top + row;
-        int y = 27 + row * 21;
+        int y = 34 + row * 19;
         if (ordinal > genre_count)
             break;
         if (ordinal == genre_selection)
@@ -3860,22 +6534,26 @@ static void draw_genre_picker(void)
 static void draw_main_menu(void)
 {
     static const char *items[] = {
-        "COLLECTION", "PLAYLISTS", "PREP DECK", "USB MODE",
-        "DECK SETTINGS", "PENDING EDITS", "INDEX STATUS",
+        "COLLECTION", "SHUFFLE COLLECTION", "PLAYLISTS", "PREP DECK",
+        "USB MODE", "REKORDPOD SETTINGS", "INDEX STATUS",
         "EXIT TO ROCKBOX"
     };
     char line[80];
+    int line_width;
+    int panel_width;
     int i;
 
     draw_blade_shell("RBPREP  /  PERFORMANCE LIBRARY",
-                     LCD_RGBPACK(70, 235, 125));
-    rb->lcd_set_foreground(LCD_BLACK);
-    rb->lcd_fillrect(5, 22, LCD_WIDTH - 5, 16);
+                     RBPREP_GREEN);
     if (library_fd >= 0)
-        rb->snprintf(line, sizeof(line), "%lu TRACKS  /  DEVICE INDEX ONLINE",
+        rb->snprintf(line, sizeof(line), "%lu TRACKS / INDEX ONLINE",
                      (unsigned long)library_track_count);
     else
-        rb->snprintf(line, sizeof(line), "DEVICE INDEX OFFLINE");
+        rb->snprintf(line, sizeof(line), "INDEX OFFLINE");
+    rb->lcd_getstringsize(line, &line_width, NULL);
+    panel_width = MIN(190, line_width + 8);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(5, 22, panel_width, 16);
     text(7, 21, line, library_fd >= 0
          ? LCD_RGBPACK(105, 178, 139) : LCD_RGBPACK(255, 90, 70));
 
@@ -3887,15 +6565,10 @@ static void draw_main_menu(void)
         }
         draw_main_glyph(20, y + 7, i, selected);
         text(42, y + 3, items[i], selected ? LCD_WHITE : RBPREP_MENU_TEXT);
-        if (i == 3)
-            text(257, y + 3, usb_selection ? "DAC" : "DATA",
+        if (i == 4)
+            text(246, y + 3, usb_selection == 2 ? "DAC" :
+                 usb_selection == 1 ? "DATA" : "POWER",
                  usb_selection ? LCD_WHITE : RBPREP_GREEN);
-        else if (i == 5 &&
-                 (pending_snapshot_count || pending_playlist_count)) {
-            rb->snprintf(line, sizeof(line), "%d",
-                         pending_snapshot_count + pending_playlist_count);
-            text(286, y + 3, line, LCD_WHITE);
-        }
     }
     text(7, 229, "WHEEL  NAVIGATE       SELECT  OPEN",
          LCD_RGBPACK(105, 125, 112));
@@ -3906,15 +6579,23 @@ static void draw_pending_edits(void)
     char line[96];
     int row;
 
-    text(7, 3, "PENDING EDITS", RBPREP_GREEN);
-    rb->snprintf(line, sizeof(line), "%d SAVED STATES   %d PLAYLIST ADDS",
-                 pending_snapshot_count, pending_playlist_count);
-    text(7, 20, line, LCD_RGBPACK(145, 165, 151));
+    draw_blade_shell("PENDING EDITS", RBPREP_GREEN);
+    if (pending_summary_overflow || pending_journal_invalid) {
+        rb->snprintf(line, sizeof(line), "BURN BLOCKED: %s",
+                     pending_summary_overflow ? "TOO MANY CHANGES"
+                                              : "JOURNAL INCOMPLETE");
+        text(7, 34, line, LCD_RGBPACK(255, 90, 70));
+    } else {
+        rb->snprintf(line, sizeof(line),
+                     "%d SAVED STATES   %d PLAYLIST OPS",
+                     pending_snapshot_count, pending_playlist_count);
+        text(7, 34, line, LCD_RGBPACK(145, 165, 151));
+    }
     rb->lcd_set_foreground(LCD_RGBPACK(25, 31, 27));
-    rb->lcd_hline(7, LCD_WIDTH - 8, 36);
+    rb->lcd_hline(7, LCD_WIDTH - 8, 49);
     for (row = 0; row < RBPREP_PENDING_ROWS; row++) {
         int visible = pending_top + row;
-        int y = 45 + row * 20;
+        int y = 55 + row * 19;
 
         if (visible >= pending_snapshot_count + pending_playlist_count)
             break;
@@ -3924,8 +6605,12 @@ static void draw_pending_edits(void)
             int ordinal = pending_snapshot_count - 1 - visible;
             struct rbprep_pending_entry *entry = &pending_entries[ordinal];
 
-            rb->lcd_set_foreground(cue_palette[entry->color]);
-            rb->lcd_fillrect(7, y + 2, 6, 6);
+            rb->lcd_set_foreground(track_color_display(entry->color));
+            if (normalize_track_color(entry->color) ==
+                    RBPREP_TRACK_COLOR_NONE)
+                rb->lcd_drawrect(7, y + 2, 6, 6);
+            else
+                rb->lcd_fillrect(7, y + 2, 6, 6);
             rb->snprintf(line, sizeof(line), "%.29s", entry->title[0]
                          ? entry->title : "Untitled track");
             text(19, y, line, LCD_WHITE);
@@ -3944,11 +6629,21 @@ static void draw_pending_edits(void)
             xlcd_fillcircle(10, y + 5, 4);
             rb->lcd_set_foreground(LCD_BLACK);
             xlcd_fillcircle(10, y + 5, 1);
-            rb->snprintf(line, sizeof(line), "ADD TO  %.27s", entry->name);
+            rb->snprintf(line, sizeof(line), "%s  %.31s",
+                         entry->operation == PLAYLIST_OP_ADD ? "ADD TO" :
+                         entry->operation == PLAYLIST_OP_CREATE ? "CREATE" :
+                         entry->operation == PLAYLIST_OP_RENAME ? "RENAME" :
+                         entry->operation == PLAYLIST_OP_MOVE ? "MOVE" :
+                         "DELETE", entry->name);
             text(19, y, line, LCD_WHITE);
-            rb->snprintf(line, sizeof(line), "TRACK %lu   PLAYLIST %lu",
-                         (unsigned long)entry->track_id,
-                         (unsigned long)entry->playlist_id);
+            if (entry->operation == PLAYLIST_OP_ADD)
+                rb->snprintf(line, sizeof(line), "TRACK %lu   PLAYLIST %lu",
+                             (unsigned long)entry->track_id,
+                             (unsigned long)entry->playlist_id);
+            else
+                rb->snprintf(line, sizeof(line), "PLAYLIST %lu   PARENT %lu",
+                             (unsigned long)entry->playlist_id,
+                             (unsigned long)entry->parent_id);
             text(19, y + 10, line, RBPREP_GREEN);
         }
     }
@@ -3962,27 +6657,41 @@ static void draw_pending_edits(void)
 static void draw_index_status(void)
 {
     char line[96];
+    int row;
 
-    text(7, 3, "RBPREP INDEX STATUS", LCD_RGBPACK(70, 235, 125));
-    text(7, 27, library_fd >= 0 ? "ONLINE" : "NOT FOUND",
-         library_fd >= 0 ? LCD_RGBPACK(70, 235, 125)
+    draw_blade_shell("INDEX STATUS", RBPREP_GREEN);
+    text(9, 30, library_fd >= 0 ? "DEVICE INDEX ONLINE" : "INDEX NOT FOUND",
+         library_fd >= 0 ? RBPREP_GREEN
                          : LCD_RGBPACK(255, 90, 70));
-    rb->snprintf(line, sizeof(line), "%lu TRACKS",
+    for (row = 0; row < 4; row++) {
+        int y = 49 + row * 25;
+        rb->lcd_set_foreground(LCD_RGBPACK(13, 20, 16));
+        rb->lcd_fillrect(8, y, LCD_WIDTH - 16, 20);
+        rb->lcd_set_foreground(row == 0 ? RBPREP_GREEN
+                                        : LCD_RGBPACK(45, 72, 55));
+        rb->lcd_fillrect(8, y, 3, 20);
+    }
+    text(17, 54, "TRACKS IN INDEX", LCD_RGBPACK(145, 165, 151));
+    rb->snprintf(line, sizeof(line), "%lu",
                  (unsigned long)library_track_count);
-    text(7, 52, line, LCD_WHITE);
-    rb->snprintf(line, sizeof(line), "%lu PLAYLIST/FOLDER NODES",
+    text(275, 54, line, LCD_WHITE);
+    text(17, 79, "ADDED IN LAST 30 DAYS", LCD_RGBPACK(145, 165, 151));
+    rb->snprintf(line, sizeof(line), "%d", recent_tracks_30d);
+    text(275, 79, line, LCD_WHITE);
+    text(17, 104, "TOTAL PLAYS  (> 1 MIN)", LCD_RGBPACK(145, 165, 151));
+    rb->snprintf(line, sizeof(line), "%d", total_plays);
+    text(275, 104, line, LCD_WHITE);
+    text(17, 129, "TRACKS BURNED THIS UPTIME",
+         LCD_RGBPACK(145, 165, 151));
+    rb->snprintf(line, sizeof(line), "%d", uptime_tracks_burned);
+    text(275, 129, line, LCD_WHITE);
+    rb->snprintf(line, sizeof(line), "%lu PLAYLIST / FOLDER NODES",
                  (unsigned long)library_node_count);
-    text(7, 72, line, LCD_WHITE);
+    text(9, 158, line, LCD_WHITE);
     rb->snprintf(line, sizeof(line), "%lu PLAYLIST MEMBERS",
                  (unsigned long)library_member_count);
-    text(7, 92, line, LCD_WHITE);
-    rb->snprintf(line, sizeof(line), "%d EDIT SNAPSHOTS", pending_snapshot_count);
-    text(7, 122, line, LCD_RGBPACK(255, 145, 40));
-    rb->snprintf(line, sizeof(line), "%d PLAYLIST ADD REQUESTS",
-                 pending_playlist_count);
-    text(7, 142, line, LCD_RGBPACK(255, 145, 40));
-    text(7, 180, "LOCAL BURN AVAILABLE IN PENDING EDITS",
-         LCD_RGBPACK(145, 165, 151));
+    text(9, 178, line, LCD_WHITE);
+    text(9, 204, "PLAYLIST CHANGES BURN LIVE", RBPREP_GREEN);
     text(7, 226, "MENU: BACK", LCD_LIGHTGRAY);
 }
 
@@ -4042,13 +6751,43 @@ static void begin_confirmation(enum rbprep_confirm_action action)
     force_full_redraw = true;
 }
 
+static bool append_playlist_operation(unsigned char operation,
+                                      uint32_t track_id,
+                                      uint32_t playlist_id,
+                                      uint32_t parent_id,
+                                      int kind,
+                                      const char *name)
+{
+    char line[192];
+    int fd;
+    int length;
+
+    if (!playlist_id || !rb->strchr("ACRMD", operation))
+        return false;
+    fd = rb->open(RBPREP_PLAYLIST_JOURNAL,
+                  O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0)
+        return false;
+    length = rb->snprintf(line, sizeof(line),
+                          "%c\t%lu\t%lu\t%lu\t%d\t%s\n",
+                          operation, (unsigned long)track_id,
+                          (unsigned long)playlist_id,
+                          (unsigned long)parent_id, MAX(0, MIN(2, kind)),
+                          name ? name : "");
+    if (length <= 0 || length >= (int)sizeof(line) ||
+        rb->write(fd, line, length) != length) {
+        rb->close(fd);
+        return false;
+    }
+    rb->close(fd);
+    refresh_pending_summary();
+    return true;
+}
+
 static bool append_playlist_journal(int node_index)
 {
     struct rbprep_node_record node;
     char name[80];
-    char line[160];
-    int fd;
-    int length;
     int i;
     uint32_t playlist_id;
 
@@ -4059,24 +6798,39 @@ static bool append_playlist_journal(int node_index)
         return false;
     playlist_id = node.source_id ? node.source_id : (uint32_t)node_index;
     for (i = 0; i < pending_playlist_count; i++) {
-        if (pending_playlists[i].track_id == (uint32_t)selected_track_id &&
+        if (pending_playlists[i].operation == PLAYLIST_OP_ADD &&
+            pending_playlists[i].track_id == (uint32_t)selected_track_id &&
             pending_playlists[i].playlist_id == playlist_id)
             return true;
     }
-    fd = rb->open(RBPREP_PLAYLIST_JOURNAL,
-                  O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (fd < 0)
-        return false;
-    length = rb->snprintf(line, sizeof(line), "%d\t%lu\t%s\n",
-                          selected_track_id,
-                          (unsigned long)playlist_id,
-                          name);
-    if (rb->write(fd, line, length) != length) {
-        rb->close(fd);
-        return false;
-    }
-    rb->close(fd);
-    return true;
+    return append_playlist_operation(PLAYLIST_OP_ADD, selected_track_id,
+                                     playlist_id, 0, 1, name);
+}
+
+static uint32_t playlist_parent_source_id(int node_index)
+{
+    struct rbprep_node_record node;
+
+    if (node_index < 0 || (uint32_t)node_index == RBPREP_ROOT_NODE)
+        return 0;
+    if (!read_node_record(node_index, &node) || node.kind != 0)
+        return 0;
+    return node.source_id;
+}
+
+static uint32_t next_playlist_source_id(void)
+{
+    struct rbprep_node_record node;
+    uint32_t maximum = 0;
+    uint32_t index;
+    int i;
+
+    for (index = 0; index < library_node_count; index++)
+        if (read_node_record(index, &node))
+            maximum = MAX(maximum, node.source_id);
+    for (i = 0; i < pending_playlist_count; i++)
+        maximum = MAX(maximum, pending_playlists[i].playlist_id);
+    return maximum + 1;
 }
 
 static void apply_grid_origin(int origin)
@@ -4117,13 +6871,6 @@ static void finish_confirmation(bool apply)
         deck_cue = confirm_time;
         playhead = deck_cue;
         save_snapshot = true;
-    } else if (action == CONFIRM_CUE_SET) {
-        hotcues[confirm_slot] = confirm_time;
-        hotcue_colors[confirm_slot] = confirm_color;
-        cue_slot = confirm_slot;
-        playhead = confirm_time;
-        overview_dirty = true;
-        save_snapshot = true;
     } else if (action == CONFIRM_CUE_DELETE) {
         hotcues[confirm_slot] = -1;
         cue_slot = confirm_slot;
@@ -4140,7 +6887,8 @@ static void finish_confirmation(bool apply)
             playlist_add_mode = false;
             mode = MODE_DECK;
             refresh_pending_summary();
-            rb->splash(HZ, "Playlist add queued");
+            if (!burn_playlist_changes_now())
+                rb->splash(HZ * 2, "Playlist change saved; burn failed");
         } else {
             rb->splash(HZ * 2, "Could not queue playlist add");
         }
@@ -4150,9 +6898,13 @@ static void finish_confirmation(bool apply)
         mode = MODE_METADATA;
         save_snapshot = true;
     } else if (action == CONFIRM_BURN) {
-        if (rbprep_burn_all())
-            rb->splash(HZ * 2, "Rekordbox edits burned locally");
-        refresh_pending_summary();
+        burn_all_now();
+    } else if (action == CONFIRM_BURN_ALL_NOW) {
+        burn_all_now();
+    } else if (action == CONFIRM_MACRO_CLEAR) {
+        clear_macro(confirm_slot);
+    } else if (action == CONFIRM_MACRO_DELETE_STEP) {
+        delete_macro_step(confirm_slot, confirm_time);
     } else if (action == CONFIRM_DELETE_PENDING) {
         uint32_t track_id = pending_entries[confirm_slot].track_id;
         if (!delete_pending_edit(track_id)) {
@@ -4163,15 +6915,42 @@ static void finish_confirmation(bool apply)
     } else if (action == CONFIRM_DELETE_PLAYLIST) {
         struct rbprep_pending_playlist *entry =
             &pending_playlists[confirm_slot];
-        if (!delete_pending_playlist(entry->track_id,
+        if (!delete_pending_playlist(entry->operation, entry->track_id,
                                      entry->playlist_id)) {
             rb->splash(HZ * 2, "Could not delete playlist add");
             restore_black_canvas();
         }
         refresh_pending_summary();
+    } else if (action == CONFIRM_PLAYLIST_CREATE ||
+               action == CONFIRM_PLAYLIST_RENAME ||
+               action == CONFIRM_PLAYLIST_MOVE ||
+               action == CONFIRM_PLAYLIST_NODE_DELETE) {
+        unsigned char operation =
+            action == CONFIRM_PLAYLIST_CREATE ? PLAYLIST_OP_CREATE :
+            action == CONFIRM_PLAYLIST_RENAME ? PLAYLIST_OP_RENAME :
+            action == CONFIRM_PLAYLIST_MOVE ? PLAYLIST_OP_MOVE :
+                                              PLAYLIST_OP_DELETE;
+        if (append_playlist_operation(operation, 0, playlist_action_id,
+                                      playlist_action_parent_id, 1,
+                                      playlist_action_name)) {
+            playlist_move_mode = false;
+            mode = MODE_PLAYLISTS;
+            tree_selection = tree_top = 0;
+            refresh_tree_children(RBPREP_ROOT_NODE);
+            if (!burn_playlist_changes_now())
+                rb->splash(HZ * 2, "Playlist change saved; burn failed");
+            tree_selection = tree_top = 0;
+            refresh_tree_children(RBPREP_ROOT_NODE);
+        } else {
+            rb->splash(HZ * 2, "Could not queue playlist change");
+        }
     }
-    if (save_snapshot && !record_edit_change())
-        rb->splash(HZ * 2, "Edit applied, journal write failed");
+    if (save_snapshot) {
+        if (!record_edit_change())
+            rb->splash(HZ * 2, "Edit applied, journal write failed");
+        else if (auto_burn)
+            auto_burn_pending_changes();
+    }
     restore_black_canvas();
 }
 
@@ -4201,11 +6980,17 @@ static void draw_confirmation(void)
 
 static void draw_screen(void)
 {
+    bool full_frame_update = false;
+    long now = *rb->current_tick;
+
     rb->lcd_set_background(LCD_BLACK);
     rb->lcd_set_drawmode(DRMODE_SOLID);
     if (mode == MODE_PLAYLISTS || mode == MODE_TRACKS || mode == MODE_FILTER ||
         mode == MODE_LIBRARY || mode == MODE_USB || mode == MODE_SETTINGS ||
-        mode == MODE_PENDING || mode == MODE_INDEX || mode == MODE_GENRES) {
+        mode == MODE_PENDING || mode == MODE_INDEX || mode == MODE_GENRES ||
+        mode == MODE_PLAYLIST_ACTIONS || mode == MODE_ACCENT ||
+        mode == MODE_MACRO_ACTIONS || mode == MODE_MACRO_EDITOR ||
+        mode == MODE_MACRO_PICKER || mode == MODE_MACRO_VALUE) {
         rb->lcd_clear_display();
         if (mode == MODE_PLAYLISTS)
             draw_playlist_browser();
@@ -4223,10 +7008,23 @@ static void draw_screen(void)
             draw_index_status();
         else if (mode == MODE_GENRES)
             draw_genre_picker();
+        else if (mode == MODE_PLAYLIST_ACTIONS)
+            draw_playlist_actions();
+        else if (mode == MODE_ACCENT)
+            draw_accent_picker();
+        else if (mode == MODE_MACRO_ACTIONS)
+            draw_macro_actions();
+        else if (mode == MODE_MACRO_EDITOR)
+            draw_macro_editor();
+        else if (mode == MODE_MACRO_PICKER)
+            draw_macro_picker();
+        else if (mode == MODE_MACRO_VALUE)
+            draw_macro_value_editor();
         else
             draw_main_menu();
         if (confirm_active)
             draw_confirmation();
+        draw_status_bar();
         rb->lcd_update();
         force_full_redraw = false;
         return;
@@ -4238,22 +7036,25 @@ static void draw_screen(void)
         draw_top_hud();
     } else {
         if (hud_scroll_active &&
-            !TIME_BEFORE(*rb->current_tick, hud_scroll_deadline)) {
+            !TIME_BEFORE(now, hud_scroll_deadline)) {
             draw_track_header(true);
-            rb->lcd_update_rect(0, 0, LCD_WIDTH, 32);
-            hud_scroll_deadline = *rb->current_tick +
-                                  RBPREP_HUD_SCROLL_TICKS;
+            hud_scroll_deadline = now + RBPREP_HUD_SCROLL_TICKS;
+            full_frame_update = true;
         }
         if (overview_dirty ||
-            !TIME_BEFORE(*rb->current_tick, overview_deadline)) {
-            if (!TIME_BEFORE(*rb->current_tick, overview_deadline))
+            !TIME_BEFORE(now, overview_deadline)) {
+            if (!TIME_BEFORE(now, overview_deadline))
                 overview_playhead_white = !overview_playhead_white;
             draw_overview_waveform();
             draw_tool_row();
             overview_dirty = false;
-            overview_deadline = *rb->current_tick + RBPREP_OVERVIEW_TICKS;
-            rb->lcd_update_rect(0, RBPREP_OVERVIEW_Y, LCD_WIDTH,
-                                RBPREP_WAVE_TOP - RBPREP_OVERVIEW_Y);
+            overview_deadline = now + RBPREP_OVERVIEW_TICKS;
+            full_frame_update = true;
+        }
+        if (!TIME_BEFORE(now, status_deadline)) {
+            draw_status_bar();
+            status_deadline = now + RBPREP_STATUS_TICKS;
+            full_frame_update = true;
         }
     }
 
@@ -4270,18 +7071,24 @@ static void draw_screen(void)
         rb->lcd_update();
         force_full_redraw = false;
         overview_dirty = false;
-        overview_deadline = *rb->current_tick + RBPREP_OVERVIEW_TICKS;
-        hud_scroll_deadline = *rb->current_tick +
-                              RBPREP_HUD_SCROLL_TICKS;
+        overview_deadline = now + RBPREP_OVERVIEW_TICKS;
+        hud_scroll_deadline = now + RBPREP_HUD_SCROLL_TICKS;
+        status_deadline = now + RBPREP_STATUS_TICKS;
     } else {
         rb->lcd_set_foreground(LCD_BLACK);
-        rb->lcd_fillrect(236, RBPREP_TOOL_TOP,
-                         LCD_WIDTH - 236, RBPREP_TOOL_HEIGHT);
+        rb->lcd_fillrect(232, RBPREP_TOOL_TOP,
+                         LCD_WIDTH - 232, RBPREP_TOOL_HEIGHT);
         draw_tool_indicators();
-        rb->lcd_update_rect(0, RBPREP_WAVE_TOP, LCD_WIDTH,
-                            RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
-        rb->lcd_update_rect(236, RBPREP_TOOL_TOP,
-                            LCD_WIDTH - 236, RBPREP_TOOL_HEIGHT);
+        /* The S5L8702 panel has a single DMA staging buffer rather than
+           framebuffer page flipping. Multiple update_rect calls serialize
+           on that buffer and visibly shear adjacent HUD regions. Submit one
+           coalesced transfer per animation frame; occasionally refresh the
+           complete static HUD in that same transfer. */
+        if (full_frame_update)
+            rb->lcd_update();
+        else
+            rb->lcd_update_rect(0, RBPREP_TOOL_TOP, LCD_WIDTH,
+                                RBPREP_WAVE_BOTTOM - RBPREP_TOOL_TOP + 1);
     }
 }
 
@@ -4293,40 +7100,85 @@ static void reset_play_clock(int anchor, long tick)
     audio_sync_after = tick + MAX(1, HZ / 4);
 }
 
-static bool update_play_clock(void)
+static bool play_clock_audio_running(int status)
+{
+    bool clock_state = seek_state == SEEK_IDLE ||
+                       seek_state == SEEK_PREVIEW ||
+                       seek_state == SEEK_CUE_HOLD;
+
+    return clock_state && (status & AUDIO_STATUS_PLAY) &&
+           !(status & AUDIO_STATUS_PAUSE);
+}
+
+static bool play_clock_tracks_cursor(int status)
+{
+    return play_clock_audio_running(status) &&
+           (seek_state == SEEK_IDLE || seek_state == SEEK_CUE_HOLD);
+}
+
+static int interpolated_playhead(long now)
+{
+    long elapsed_ticks = now - play_clock_tick;
+
+    if (elapsed_ticks < 0)
+        elapsed_ticks = 0;
+    return clamp_playhead(play_clock_anchor +
+        (long long)elapsed_ticks * 1000 * deck_speed_x100() /
+        (HZ * PITCH_SPEED_100));
+}
+
+static int live_playhead_now(void)
+{
+    int status = rb->audio_status();
+    long now = *rb->current_tick;
+
+    if (!play_clock_tracks_cursor(status))
+        return clamp_playhead(playhead);
+    return interpolated_playhead(now);
+}
+
+static int synchronized_audio_playhead(void)
 {
     int status = rb->audio_status();
     int position;
     long now = *rb->current_tick;
     struct mp3entry *id3;
 
-    if (seek_state != SEEK_IDLE || !(status & AUDIO_STATUS_PLAY) ||
-        (status & AUDIO_STATUS_PAUSE))
-        return false;
-    position = clamp_playhead(play_clock_anchor +
-        (long long)(now - play_clock_tick) * 1000 * deck_speed_x100() /
-        (HZ * PITCH_SPEED_100));
+    if (!play_clock_audio_running(status))
+        return clamp_playhead(playhead);
+    position = interpolated_playhead(now);
     id3 = rb->audio_current_track();
     if (id3 && !TIME_BEFORE(now, audio_sync_after)) {
         int observed = clamp_playhead(id3->elapsed);
-        if (observed != reported_audio_elapsed) {
-            int error = observed - position;
 
-            /* Codec elapsed can arrive several seconds late at a refill
-               boundary. A backwards snap looks like a frozen waveform until
-               the display clock catches up, so reject stale observations and
-               phase-lock only with bounded, monotonic corrections. */
+        if (observed != reported_audio_elapsed) {
+            /* PCM publishes the source timestamp of each buffer exactly when
+               that buffer reaches the output. Make that timestamp the clock
+               anchor and interpolate only until the next one arrives. Never
+               advance the anchor a frame at a time: doing so truncates a
+               fractional millisecond on every draw and eventually lets the
+               waveform drift away after a scrub or seek. */
             reported_audio_elapsed = observed;
-            if (error > 0)
-                position += MIN(error, 100);
-            else if (error >= -250)
-                position += MAX(error / 8, -8);
-            position = MAX(playhead, clamp_playhead(position));
-            play_clock_anchor = position;
+            play_clock_anchor = observed;
             play_clock_tick = now;
+            position = observed;
         }
     }
-    position = MAX(playhead, position);
+    return position;
+}
+
+static bool update_play_clock(void)
+{
+    int status = rb->audio_status();
+    int position;
+
+    /* During a short scrub preview the clickwheel owns playhead/seek_target.
+       The audition audio has its own clock, but must not race that cursor and
+       overwrite a newly requested position. Cue-hold is continuous playback,
+       so it follows the audio clock just like ordinary deck playback. */
+    if (!play_clock_tracks_cursor(status))
+        return false;
+    position = synchronized_audio_playhead();
     if (position == playhead)
         return false;
     playhead = position;
@@ -4339,6 +7191,7 @@ static void stop_editor_audio(void)
 
     if (seek_state == SEEK_IDLE)
         return;
+    update_play_clock();
     resume = !seek_was_paused && !cue_audition_active;
     rb->audio_pause();
     rb->audio_ff_rewind(playhead);
@@ -4400,16 +7253,11 @@ static bool service_audio_seek(void)
 {
     long now = *rb->current_tick;
 
-    if (seek_state == SEEK_CUE_HOLD) {
-        int position = clamp_playhead(play_clock_anchor +
-            (long long)(now - play_clock_tick) * 1000 * deck_speed_x100() /
-            (HZ * PITCH_SPEED_100));
-        if (position != playhead) {
-            playhead = position;
-            return true;
-        }
+    /* Preview and held-cue playback use the same authoritative transport
+       clock as ordinary playback; update_play_clock() runs immediately after
+       this service call in the main loop. */
+    if (seek_state == SEEK_CUE_HOLD)
         return false;
-    }
 
     if (seek_state == SEEK_IDLE ||
         (TIME_BEFORE(now, seek_deadline) && now != seek_deadline))
@@ -4573,9 +7421,7 @@ static void toggle_playback(void)
         return;
     }
     if (seek_state == SEEK_PREVIEW) {
-        playhead = clamp_playhead(seek_applied_target +
-            (long long)(*rb->current_tick - seek_applied_tick) * 1000 *
-            deck_speed_x100() / (HZ * PITCH_SPEED_100));
+        playhead = synchronized_audio_playhead();
         seek_state = SEEK_IDLE;
         rb->pcmbuf_fade(false, true);
         reset_play_clock(playhead, *rb->current_tick);
@@ -4657,9 +7503,9 @@ static void draw_rbprep_keyboard(const char *title, const char *value,
 
     draw_blade_shell(title, RBPREP_GREEN);
     rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
-    rb->lcd_fillrect(8, 31, LCD_WIDTH - 16, 36);
+    rb->lcd_fillrect(8, 36, LCD_WIDTH - 16, 36);
     rb->lcd_set_foreground(RBPREP_GREEN_DIM);
-    rb->lcd_drawrect(8, 31, LCD_WIDTH - 16, 36);
+    rb->lcd_drawrect(8, 36, LCD_WIDTH - 16, 36);
 
     if (value_length >= sizeof(shown)) {
         visible = value + value_length - sizeof(shown) + 1;
@@ -4675,9 +7521,9 @@ static void draw_rbprep_keyboard(const char *title, const char *value,
             start++;
         rb->lcd_getstringsize(shown + start, &width, NULL);
     }
-    text(15, 43, shown + start, LCD_WHITE);
+    text(15, 48, shown + start, LCD_WHITE);
     rb->lcd_set_foreground(RBPREP_GREEN);
-    rb->lcd_vline(MIN(LCD_WIDTH - 17, 17 + width), 41, 57);
+    rb->lcd_vline(MIN(LCD_WIDTH - 17, 17 + width), 46, 62);
 
     keyboard_key_name(previous, neighbor, sizeof(neighbor));
     centered_text(8, 82, 88, neighbor, LCD_RGBPACK(72, 91, 79));
@@ -4685,6 +7531,10 @@ static void draw_rbprep_keyboard(const char *title, const char *value,
     centered_text(LCD_WIDTH - 90, 82, 88, neighbor,
                   LCD_RGBPACK(72, 91, 79));
     draw_blade_selection(104, 30, RBPREP_GREEN);
+    rb->lcd_set_foreground(LCD_RGBPACK(240, 100, 45));
+    xlcd_drawcircle(LCD_WIDTH / 2, 119, 17);
+    rb->lcd_set_foreground(LCD_RGBPACK(80, 180, 245));
+    xlcd_drawcircle(LCD_WIDTH / 2, 119, 14);
     keyboard_key_name(selected_key, active, sizeof(active));
     centered_text(7, LCD_WIDTH - 14, 113, active, LCD_WHITE);
 
@@ -4694,6 +7544,7 @@ static void draw_rbprep_keyboard(const char *title, const char *value,
     text(10, 191, "SELECT: TYPE     LEFT: BACKSPACE", LCD_WHITE);
     text(10, 206, "RIGHT: SPACE     PLAY: DONE", LCD_WHITE);
     text(10, 221, "MENU: CANCEL", LCD_RGBPACK(155, 174, 161));
+    draw_status_bar();
     rb->lcd_update();
 }
 
@@ -4749,9 +7600,106 @@ static bool rbprep_keyboard(char *value, size_t size, const char *title)
             } else {
                 return true;
             }
-        } else if (rb->default_event_handler(button) == SYS_USB_CONNECTED) {
+        } else if (handle_usb_system_event(button)) {
             return false;
         }
+    }
+}
+
+static bool playlist_name_with_keyboard(char *name, size_t size,
+                                        const char *title)
+{
+    int start = 0;
+    int end;
+
+    if (!rbprep_keyboard(name, size, title)) {
+        rb->lcd_setfont(FONT_SYSFIXED);
+        restore_black_canvas();
+        return false;
+    }
+    rb->lcd_setfont(FONT_SYSFIXED);
+    while (name[start] == ' ' || name[start] == '\t')
+        start++;
+    if (start)
+        rb->memmove(name, name + start, rb->strlen(name + start) + 1);
+    end = rb->strlen(name);
+    while (end > 0 && (name[end - 1] == ' ' || name[end - 1] == '\t'))
+        name[--end] = '\0';
+    if (!name[0]) {
+        rb->splash(HZ, "Playlist name is empty");
+        restore_black_canvas();
+        return false;
+    }
+    return true;
+}
+
+static void choose_playlist_action(void)
+{
+    struct rbprep_node_record node;
+    bool editable = playlist_action_node >= 0 &&
+                    read_node_record(playlist_action_node, &node) &&
+                    node.kind != 0 && node.source_id;
+
+    if (playlist_action_selection == 0) {
+        rb->strlcpy(playlist_action_name, "NEW PLAYLIST",
+                    sizeof(playlist_action_name));
+        if (!playlist_name_with_keyboard(playlist_action_name,
+                                         sizeof(playlist_action_name),
+                                         "CREATE PLAYLIST"))
+            return;
+        playlist_action_id = next_playlist_source_id();
+        playlist_action_parent_id =
+            playlist_parent_source_id(playlist_action_parent);
+        if (playlist_action_parent >= 0 && !playlist_action_parent_id) {
+            rb->splash(HZ * 2, "Rebuild cache for stable folder IDs");
+            restore_black_canvas();
+            return;
+        }
+        rb->snprintf(confirm_message, sizeof(confirm_message),
+                     "CREATE %.30s?", playlist_action_name);
+        begin_confirmation(CONFIRM_PLAYLIST_CREATE);
+    } else if (!editable) {
+        rb->splash(HZ, "Select a playlist first");
+        restore_black_canvas();
+    } else if (playlist_action_selection == 1) {
+        read_index_string(node.name_offset, playlist_action_name,
+                          sizeof(playlist_action_name));
+        if (!playlist_name_with_keyboard(playlist_action_name,
+                                         sizeof(playlist_action_name),
+                                         "RENAME PLAYLIST"))
+            return;
+        playlist_action_id = node.source_id;
+        rb->snprintf(confirm_message, sizeof(confirm_message),
+                     "RENAME TO %.27s?", playlist_action_name);
+        begin_confirmation(CONFIRM_PLAYLIST_RENAME);
+    } else if (playlist_action_selection == 2) {
+        playlist_action_id = node.source_id;
+        read_index_string(node.name_offset, playlist_action_name,
+                          sizeof(playlist_action_name));
+        playlist_move_mode = true;
+        tree_selection = tree_top = 0;
+        refresh_tree_children(RBPREP_ROOT_NODE);
+        mode = MODE_PLAYLISTS;
+        force_full_redraw = true;
+    } else if (playlist_action_selection == 3) {
+        playlist_action_id = node.source_id;
+        read_index_string(node.name_offset, playlist_action_name,
+                          sizeof(playlist_action_name));
+        rb->snprintf(confirm_message, sizeof(confirm_message),
+                     "DELETE %.30s?", playlist_action_name);
+        begin_confirmation(CONFIRM_PLAYLIST_NODE_DELETE);
+    } else {
+        int slot;
+        if (!cycle_macro_link(node.source_id)) {
+            rb->splash(HZ, "Could not save workflow link");
+            restore_black_canvas();
+            return;
+        }
+        slot = macro_link_for(node.source_id);
+        rb->splash(HZ, slot < 0 ? "Workflow link off" :
+                   slot == 0 ? "Workflow M1 linked" :
+                               "Workflow M2 linked");
+        restore_black_canvas();
     }
 }
 
@@ -4824,6 +7772,7 @@ static void edit_collection_search(void)
 
 static void choose_collection_sort(int sort_key)
 {
+    collection_shuffle_active = false;
     if (sort_key == track_sort_key)
         track_sort_descending = !track_sort_descending;
     else {
@@ -4844,35 +7793,28 @@ static void short_select(void)
 {
     if (mode == MODE_LIBRARY) {
         if (selection == 0 && library_fd >= 0) {
+            collection_shuffle_active = false;
             open_track_browser(-1);
         } else if (selection == 1 && library_fd >= 0) {
+            start_shuffled_collection();
+        } else if (selection == 2 && library_fd >= 0) {
             tree_selection = tree_top = 0;
             refresh_tree_children(RBPREP_ROOT_NODE);
             mode = MODE_PLAYLISTS;
             force_full_redraw = true;
-        } else if (selection == 2) {
+        } else if (selection == 3) {
             if (library_fd >= 0)
                 open_loaded_track();
             else {
                 rb->splash(HZ * 2, "RBPrep index is offline");
                 restore_black_canvas();
             }
-        } else if (selection == 3) {
-            usb_selection = rb->global_settings->usb_audio != 0;
+        } else if (selection == 4) {
             mode = MODE_USB;
             force_full_redraw = true;
-        } else if (selection == 4) {
+        } else if (selection == 5) {
             settings_selection = 0;
             mode = MODE_SETTINGS;
-            force_full_redraw = true;
-        } else if (selection == 5) {
-            if (!flush_deferred_edit()) {
-                rb->splash(HZ * 2, "Could not save deferred edits");
-                restore_black_canvas();
-                return;
-            }
-            refresh_pending_summary();
-            mode = MODE_PENDING;
             force_full_redraw = true;
         } else if (selection == 6) {
             refresh_pending_summary();
@@ -4897,9 +7839,14 @@ static void short_select(void)
             rb->snprintf(confirm_message, sizeof(confirm_message),
                          "ADD TO %.28s?", name);
             begin_confirmation(CONFIRM_ADD_PLAYLIST);
+        } else if (index >= 0 && playlist_move_mode) {
+            rb->splash(HZ, "PLAY chooses this folder");
+            restore_black_canvas();
         } else if (index >= 0) {
             open_track_browser(index);
         }
+    } else if (mode == MODE_PLAYLIST_ACTIONS) {
+        choose_playlist_action();
     } else if (mode == MODE_TRACKS) {
         if (track_row_count > 0)
             play_track_row(track_selection);
@@ -4915,25 +7862,49 @@ static void short_select(void)
         }
     } else if (mode == MODE_USB) {
         apply_usb_choice(usb_selection);
-        rb->splash(HZ, usb_selection ? "USB DAC selected"
-                                     : "Data transfer selected");
+        rb->splash(HZ, usb_selection == 2 ? "USB DAC armed" :
+                       usb_selection == 1 ? "Data transfer armed" :
+                                            "USB power only");
         restore_black_canvas();
     } else if (mode == MODE_SETTINGS) {
-        if (settings_selection == 0)
-            visualizer_mode = (visualizer_mode + 1) %
-                              ARRAYLEN(visualizer_styles);
-        else if (settings_selection == 1)
+        if (settings_selection == 0) {
+            autoboot_enabled = !autoboot_enabled;
+        } else if (settings_selection == 1) {
+            autoplay_enabled = !autoplay_enabled;
+            playlist_playback = autoplay_enabled;
+        } else if (settings_selection == 2)
             waveform_half = !waveform_half;
-        else {
+        else if (settings_selection == 3) {
             save_on_track_load = !save_on_track_load;
             if (!save_on_track_load && !flush_deferred_edit()) {
                 rb->splash(HZ * 2, "Could not save deferred edits");
                 restore_black_canvas();
             }
+        } else if (settings_selection == 4) {
+            auto_burn = !auto_burn;
+            if (auto_burn) {
+                /* Real-time commit and deferred journaling are mutually
+                   exclusive; confirmations become the sole burn boundary. */
+                save_on_track_load = false;
+                if (!flush_deferred_edit()) {
+                    auto_burn = false;
+                    rb->splash(HZ * 2, "Auto Burn: journal write failed");
+                    restore_black_canvas();
+                }
+            }
+        } else if (settings_selection == 5) {
+            click_sound = !click_sound;
+        } else {
+            color_picker_target = settings_selection - 6;
+            accent_component = 0;
+            mode = MODE_ACCENT;
         }
         rebuild_waveform_height_lut();
-        configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
-                        ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
+        mark_rbprep_config_dirty();
+        force_full_redraw = true;
+    } else if (mode == MODE_ACCENT) {
+        mark_rbprep_config_dirty();
+        mode = MODE_SETTINGS;
         force_full_redraw = true;
     } else if (mode == MODE_PENDING) {
         int index = -1;
@@ -4943,8 +7914,16 @@ static void short_select(void)
         } else if (pending_selection < pending_snapshot_count +
                                             pending_playlist_count) {
             int ordinal = pending_selection - pending_snapshot_count;
-            index = find_track_index_by_id(
-                pending_playlists[ordinal].track_id);
+            if (pending_playlists[ordinal].operation == PLAYLIST_OP_ADD)
+                index = find_track_index_by_id(
+                    pending_playlists[ordinal].track_id);
+            else {
+                rb->splashf(HZ, "%c: %s",
+                            pending_playlists[ordinal].operation,
+                            pending_playlists[ordinal].name);
+                restore_black_canvas();
+                return;
+            }
         }
         if (index >= 0) {
             playlist_playback = false;
@@ -4960,6 +7939,79 @@ static void short_select(void)
         } else if (genre_name_at(genre_selection - 1, name, sizeof(name))) {
             choose_genre(name);
         }
+    } else if (mode == MODE_MACRO_ACTIONS) {
+        if (macro_action_selection == 0) {
+            rename_macro(macro_manage_slot);
+        } else if (macro_action_selection == 1) {
+            open_macro_editor(macro_manage_slot);
+        } else {
+            confirm_slot = macro_manage_slot;
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "CLEAR M%d %.22s?", macro_manage_slot + 1,
+                         tool_macros[macro_manage_slot].name);
+            begin_confirmation(CONFIRM_MACRO_CLEAR);
+        }
+    } else if (mode == MODE_MACRO_EDITOR) {
+        struct rbprep_tool_macro *macro = &tool_macros[macro_manage_slot];
+
+        if (macro_edit_operation == 2) {
+            if (macro->count <= 0) {
+                rb->splash(HZ, "Workflow is empty");
+                restore_black_canvas();
+            } else {
+                confirm_slot = macro_manage_slot;
+                confirm_time = macro_edit_position;
+                rb->snprintf(confirm_message, sizeof(confirm_message),
+                             "DELETE STEP %02d?", macro_edit_position + 1);
+                begin_confirmation(CONFIRM_MACRO_DELETE_STEP);
+            }
+        } else if (macro_edit_operation == 0 &&
+                   macro->count >= RBPREP_MACRO_STEPS) {
+            rb->splash(HZ, "Workflow is full");
+            restore_black_canvas();
+        } else if ((macro_edit_operation == 1 ||
+                    macro_edit_operation == 3) && macro->count <= 0) {
+            rb->splash(HZ, "Nothing to replace");
+            restore_black_canvas();
+        } else if (macro_edit_operation == 3) {
+            struct rbprep_macro_step *step =
+                &macro->steps[macro_edit_position];
+
+            macro_value_tool = step->tool;
+            macro_value_draft = step->value == RBPREP_MACRO_CHOOSE
+                              ? macro_current_tool_value(step->tool)
+                              : step->value;
+            macro_value_choose = step->value == RBPREP_MACRO_CHOOSE;
+            macro_value_lock = !!(step->flags & RBPREP_MACRO_LOCK_WHEEL);
+            macro_value_new_step = false;
+            mode = MODE_MACRO_VALUE;
+            force_full_redraw = true;
+        } else {
+            int page;
+            int item;
+
+            macro_picker_page = 0;
+            macro_picker_tool = 0;
+            if (macro_edit_operation == 1) {
+                enum rbprep_tool current =
+                    macro->steps[macro_edit_position].tool;
+                for (page = 0; page < (int)ARRAYLEN(tool_pages); page++) {
+                    int count = macro_picker_count_for_page(page);
+                    for (item = 0; item < count; item++) {
+                        if (macro_picker_tool_at(page, item) == current) {
+                            macro_picker_page = page;
+                            macro_picker_tool = item;
+                        }
+                    }
+                }
+            }
+            mode = MODE_MACRO_PICKER;
+            force_full_redraw = true;
+        }
+    } else if (mode == MODE_MACRO_PICKER) {
+        apply_macro_picker_tool();
+    } else if (mode == MODE_MACRO_VALUE) {
+        save_macro_value();
     } else if (mode == MODE_DECK) {
         enum rbprep_tool tool = active_tool();
         if (tool == TOOL_SEEK) {
@@ -4967,11 +8019,13 @@ static void short_select(void)
                 playhead = deck_cue;
             audition_playhead();
         } else if (tool == TOOL_SCRUB_STEP) {
-            configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
-                            ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
+            mark_rbprep_config_dirty();
         } else if (tool == TOOL_ZOOM) {
             zoom = 1;
-        } else if (tool == TOOL_HOST_RPM) {
+        }
+    } else if (mode == MODE_TEMPO) {
+        enum rbprep_tool tool = active_tool();
+        if (tool == TOOL_HOST_RPM) {
             host_rpm_index = 0;
             apply_playback_rate();
         } else if (tool == TOOL_PLAY_RPM) {
@@ -4983,28 +8037,35 @@ static void short_select(void)
         } else if (tool == TOOL_TEMPO) {
             tempo_x100 = PITCH_SPEED_100;
             apply_playback_rate();
-            configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
-                            ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
-        } else if (tool == TOOL_PLAYLIST_MODE) {
-            playlist_playback = !playlist_playback;
-        } else if (tool == TOOL_ADD_PLAYLIST) {
-            if (selected_track_id >= 0) {
-                playlist_add_mode = true;
-                tree_selection = tree_top = 0;
-                refresh_tree_children(RBPREP_ROOT_NODE);
-                mode = MODE_PLAYLISTS;
-                force_full_redraw = true;
-            }
-        } else if (tool == TOOL_WAVEFORM_STYLE) {
-            visualizer_mode = (visualizer_mode + 1) %
-                              ARRAYLEN(visualizer_styles);
-            configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
-                            ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
-            force_full_redraw = true;
+            mark_rbprep_config_dirty();
         }
     } else if (mode == MODE_CUES) {
         enum rbprep_tool tool = active_tool();
-        if (tool == TOOL_CUE_MOVE && hotcues[cue_slot] >= 0) {
+        if (tool == TOOL_CUE_SLOT && hotcues[cue_slot] < 0) {
+            int start_slot = cue_slot;
+            hotcues[cue_slot] = quantized_time(select_pressed_time);
+            hotcue_colors[cue_slot] = 3;
+            overview_dirty = true;
+            if (!record_edit_change()) {
+                rb->splash(HZ, "Cue set; journal failed");
+                restore_black_canvas();
+            } else if (auto_burn) {
+                auto_burn_pending_changes();
+            }
+            do {
+                cue_slot = (cue_slot + 1) & 15;
+            } while (cue_slot != start_slot && hotcues[cue_slot] >= 0);
+        } else if (tool == TOOL_CUE_DELETE) {
+            if (cue_slot_for_delete(cue_slot) >= 0) {
+                confirm_slot = cue_slot;
+                rb->snprintf(confirm_message, sizeof(confirm_message),
+                             "DELETE CUE %02d?", cue_slot + 1);
+                begin_confirmation(CONFIRM_CUE_DELETE);
+            } else {
+                rb->splashf(HZ, "CUE %02d IS EMPTY", cue_slot + 1);
+                restore_black_canvas();
+            }
+        } else if (tool == TOOL_CUE_MOVE && hotcues[cue_slot] >= 0) {
             playhead = hotcues[cue_slot];
             audition_playhead();
         } else if (tool == TOOL_CUE_COLOR && staged_tool == tool) {
@@ -5063,12 +8124,104 @@ static void short_select(void)
                          "KEEP METADATA CHANGE?");
             begin_confirmation(CONFIRM_KEEP_EDIT);
         }
+    } else if (mode == MODE_LIST) {
+        enum rbprep_tool tool = active_tool();
+        if (tool == TOOL_PLAYLIST_MODE) {
+            playlist_playback = !playlist_playback;
+        } else if (tool == TOOL_ADD_PLAYLIST) {
+            if (selected_track_id >= 0) {
+                playlist_add_mode = true;
+                tree_selection = tree_top = 0;
+                refresh_tree_children(RBPREP_ROOT_NODE);
+                mode = MODE_PLAYLISTS;
+                force_full_redraw = true;
+            }
+        } else if (tool == TOOL_BURN_SONG) {
+            if (selected_track_id >= 0)
+                burn_loaded_track_now();
+        } else if (tool == TOOL_BURN_ALL) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "INSTANT BURN ALL?");
+            begin_confirmation(CONFIRM_BURN_ALL_NOW);
+        }
+    } else if (mode == MODE_PNAV) {
+        enum rbprep_tool tool = active_tool();
+        if (tool == TOOL_PLAYLIST_PREVIOUS && pnav_tool_available(tool)) {
+            navigate_playlist_track(-1);
+        } else if (tool == TOOL_PLAYLIST_NEXT &&
+                   pnav_tool_available(tool)) {
+            navigate_playlist_track(1);
+        } else if (tool == TOOL_RESTART_PLAYBACK &&
+                   pnav_tool_available(tool)) {
+            int status = rb->audio_status();
+            if (!(status & AUDIO_STATUS_PLAY)) {
+                reload_current_track();
+            } else {
+                jump_to_time(0);
+                if (status & AUDIO_STATUS_PAUSE) {
+                    rb->audio_resume();
+                    reset_play_clock(0, *rb->current_tick);
+                }
+                audio_was_running = true;
+            }
+        } else if (tool == TOOL_RELOAD_TRACK &&
+                   pnav_tool_available(tool)) {
+            reload_current_track();
+        }
+    } else if (mode == MODE_VISUALIZER) {
+        enum rbprep_tool tool = active_tool();
+        if (tool == TOOL_WAVEFORM_STYLE)
+            visualizer_mode = 0;
+        else if (tool == TOOL_VIS_BOOMBOX)
+            visualizer_mode = 1;
+        else if (tool == TOOL_VIS_EQ)
+            visualizer_mode = 2;
+        else if (tool == TOOL_VIS_TURNTABLE)
+            visualizer_mode = 3;
+        mark_rbprep_config_dirty();
+        force_full_redraw = true;
+    } else if (mode == MODE_MACRO) {
+        enum rbprep_tool tool = active_tool();
+        if (tool == TOOL_KEYLOCK) {
+            keylock_enabled = !keylock_enabled;
+            apply_playback_rate();
+            mark_rbprep_config_dirty();
+        } else if (tool == TOOL_MACRO_ONE) {
+            activate_macro(0);
+        } else if (tool == TOOL_MACRO_TWO) {
+            activate_macro(1);
+        }
     }
 }
 
 static void long_select(void)
 {
-    if (mode == MODE_PENDING &&
+    if (mode >= MODE_DECK &&
+        (active_tool() == TOOL_MACRO_ONE ||
+         active_tool() == TOOL_MACRO_TWO)) {
+        int slot = active_tool() == TOOL_MACRO_ONE ? 0 : 1;
+        macro_manage_slot = slot;
+        macro_action_selection = tool_macros[slot].count > 0 ? 1 : 0;
+        mode = MODE_MACRO_ACTIONS;
+        force_full_redraw = true;
+    } else if (mode == MODE_PLAYLISTS && !playlist_add_mode &&
+        !playlist_move_mode) {
+        struct rbprep_node_record node;
+        int index = child_node_at(tree_parent, tree_selection, &node);
+
+        playlist_action_selection = 0;
+        playlist_action_node = -1;
+        playlist_action_parent = tree_parent == RBPREP_ROOT_NODE
+                               ? -1 : (int)tree_parent;
+        if (index >= 0) {
+            if (node.kind == 0)
+                playlist_action_parent = index;
+            else
+                playlist_action_node = index;
+        }
+        mode = MODE_PLAYLIST_ACTIONS;
+        force_full_redraw = true;
+    } else if (mode == MODE_PENDING &&
         pending_snapshot_count + pending_playlist_count > 0) {
         if (pending_selection < pending_snapshot_count) {
             int ordinal = pending_snapshot_count - 1 - pending_selection;
@@ -5081,7 +8234,8 @@ static void long_select(void)
             int ordinal = pending_selection - pending_snapshot_count;
             confirm_slot = ordinal;
             rb->snprintf(confirm_message, sizeof(confirm_message),
-                         "DELETE ADD TO %.22s?",
+                         "REMOVE %c %.24s?",
+                         pending_playlists[ordinal].operation,
                          pending_playlists[ordinal].name);
             begin_confirmation(CONFIRM_DELETE_PLAYLIST);
         }
@@ -5095,21 +8249,27 @@ static void long_select(void)
     } else if (mode == MODE_CUES) {
         enum rbprep_tool tool = active_tool();
         if (tool == TOOL_CUE_DELETE) {
-            if (hotcues[cue_slot] >= 0) {
+            int delete_slot = cue_slot_for_delete(cue_slot);
+            if (delete_slot >= 0) {
+                cue_slot = delete_slot;
                 confirm_slot = cue_slot;
                 rb->snprintf(confirm_message, sizeof(confirm_message),
                              "DELETE CUE %02d?", cue_slot + 1);
                 begin_confirmation(CONFIRM_CUE_DELETE);
+            } else {
+                rb->splashf(HZ, "CUE %02d IS EMPTY", cue_slot + 1);
+                restore_black_canvas();
             }
         } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE) {
-            confirm_slot = cue_slot;
-            confirm_time = quantized_time(playhead);
-            confirm_color = color_index;
-            rb->snprintf(confirm_message, sizeof(confirm_message),
-                         "%s CUE %02d @ %dms?",
-                         hotcues[cue_slot] >= 0 ? "REPLACE" : "CREATE",
-                         cue_slot + 1, confirm_time);
-            begin_confirmation(CONFIRM_CUE_SET);
+            hotcues[cue_slot] = quantized_time(live_playhead_now());
+            hotcue_colors[cue_slot] = 3;
+            overview_dirty = true;
+            if (!record_edit_change()) {
+                rb->splash(HZ, "Cue set; journal failed");
+                restore_black_canvas();
+            } else if (auto_burn) {
+                auto_burn_pending_changes();
+            }
         }
     } else if (mode == MODE_GRID) {
         if (active_tool() == TOOL_GRID_ORIGIN) {
@@ -5149,7 +8309,7 @@ static void change_volume(int direction)
     volume = MAX(rb->sound_min(SOUND_VOLUME),
                  MIN(rb->sound_max(SOUND_VOLUME), volume));
     if (volume != rb->global_status->volume)
-        rb->sound_set(SOUND_VOLUME, volume);
+        set_output_gain(volume);
 }
 
 static void adjust_loop_marker(enum rbprep_tool tool, int delta)
@@ -5169,6 +8329,12 @@ static void adjust_active_tool(int direction)
 {
     enum rbprep_tool tool = active_tool();
 
+    if (macro_wheel_locked) {
+        /* A fixed workflow value locks the tool parameter, not navigation.
+           Repurpose the wheel as the deck's precise scrub control. */
+        seek_by(direction * scrub_step_ms(), true);
+        return;
+    }
     if (tool == TOOL_SEEK || tool == TOOL_CUE_MOVE ||
         tool == TOOL_GRID_ORIGIN)
         seek_by(direction * scrub_step_ms(), true);
@@ -5176,8 +8342,7 @@ static void adjust_active_tool(int direction)
         scrub_step_index = (scrub_step_index +
             (direction > 0 ? 1 : ARRAYLEN(scrub_steps) - 1)) %
             ARRAYLEN(scrub_steps);
-        configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
-                        ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
+        mark_rbprep_config_dirty();
     }
     else if (tool == TOOL_ZOOM)
         change_zoom(direction > 0);
@@ -5209,14 +8374,20 @@ static void adjust_active_tool(int direction)
         apply_playback_rate();
         force_full_redraw = true;
     }
+    else if (tool == TOOL_KEYLOCK) {
+        keylock_enabled = direction > 0;
+        apply_playback_rate();
+        mark_rbprep_config_dirty();
+        force_full_redraw = true;
+    }
     else if (tool == TOOL_PLAYLIST_MODE)
         playlist_playback = direction > 0;
-    else if (tool == TOOL_WAVEFORM_STYLE) {
-        visualizer_mode = (visualizer_mode +
-            (direction > 0 ? 1 : ARRAYLEN(visualizer_styles) - 1)) %
-            ARRAYLEN(visualizer_styles);
-        configfile_save(RBPREP_CONFIG_FILE, rbprep_config,
-                        ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
+    else if (tool == TOOL_WAVEFORM_STYLE || tool == TOOL_VIS_BOOMBOX ||
+             tool == TOOL_VIS_EQ || tool == TOOL_VIS_TURNTABLE) {
+        visualizer_mode = tool == TOOL_WAVEFORM_STYLE ? 0 :
+                          tool == TOOL_VIS_BOOMBOX ? 1 :
+                          tool == TOOL_VIS_EQ ? 2 : 3;
+        mark_rbprep_config_dirty();
         force_full_redraw = true;
     }
     else if (tool == TOOL_LOOP_LENGTH) {
@@ -5247,7 +8418,7 @@ static void adjust_active_tool(int direction)
         grid_offset += direction;
     } else if (tool == TOOL_GRID_BPM) {
         stage_active_edit();
-        grid_bpm_x100 = MAX(3000, MIN(30000,
+        grid_bpm_x100 = MAX(2000, MIN(25000,
                                      grid_bpm_x100 + direction));
     } else if (tool == TOOL_GRID_QUANTIZE) {
         stage_active_edit();
@@ -5258,11 +8429,16 @@ static void adjust_active_tool(int direction)
         force_full_redraw = true;
     } else if (tool == TOOL_META_COLOR) {
         stage_active_edit();
-        color_index = (color_index + (direction > 0 ? 1 : 7)) & 7;
+        color_index = (normalize_track_color(color_index) +
+            (direction > 0 ? 1 : RBPREP_TRACK_COLOR_COUNT - 1)) %
+            RBPREP_TRACK_COLOR_COUNT;
         force_full_redraw = true;
     } else if (tool == TOOL_META_YEAR) {
         stage_active_edit();
-        track_year = MAX(0, MIN(9999, track_year + direction));
+        if (track_year == 0)
+            track_year = 2000;
+        else
+            track_year = MAX(0, MIN(9999, track_year + direction));
         force_full_redraw = true;
     }
 }
@@ -5271,6 +8447,13 @@ static void adjust_active_tool_coarse(int direction)
 {
     enum rbprep_tool tool = active_tool();
 
+    if (macro_wheel_locked) {
+        if (quantize)
+            beat_jump(direction);
+        else
+            seek_by(direction * 1000, true);
+        return;
+    }
     if (tool == TOOL_SEEK && quantize)
         beat_jump(direction);
     else if (tool == TOOL_SEEK || tool == TOOL_CUE_MOVE ||
@@ -5307,13 +8490,16 @@ static void adjust_active_tool_coarse(int direction)
         grid_offset += direction * 10;
     } else if (tool == TOOL_GRID_BPM) {
         stage_active_edit();
-        grid_bpm_x100 = MAX(3000, MIN(30000,
+        grid_bpm_x100 = MAX(2000, MIN(25000,
                                      grid_bpm_x100 + direction * 100));
     } else if (tool == TOOL_LOOP_IN || tool == TOOL_LOOP_OUT) {
         adjust_loop_marker(tool, direction * 1000);
     } else if (tool == TOOL_META_YEAR) {
         stage_active_edit();
-        track_year = MAX(0, MIN(9999, track_year + direction * 10));
+        if (track_year == 0)
+            track_year = 2000;
+        else
+            track_year = MAX(0, MIN(9999, track_year + direction * 10));
     }
     else
         adjust_active_tool(direction);
@@ -5353,34 +8539,450 @@ static bool service_playlist_playback(void)
     return play_track_row(track_selection);
 }
 
+static void normalize_macro_editor_cursor(void)
+{
+    int count = tool_macros[macro_manage_slot].count;
+    int maximum;
+
+    if (macro_edit_operation == 0 && count < RBPREP_MACRO_STEPS)
+        maximum = count;
+    else
+        maximum = MAX(0, count - 1);
+    macro_edit_position = MAX(0, MIN(maximum, macro_edit_position));
+}
+
+static void move_macro_editor_cursor(int direction)
+{
+    int count = tool_macros[macro_manage_slot].count;
+    int positions = macro_edit_operation == 0 && count < RBPREP_MACRO_STEPS
+                  ? count + 1 : MAX(1, count);
+
+    macro_edit_position = (macro_edit_position +
+        (direction > 0 ? 1 : positions - 1)) % positions;
+    force_full_redraw = true;
+}
+
+static void cycle_macro_operation(int direction)
+{
+    macro_edit_operation = (macro_edit_operation +
+        (direction > 0 ? 1 : 3)) % 4;
+    normalize_macro_editor_cursor();
+    force_full_redraw = true;
+}
+
+static void bank_macro_picker(int direction)
+{
+    macro_picker_page = (macro_picker_page +
+        (direction > 0 ? 1 : ARRAYLEN(tool_pages) - 1)) %
+        ARRAYLEN(tool_pages);
+    macro_picker_tool = MIN(macro_picker_tool,
+                            macro_picker_page_count() - 1);
+    force_full_redraw = true;
+}
+
+static void move_macro_picker(int direction)
+{
+    int count = macro_picker_page_count();
+
+    macro_picker_tool = (macro_picker_tool +
+        (direction > 0 ? 1 : count - 1)) % count;
+    force_full_redraw = true;
+}
+
+static void rename_macro(int slot)
+{
+    char name[RBPREP_MACRO_NAME];
+    int start = 0;
+    int end;
+
+    if (slot < 0 || slot >= RBPREP_MACRO_COUNT)
+        return;
+    rb->strlcpy(name, tool_macros[slot].name, sizeof(name));
+    if (!rbprep_keyboard(name, sizeof(name), "RENAME WORKFLOW")) {
+        rb->lcd_setfont(FONT_SYSFIXED);
+        restore_black_canvas();
+        return;
+    }
+    rb->lcd_setfont(FONT_SYSFIXED);
+    while (name[start] == ' ' || name[start] == '\t')
+        start++;
+    if (start)
+        rb->memmove(name, name + start, rb->strlen(name + start) + 1);
+    end = rb->strlen(name);
+    while (end > 0 && (name[end - 1] == ' ' || name[end - 1] == '\t'))
+        name[--end] = '\0';
+    if (!name[0])
+        rb->snprintf(name, sizeof(name), "WORKFLOW %c", 'A' + slot);
+    rb->strlcpy(tool_macros[slot].name, name,
+                sizeof(tool_macros[slot].name));
+    macro_dirty = true;
+    if (!save_tool_macros())
+        rb->splash(HZ, "Workflow rename save failed");
+    restore_black_canvas();
+    force_full_redraw = true;
+}
+
+static void open_macro_editor(int slot)
+{
+    if (slot < 0 || slot >= RBPREP_MACRO_COUNT)
+        return;
+    macro_manage_slot = slot;
+    macro_edit_position = 0;
+    macro_edit_operation = tool_macros[slot].count > 0 ? 1 : 0;
+    mode = MODE_MACRO_EDITOR;
+    force_full_redraw = true;
+}
+
+static void store_macro_tool(enum rbprep_tool tool, int value,
+                             unsigned char flags)
+{
+    struct rbprep_tool_macro *macro = &tool_macros[macro_manage_slot];
+    int i;
+
+    if (macro_edit_operation == 0) {
+        if (macro->count >= RBPREP_MACRO_STEPS) {
+            rb->splash(HZ, "Workflow is full");
+            restore_black_canvas();
+            return;
+        }
+        macro_edit_position = MAX(0, MIN(macro->count,
+                                         macro_edit_position));
+        for (i = macro->count; i > macro_edit_position; i--)
+            macro->steps[i] = macro->steps[i - 1];
+        macro->steps[macro_edit_position].tool = tool;
+        macro->steps[macro_edit_position].value = value;
+        macro->steps[macro_edit_position].flags = flags;
+        macro->count++;
+        macro_edit_position = MIN((int)macro->count,
+                                  macro_edit_position + 1);
+    } else {
+        if (macro->count <= 0) {
+            rb->splash(HZ, "Nothing to replace");
+            restore_black_canvas();
+            return;
+        }
+        macro_edit_position = MAX(0, MIN((int)macro->count - 1,
+                                         macro_edit_position));
+        macro->steps[macro_edit_position].tool = tool;
+        macro->steps[macro_edit_position].value = value;
+        macro->steps[macro_edit_position].flags = flags;
+    }
+    if (macro_active == macro_manage_slot)
+        macro_position = MIN(macro_position, macro->count - 1);
+    macro_dirty = true;
+    if (!save_tool_macros())
+        rb->splash(HZ, "Workflow save failed");
+    mode = MODE_MACRO_EDITOR;
+    normalize_macro_editor_cursor();
+    overview_dirty = true;
+    restore_black_canvas();
+    force_full_redraw = true;
+}
+
+static void apply_macro_picker_tool(void)
+{
+    int count = macro_picker_page_count();
+    enum rbprep_tool tool;
+
+    if (macro_picker_tool < 0 || macro_picker_tool >= count)
+        return;
+    tool = macro_picker_tool_at(macro_picker_page, macro_picker_tool);
+    macro_value_tool = tool;
+    macro_value_new_step = true;
+    macro_value_draft = macro_current_tool_value(tool);
+    macro_value_choose = !macro_tool_supports_fixed_value(tool);
+    macro_value_lock = !macro_value_choose;
+    mode = MODE_MACRO_VALUE;
+    force_full_redraw = true;
+}
+
+static void adjust_macro_value(int direction, bool coarse)
+{
+    enum rbprep_tool tool = macro_value_tool;
+    int amount = coarse ? 10 : 1;
+
+    if (!macro_tool_supports_fixed_value(tool))
+        return;
+    macro_value_choose = false;
+    if (tool == TOOL_SCRUB_STEP) {
+        macro_value_draft = (macro_value_draft +
+            (direction > 0 ? 1 : ARRAYLEN(scrub_steps) - 1)) %
+            ARRAYLEN(scrub_steps);
+    } else if (tool == TOOL_ZOOM) {
+        if (direction > 0)
+            macro_value_draft = macro_value_draft >= RBPREP_MAX_ZOOM
+                              ? 1 : MAX(1, macro_value_draft * 2);
+        else
+            macro_value_draft = macro_value_draft <= 1
+                              ? RBPREP_MAX_ZOOM : macro_value_draft / 2;
+    } else if (tool == TOOL_GAIN) {
+        macro_value_draft = MAX(rb->sound_min(SOUND_VOLUME),
+            MIN(rb->sound_max(SOUND_VOLUME),
+                macro_value_draft + direction * amount));
+    } else if (tool == TOOL_HOST_RPM || tool == TOOL_PLAY_RPM) {
+        macro_value_draft = (macro_value_draft +
+            (direction > 0 ? 1 : ARRAYLEN(rpm_styles) - 1)) %
+            ARRAYLEN(rpm_styles);
+    } else if (tool == TOOL_PITCH_BEND) {
+        macro_value_draft = MAX(-1600, MIN(1600,
+            macro_value_draft + direction * (coarse ? 100 : 10)));
+    } else if (tool == TOOL_TEMPO) {
+        macro_value_draft = MAX(5000, MIN(20000,
+            macro_value_draft + direction * (coarse ? 100 : 10)));
+    } else if (tool == TOOL_GRID_BPM) {
+        macro_value_draft = MAX(2000, MIN(25000,
+            macro_value_draft + direction * (coarse ? 100 : 1)));
+    } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE ||
+               tool == TOOL_CUE_COLOR || tool == TOOL_CUE_DELETE) {
+        macro_value_draft = (macro_value_draft +
+            (direction > 0 ? 1 : 15)) & 15;
+    } else if (tool == TOOL_LOOP_LENGTH) {
+        macro_value_draft = (macro_value_draft +
+            (direction > 0 ? 1 : ARRAYLEN(loop_length_names) - 1)) %
+            ARRAYLEN(loop_length_names);
+    } else {
+        macro_value_draft = direction > 0;
+    }
+    force_full_redraw = true;
+}
+
+static void save_macro_value(void)
+{
+    struct rbprep_tool_macro *macro = &tool_macros[macro_manage_slot];
+    int value = macro_value_choose ? RBPREP_MACRO_CHOOSE
+                                   : macro_value_draft;
+    unsigned char flags = !macro_value_choose && macro_value_lock
+                        ? RBPREP_MACRO_LOCK_WHEEL : 0;
+
+    if (macro_value_new_step) {
+        store_macro_tool(macro_value_tool, value, flags);
+        return;
+    }
+    if (macro_edit_position < 0 || macro_edit_position >= macro->count)
+        return;
+    macro->steps[macro_edit_position].value = value;
+    macro->steps[macro_edit_position].flags = flags;
+    macro_dirty = true;
+    if (!save_tool_macros())
+        rb->splash(HZ, "Workflow default save failed");
+    mode = MODE_MACRO_EDITOR;
+    overview_dirty = true;
+    restore_black_canvas();
+    force_full_redraw = true;
+}
+
+static void delete_macro_step(int slot, int position)
+{
+    struct rbprep_tool_macro *macro;
+    int i;
+
+    if (slot < 0 || slot >= RBPREP_MACRO_COUNT)
+        return;
+    macro = &tool_macros[slot];
+    if (position < 0 || position >= macro->count)
+        return;
+    for (i = position; i + 1 < macro->count; i++)
+        macro->steps[i] = macro->steps[i + 1];
+    macro->count--;
+    macro->steps[macro->count].tool = 0;
+    macro->steps[macro->count].flags = 0;
+    macro->steps[macro->count].value = RBPREP_MACRO_CHOOSE;
+    if (macro_active == slot) {
+        if (macro->count <= 0)
+            macro_active = -1;
+        else
+            macro_position = MIN(macro_position, macro->count - 1);
+    }
+    normalize_macro_editor_cursor();
+    macro_dirty = true;
+    if (!save_tool_macros())
+        rb->splash(HZ, "Workflow save failed");
+    overview_dirty = true;
+    force_full_redraw = true;
+}
+
+static void clear_macro(int slot)
+{
+    int i;
+
+    if (slot < 0 || slot >= RBPREP_MACRO_COUNT)
+        return;
+    tool_macros[slot].count = 0;
+    for (i = 0; i < RBPREP_MACRO_STEPS; i++) {
+        tool_macros[slot].steps[i].tool = 0;
+        tool_macros[slot].steps[i].flags = 0;
+        tool_macros[slot].steps[i].value = RBPREP_MACRO_CHOOSE;
+    }
+    if (macro_active == slot)
+        macro_active = -1;
+    macro_edit_position = 0;
+    macro_edit_operation = 0;
+    macro_dirty = true;
+    if (!save_tool_macros())
+        rb->splash(HZ, "Workflow clear save failed");
+    overview_dirty = true;
+    force_full_redraw = true;
+}
+
+static void apply_macro_step(const struct rbprep_macro_step *step)
+{
+    enum rbprep_tool tool;
+    int value;
+
+    if (!step || step->tool >= TOOL_COUNT)
+        return;
+    tool = step->tool;
+    value = step->value;
+    tool_menu_active = false;
+    select_tool(tool);
+    macro_wheel_locked = value != RBPREP_MACRO_CHOOSE &&
+                         !!(step->flags & RBPREP_MACRO_LOCK_WHEEL);
+    if (value == RBPREP_MACRO_CHOOSE)
+        goto done;
+
+    if (tool == TOOL_SCRUB_STEP) {
+        scrub_step_index = MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1,
+                                     value));
+    } else if (tool == TOOL_ZOOM) {
+        zoom = MAX(1, MIN(RBPREP_MAX_ZOOM, value));
+    } else if (tool == TOOL_GAIN) {
+        set_output_gain(
+            MAX(rb->sound_min(SOUND_VOLUME),
+                MIN(rb->sound_max(SOUND_VOLUME), value)));
+    } else if (tool == TOOL_HOST_RPM) {
+        host_rpm_index = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1, value));
+        apply_playback_rate();
+    } else if (tool == TOOL_PLAY_RPM) {
+        played_rpm_index = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1, value));
+        apply_playback_rate();
+    } else if (tool == TOOL_PITCH_BEND) {
+        pitch_bend_x100 = MAX(-1600, MIN(1600, value));
+        apply_playback_rate();
+    } else if (tool == TOOL_TEMPO) {
+        tempo_x100 = MAX(5000, MIN(20000, value));
+        apply_playback_rate();
+    } else if (tool == TOOL_PLAYLIST_MODE) {
+        playlist_playback = !!value;
+    } else if (tool == TOOL_KEYLOCK) {
+        keylock_enabled = !!value;
+        apply_playback_rate();
+    } else if (tool == TOOL_GRID_BPM) {
+        stage_active_edit();
+        grid_bpm_x100 = MAX(2000, MIN(25000, value));
+    } else if (tool == TOOL_GRID_QUANTIZE) {
+        stage_active_edit();
+        quantize = !!value;
+    } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE ||
+               tool == TOOL_CUE_COLOR || tool == TOOL_CUE_DELETE) {
+        cue_slot = MAX(0, MIN(15, value));
+    } else if (tool == TOOL_LOOP_LENGTH) {
+        loop_length_index = MAX(0,
+            MIN((int)ARRAYLEN(loop_length_names) - 1, value));
+    } else if (tool == TOOL_LOOP_ACTIVE) {
+        loop_active = !!value && loop_in >= 0 && loop_out > loop_in;
+    }
+
+done:
+    /* Workflow playback is a real-time navigation path. The macro file owns
+       stored defaults, so do not synchronously rewrite rbprep.cfg for every
+       cell transition; that disk write was long enough to drop input edges. */
+    overview_dirty = true;
+    force_full_redraw = true;
+}
+
+static void activate_macro(int slot)
+{
+    if (slot < 0 || slot >= RBPREP_MACRO_COUNT ||
+        tool_macros[slot].count <= 0) {
+        rb->splash(HZ, "Hold SELECT to program this workflow");
+        restore_black_canvas();
+        return;
+    }
+    macro_active = slot;
+    macro_position = 0;
+    apply_macro_step(&tool_macros[slot].steps[0]);
+}
+
+static void step_macro(int direction)
+{
+    int count;
+
+    if (macro_active < 0 || macro_active >= RBPREP_MACRO_COUNT)
+        return;
+    count = tool_macros[macro_active].count;
+    if (count <= 0)
+        return;
+    macro_position = (macro_position +
+        (direction > 0 ? 1 : count - 1)) % count;
+    apply_macro_step(&tool_macros[macro_active].steps[macro_position]);
+}
+
+static void swap_macro(int direction)
+{
+    int next;
+
+    if (macro_active < 0)
+        return;
+    next = (macro_active +
+            (direction > 0 ? 1 : RBPREP_MACRO_COUNT - 1)) %
+           RBPREP_MACRO_COUNT;
+    if (tool_macros[next].count <= 0) {
+        rb->splash(HZ / 2, "Other workflow is empty");
+        restore_black_canvas();
+        return;
+    }
+    macro_active = next;
+    macro_position = MIN(macro_position, tool_macros[next].count - 1);
+    apply_macro_step(&tool_macros[next].steps[macro_position]);
+}
+
 static void select_tool(enum rbprep_tool tool)
 {
-    if (tool < TOOL_GRID_NUDGE) {
-        mode = MODE_DECK;
-        deck_tool = tool - TOOL_SEEK;
-    } else if (tool < TOOL_CUE_SLOT) {
-        mode = MODE_GRID;
-        grid_tool = tool - TOOL_GRID_NUDGE;
-    } else if (tool < TOOL_LOOP_LENGTH) {
-        mode = MODE_CUES;
-        cue_tool = tool - TOOL_CUE_SLOT;
-    } else if (tool < TOOL_META_RATING) {
-        mode = MODE_LOOP;
-        loop_tool = tool - TOOL_LOOP_LENGTH;
-    } else {
-        mode = MODE_METADATA;
-        metadata_tool = tool - TOOL_META_RATING;
+    int page;
+    int index;
+
+    for (page = 0; page < (int)ARRAYLEN(tool_pages); page++) {
+        for (index = 0; index < tool_pages[page].count; index++) {
+            if (tool_pages[page].tools[index] != tool)
+                continue;
+            mode = tool_pages[page].mode;
+            if (mode == MODE_DECK) deck_tool = index;
+            else if (mode == MODE_TEMPO) tempo_tool = index;
+            else if (mode == MODE_GRID) grid_tool = index;
+            else if (mode == MODE_CUES) cue_tool = index;
+            else if (mode == MODE_LOOP) loop_tool = index;
+            else if (mode == MODE_METADATA) metadata_tool = index;
+            else if (mode == MODE_LIST) list_tool = index;
+            else if (mode == MODE_PNAV) pnav_tool = index;
+            else if (mode == MODE_VISUALIZER) visualizer_tool = index;
+            else macro_tool = index;
+            return;
+        }
     }
 }
 
 static void browse_tool_menu(int direction)
 {
-    int tool = active_tool();
+    int *selected = tool_selection();
+    int count = tool_count();
 
-    tool = (tool + (direction > 0 ? 1 : TOOL_COUNT - 1)) % TOOL_COUNT;
     discard_staged_edit();
     finish_cue_audition();
-    select_tool(tool);
+    *selected = (*selected + (direction > 0 ? 1 : count - 1)) % count;
+    force_full_redraw = true;
+}
+
+static void bank_tool_page(int direction)
+{
+    int page = tool_page_index();
+    int selected = *tool_selection();
+    int next = (page + (direction > 0 ? 1 : ARRAYLEN(tool_pages) - 1)) %
+               ARRAYLEN(tool_pages);
+
+    discard_staged_edit();
+    finish_cue_audition();
+    mode = tool_pages[next].mode;
+    *tool_selection() = MIN(selected, tool_pages[next].count - 1);
     force_full_redraw = true;
 }
 
@@ -5392,6 +8994,50 @@ static void handle_escape_once(void)
         force_full_redraw = true;
         return;
     }
+    if (mode == MODE_MACRO_PICKER) {
+        mode = MODE_MACRO_EDITOR;
+        force_full_redraw = true;
+        return;
+    }
+    if (mode == MODE_MACRO_VALUE) {
+        mode = macro_value_new_step ? MODE_MACRO_PICKER
+                                    : MODE_MACRO_EDITOR;
+        force_full_redraw = true;
+        return;
+    }
+    if (mode == MODE_MACRO_EDITOR) {
+        if (macro_dirty && !save_tool_macros()) {
+            rb->splash(HZ, "Workflow save retry failed");
+            restore_black_canvas();
+        }
+        mode = MODE_MACRO_ACTIONS;
+        force_full_redraw = true;
+        return;
+    }
+    if (mode == MODE_MACRO_ACTIONS) {
+        if (macro_dirty && !save_tool_macros()) {
+            rb->splash(HZ, "Workflow save retry failed");
+            restore_black_canvas();
+        }
+        if (tool_macros[macro_manage_slot].count > 0) {
+            macro_active = macro_manage_slot;
+            macro_position = MIN(macro_position,
+                tool_macros[macro_manage_slot].count - 1);
+            apply_macro_step(
+                &tool_macros[macro_manage_slot].steps[macro_position]);
+        } else {
+            select_tool(macro_manage_slot == 0 ? TOOL_MACRO_ONE
+                                               : TOOL_MACRO_TWO);
+        }
+        force_full_redraw = true;
+        return;
+    }
+    if (macro_active >= 0) {
+        macro_active = -1;
+        overview_dirty = true;
+        force_full_redraw = true;
+        return;
+    }
 
     discard_staged_edit();
     stop_editor_audio();
@@ -5399,11 +9045,20 @@ static void handle_escape_once(void)
         force_full_redraw = true;
     } else if (mode == MODE_FILTER) {
         mode = MODE_TRACKS;
-    } else if (mode == MODE_USB || mode == MODE_SETTINGS ||
-               mode == MODE_PENDING || mode == MODE_INDEX) {
+    } else if (mode == MODE_USB) {
+        /* Leaving this menu is a safety boundary, not merely navigation:
+           always disarm data/audio, persist Power Only, then go back. */
+        apply_usb_choice(0);
         mode = MODE_LIBRARY;
+    } else if (mode == MODE_SETTINGS || mode == MODE_PENDING ||
+               mode == MODE_INDEX) {
+        mode = MODE_LIBRARY;
+    } else if (mode == MODE_ACCENT) {
+        mode = MODE_SETTINGS;
     } else if (mode == MODE_GENRES) {
         mode = MODE_METADATA;
+    } else if (mode == MODE_PLAYLIST_ACTIONS) {
+        mode = MODE_PLAYLISTS;
     } else if (mode == MODE_PLAYLISTS &&
                tree_parent != RBPREP_ROOT_NODE) {
         struct rbprep_node_record parent;
@@ -5415,6 +9070,9 @@ static void handle_escape_once(void)
     } else if (mode == MODE_PLAYLISTS && playlist_add_mode) {
         playlist_add_mode = false;
         mode = MODE_DECK;
+    } else if (mode == MODE_PLAYLISTS && playlist_move_mode) {
+        playlist_move_mode = false;
+        mode = MODE_PLAYLIST_ACTIONS;
     } else if (mode == MODE_TRACKS && active_playlist_node >= 0) {
         mode = MODE_PLAYLISTS;
     } else if (mode >= MODE_DECK &&
@@ -5429,6 +9087,28 @@ static void handle_escape_once(void)
     force_full_redraw = true;
 }
 
+static void boot_round_box(int x, int y, int width, int height, int radius)
+{
+    rb->lcd_fillrect(x + radius, y, width - radius * 2, height);
+    rb->lcd_fillrect(x, y + radius, width, height - radius * 2);
+    xlcd_fillcircle(x + radius, y + radius, radius);
+    xlcd_fillcircle(x + width - radius - 1, y + radius, radius);
+    xlcd_fillcircle(x + radius, y + height - radius - 1, radius);
+    xlcd_fillcircle(x + width - radius - 1,
+                    y + height - radius - 1, radius);
+}
+
+static void boot_fill_clipped_rect(int x, int y, int width, int height)
+{
+    int left = MAX(0, x);
+    int top = MAX(0, y);
+    int right = MIN(LCD_WIDTH, x + width);
+    int bottom = MIN(LCD_HEIGHT, y + height);
+
+    if (right > left && bottom > top)
+        rb->lcd_fillrect(left, top, right - left, bottom - top);
+}
+
 static void draw_rekordpod_boot_splash(void)
 {
     static const int8_t dot_x[12] = {
@@ -5437,58 +9117,257 @@ static void draw_rekordpod_boot_splash(void)
     static const int8_t dot_y[12] = {
         0, 9, 16, 18, 16, 9, 0, -9, -16, -18, -16, -9
     };
-    const char *left_word = "rekord";
-    const char *right_word = "pod";
-    int font_id = rb->font_load("/.rockbox/fonts/15-Adobe-Helvetica.fnt");
-    int left_width;
-    int right_width;
-    int word_x;
     int frame;
 
     rb->lcd_set_background(LCD_BLACK);
-    rb->lcd_setfont(font_id >= 0 ? font_id : FONT_UI);
-    rb->lcd_getstringsize(left_word, &left_width, NULL);
-    rb->lcd_getstringsize(right_word, &right_width, NULL);
-    word_x = (LCD_WIDTH - left_width - right_width) / 2;
 
-    for (frame = 0; frame < 12; frame++) {
-        int progress_right = 82 + frame * 156 / 11;
+    for (frame = 0; frame < 96; frame++) {
+        int record_y;
+        int sink_step;
+        int morph = MAX(0, MIN(20, frame - 64));
+        int record_radius = 24 + morph * 15 / 20;
+        int label_radius = 7 + morph * 6 / 20;
+        int phase = frame % 12;
+        int progress = frame * 100 / 95;
+
+        if (frame < 20) {
+            record_y = 60;
+        } else if (frame < 68) {
+            sink_step = frame - 20;
+            record_y = 60 + 91 * sink_step * sink_step / (47 * 47);
+        } else {
+            record_y = 151;
+        }
 
         rb->lcd_clear_display();
-        rb->lcd_set_foreground(LCD_RGBPACK(20, 25, 22));
-        xlcd_fillcircle(LCD_WIDTH / 2, 71, 22);
-        rb->lcd_set_foreground(LCD_RGBPACK(115, 125, 119));
-        xlcd_drawcircle(LCD_WIDTH / 2, 71, 22);
-        xlcd_drawcircle(LCD_WIDTH / 2, 71, 17);
-        xlcd_drawcircle(LCD_WIDTH / 2, 71, 12);
+        rb->lcd_set_foreground(theme_body_shadow);
+        boot_round_box(103, 8, 114, 200, 12);
+        rb->lcd_set_foreground(theme_body);
+        boot_round_box(106, 11, 108, 194, 10);
+
+        /* The iPod starts without controls: only its screen and the record
+           exist. The record then falls through the body and becomes both the
+           click wheel and its expanding SELECT button. */
+        rb->lcd_set_foreground(LCD_RGBPACK(72, 78, 74));
+        boot_round_box(116, 23, 88, 74, 5);
+        rb->lcd_set_foreground(LCD_RGBPACK(8, 11, 9));
+        rb->lcd_fillrect(119, 26, 82, 68);
+
+        rb->lcd_set_foreground(morph > 10 ? theme_wheel : LCD_BLACK);
+        xlcd_fillcircle(LCD_WIDTH / 2, record_y, record_radius);
+        rb->lcd_set_foreground(theme_wheel_outline);
+        xlcd_drawcircle(LCD_WIDTH / 2, record_y, record_radius);
+        if (morph < 16) {
+            rb->lcd_set_foreground(LCD_RGBPACK(48, 54, 50));
+            xlcd_drawcircle(LCD_WIDTH / 2, record_y,
+                            MAX(label_radius + 3, record_radius - 5));
+            if (morph < 10)
+                xlcd_drawcircle(LCD_WIDTH / 2, record_y,
+                                MAX(label_radius + 2, record_radius - 10));
+        }
         rb->lcd_set_foreground(LCD_WHITE);
-        xlcd_fillcircle(LCD_WIDTH / 2, 71, 7);
-        rb->lcd_set_foreground(LCD_RGBPACK(205, 215, 209));
-        xlcd_fillcircle(LCD_WIDTH / 2, 71, 2);
-        rb->lcd_set_foreground(RBPREP_GREEN);
-        xlcd_fillcircle(LCD_WIDTH / 2 + dot_x[frame],
-                        71 + dot_y[frame], 2);
+        xlcd_fillcircle(LCD_WIDTH / 2, record_y, label_radius);
+        rb->lcd_set_foreground(LCD_RGBPACK(115, 122, 118));
+        xlcd_drawcircle(LCD_WIDTH / 2, record_y, label_radius);
+        if (morph < 10) {
+            rb->lcd_set_foreground(LCD_RGBPACK(105, 112, 108));
+            xlcd_fillcircle(LCD_WIDTH / 2, record_y, 2);
+            rb->lcd_set_foreground(RBPREP_GREEN);
+            xlcd_fillcircle(LCD_WIDTH / 2 + dot_x[phase],
+                            record_y + dot_y[phase], 2);
+        }
 
-        text(word_x, 108, left_word, LCD_WHITE);
-        text(word_x + left_width, 108, right_word, RBPREP_GREEN);
-        centered_text(0, LCD_WIDTH, 132,
-                      "DEVICE LIBRARY / PREP DECK",
-                      LCD_RGBPACK(145, 160, 150));
-
-        rb->lcd_set_foreground(LCD_RGBPACK(16, 38, 25));
-        rb->lcd_fillrect(82, 155, 156, 4);
+        rb->lcd_set_foreground(LCD_RGBPACK(30, 38, 33));
+        rb->lcd_fillrect(109, 218, 102, 5);
         rb->lcd_set_foreground(RBPREP_GREEN);
-        rb->lcd_fillrect(82, 155, MAX(1, progress_right - 82), 4);
-        xlcd_fillcircle(82, 156, 2);
-        xlcd_fillcircle(progress_right, 156, 2);
+        rb->lcd_fillrect(110, 219, MAX(1, progress), 3);
         rb->lcd_update();
-        rb->sleep(MAX(1, HZ / 20));
+        rb->sleep(MAX(1, HZ / 24));
     }
+
+    /* Push into the completed iPod's screen. The screen rectangle expands
+       to the physical LCD while the body, wheel and SELECT control leave the
+       frame, so the animation resolves into the actual Rekordpod UI. */
+    for (frame = 0; frame <= 32; frame++) {
+        int t = frame * 1024 / 32;
+        int eased = (long long)t * t * (3072 - 2 * t) /
+                    (1024 * 1024);
+        int sx = 119 - 119 * eased / 1024;
+        int sy = 26 - 26 * eased / 1024;
+        int sw = 82 + (LCD_WIDTH - 82) * eased / 1024;
+        int sh = 68 + (LCD_HEIGHT - 68) * eased / 1024;
+        int scale = sw * 1024 / 82;
+        int bx = sx - 13 * scale / 1024;
+        int by = sy - 15 * scale / 1024;
+        int bw = sw + 26 * scale / 1024;
+        int bh = sh + 126 * scale / 1024;
+        int inset = MAX(2, 3 * scale / 1024);
+        int wheel_cy = sy + 125 * scale / 1024;
+        int wheel_radius = 39 * scale / 1024;
+
+        rb->lcd_clear_display();
+        rb->lcd_set_foreground(theme_body_shadow);
+        boot_fill_clipped_rect(bx, by, bw, bh);
+        rb->lcd_set_foreground(theme_body);
+        boot_fill_clipped_rect(bx + inset, by + inset,
+                               bw - inset * 2, bh - inset * 2);
+        if (wheel_radius < 110 && wheel_cy - wheel_radius < LCD_HEIGHT) {
+            rb->lcd_set_foreground(theme_wheel);
+            xlcd_fillcircle(LCD_WIDTH / 2, wheel_cy, wheel_radius);
+            rb->lcd_set_foreground(theme_wheel_outline);
+            xlcd_drawcircle(LCD_WIDTH / 2, wheel_cy, wheel_radius);
+            rb->lcd_set_foreground(theme_body);
+            xlcd_fillcircle(LCD_WIDTH / 2, wheel_cy,
+                            MAX(5, 13 * scale / 1024));
+        }
+        rb->lcd_set_foreground(LCD_BLACK);
+        boot_fill_clipped_rect(sx, sy, sw, sh);
+        rb->lcd_update();
+        rb->sleep(MAX(1, HZ / 24));
+    }
+
+    /* The target has no alpha plane. Ordered dithering gives the menu a
+       short, deterministic fade without allocating another framebuffer. */
+    {
+        static const unsigned char bayer[4][4] = {
+            { 0,  8,  2, 10 }, { 12, 4, 14, 6 },
+            { 3, 11,  1,  9 }, { 15, 7, 13, 5 }
+        };
+        int fade;
+        int x;
+        int y;
+
+        for (fade = 0; fade <= 16; fade++) {
+            draw_main_menu();
+            draw_status_bar();
+            rb->lcd_set_foreground(LCD_BLACK);
+            for (y = 0; y < LCD_HEIGHT; y++)
+                for (x = 0; x < LCD_WIDTH; x++)
+                    if (bayer[y & 3][x & 3] >= fade)
+                        rb->lcd_drawpixel(x, y);
+            rb->lcd_update();
+            rb->sleep(MAX(1, HZ / 24));
+        }
+    }
+}
+
+static void write_usb_status_snapshot(void)
+{
+    unsigned char data[48];
+    int fd;
+
+    if (!recent_tracks_ready)
+        refresh_recent_track_count();
+    refresh_pending_summary();
+    rb->memset(data, 0, sizeof(data));
+    rb->memcpy(data, "RUS1", 4);
+    write_u32(data + 4, 1);
+    write_u32(data + 8, library_track_count);
+    write_u32(data + 12, library_node_count);
+    write_u32(data + 16, library_member_count);
+    write_u32(data + 20, recent_tracks_30d);
+    write_u32(data + 24, total_plays);
+    write_u32(data + 28, uptime_tracks_burned);
+    write_u32(data + 32, pending_snapshot_count + pending_playlist_count);
+    write_u32(data + 36, theme_accent);
+    write_u32(data + 40, theme_body);
+    write_u32(data + 44, theme_wheel);
+
+    fd = rb->open(RBPREP_USB_STATUS,
+                  O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) {
+        rb->write(fd, data, sizeof(data));
+        rb->close(fd);
+    }
+}
+
+static void prepare_rekordpod_for_usb(void *parameter)
+{
+    (void)parameter;
+
+    /* USB DAC owns the clickwheel while connected. Start from a quiet,
+       deterministic gain without permanently replacing the user's normal
+       playback volume. Rekordpod restores this saved value on disconnect. */
+    if (usb_armed_selection == 2 && !dac_gain_override) {
+        dac_saved_volume = rb->global_status->volume;
+        dac_gain_override = true;
+        set_output_gain(RBPREP_DAC_INITIAL_GAIN_DB);
+    }
+
+    stop_editor_audio();
+    flush_deferred_edit();
+    if (macro_dirty)
+        save_tool_macros();
+    save_rbprep_config();
+    write_usb_status_snapshot();
+    stop_spectrum_capture();
+    restore_playback_rate();
+    set_storage_performance_mode(false);
+    if (library_fd >= 0) {
+        rb->close(library_fd);
+        library_fd = -1;
+    }
+    if (genre_fd >= 0) {
+        rb->close(genre_fd);
+        genre_fd = -1;
+    }
+}
+
+static void resume_rekordpod_after_usb(void)
+{
+    struct mp3entry *id3;
+
+    /* The stock USB screen blocks until disconnect. Resume this plugin in
+       place afterwards: restarting through PLUGIN_GOTO_PLUGIN is dependent
+       on the caller's menu context and can fall through to Rockbox. */
     rb->lcd_setfont(FONT_SYSFIXED);
-    if (font_id >= 0)
-        rb->font_unload(font_id);
-    rb->lcd_clear_display();
-    rb->lcd_update();
+    restore_dac_gain();
+    apply_usb_choice(0);
+    recent_tracks_ready = false;
+    open_library_index();
+    load_genre_rollup();
+    load_smart_query_flags();
+    /* Never replace an unsaved in-memory workflow after a failed media
+       write. A successful pre-USB save clears macro_dirty; otherwise keep
+       the user's sequence intact and retry at the next save boundary. */
+    if (!macro_dirty) {
+        load_tool_macros();
+        restore_saved_macro_selection();
+    } else {
+        save_tool_macros();
+    }
+    load_macro_links();
+    refresh_pending_summary();
+    set_storage_performance_mode(!display_locked);
+    storage_keepalive_deadline = *rb->current_tick + HZ * 30;
+    apply_playback_rate();
+    if (!display_locked) {
+        backlight_ignore_timeout();
+#ifdef HAVE_BACKLIGHT
+        rb->backlight_on();
+#endif
+        start_spectrum_capture();
+    } else {
+        backlight_use_settings();
+    }
+    id3 = rb->audio_current_track();
+    if (selected_track_id >= 0 && id3)
+        playhead = clamp_playhead(id3->elapsed);
+    reset_play_clock(playhead, *rb->current_tick);
+    usb_selection = usb_armed_selection = 0;
+    overview_dirty = true;
+    force_full_redraw = true;
+    restore_black_canvas();
+    rb->button_clear_queue();
+}
+
+static bool handle_usb_system_event(int button)
+{
+    if (rb->default_event_handler_ex(button, prepare_rekordpod_for_usb,
+                                     NULL) != SYS_USB_CONNECTED)
+        return false;
+    resume_rekordpod_after_usb();
+    return true;
 }
 
 enum plugin_status plugin_start(const void *parameter)
@@ -5497,6 +9376,8 @@ enum plugin_status plugin_start(const void *parameter)
     int pressed = BUTTON_NONE;
     bool select_hold_fired = false;
     bool redraw = true;
+    bool autoboot_launch = parameter &&
+        !rb->strcmp((const char *)parameter, "autoboot");
     long frame_deadline;
 
     atexit(rbprep_cleanup);
@@ -5515,8 +9396,20 @@ enum plugin_status plugin_start(const void *parameter)
         rb->backlight_on();
 #endif
     rb->lcd_setfont(FONT_SYSFIXED);
-    if (parameter && !rb->strcmp((const char *)parameter, "autoboot"))
-        draw_rekordpod_boot_splash();
+    configfile_load(RBPREP_CONFIG_FILE, rbprep_config,
+                    ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
+    config_dirty = (!!autoboot_enabled ==
+                    rb->file_exists(RBPREP_AUTOBOOT_OFF));
+    accent_hue = MAX(0, MIN(359, accent_hue));
+    accent_saturation = MAX(0, MIN(100, accent_saturation));
+    accent_brightness = MAX(10, MIN(100, accent_brightness));
+    body_hue = MAX(0, MIN(359, body_hue));
+    body_saturation = MAX(0, MIN(100, body_saturation));
+    body_brightness = MAX(10, MIN(100, body_brightness));
+    wheel_hue = MAX(0, MIN(359, wheel_hue));
+    wheel_saturation = MAX(0, MIN(100, wheel_saturation));
+    wheel_brightness = MAX(5, MIN(100, wheel_brightness));
+    update_theme_colors();
     mode = MODE_LIBRARY;
     selection = 0;
     playhead = 0;
@@ -5524,13 +9417,18 @@ enum plugin_status plugin_start(const void *parameter)
     grid_offset = 0;
     grid_beat_shift = 0;
     cue_slot = 0;
-    deck_tool = grid_tool = cue_tool = loop_tool = metadata_tool = 0;
+    deck_tool = tempo_tool = grid_tool = cue_tool = loop_tool = 0;
+    metadata_tool = visualizer_tool = list_tool = pnav_tool = macro_tool = 0;
     rating = 0;
-    color_index = 0;
+    color_index = RBPREP_TRACK_COLOR_NONE;
     track_year = 0;
     quantize = true;
-    playlist_playback = false;
+    playlist_playback = !!autoplay_enabled;
     playlist_add_mode = false;
+    playlist_move_mode = false;
+    force_track_reload = false;
+    playlist_action_selection = 0;
+    playlist_action_node = playlist_action_parent = -1;
     playing_track_row = -1;
     audio_was_running = !!(rb->audio_status() & AUDIO_STATUS_PLAY);
     confirm_active = false;
@@ -5542,7 +9440,19 @@ enum plugin_status plugin_start(const void *parameter)
     seek_state = SEEK_IDLE;
     suppress_menu = suppress_play = false;
     suppress_left = suppress_right = false;
+    macro_chord_button = BUTTON_NONE;
     tool_menu_active = false;
+    macro_active = -1;
+    macro_position = 0;
+    macro_manage_slot = 0;
+    macro_action_selection = 0;
+    macro_edit_position = 0;
+    macro_edit_operation = 0;
+    macro_picker_page = 0;
+    macro_picker_tool = 0;
+    macro_wheel_locked = false;
+    burn_request = BURN_REQUEST_NONE;
+    select_pressed_time = 0;
     menu_button_down = false;
     menu_hold_fired = false;
     force_full_redraw = true;
@@ -5555,10 +9465,19 @@ enum plugin_status plugin_start(const void *parameter)
     track_sort_descending = false;
     track_search[0] = '\0';
     search_active = false;
+    collection_shuffle_active = false;
     search_result_count = 0;
     pending_selection = pending_top = 0;
+    recent_tracks_ready = false;
+    uptime_tracks_burned = 0;
+    play_stat_track_id = -1;
+    play_stat_last_tick = *rb->current_tick;
+    play_stat_ticks = 0;
+    play_stat_counted = false;
     track_edit_dirty = false;
-    usb_selection = rb->global_settings->usb_audio != 0;
+    usb_selection = 0;
+    dac_saved_volume = rb->global_status->volume;
+    dac_gain_override = false;
     host_rpm_index = played_rpm_index = 0;
     pitch_bend_x100 = 0;
     tempo_x100 = PITCH_SPEED_100;
@@ -5567,12 +9486,15 @@ enum plugin_status plugin_start(const void *parameter)
     original_timestretch_enabled =
         rb->global_settings->timestretch_enabled;
     playback_rate_changed = false;
-    configfile_load(RBPREP_CONFIG_FILE, rbprep_config,
-                    ARRAYLEN(rbprep_config), RBPREP_CONFIG_VERSION);
     waveform_half = !!waveform_half;
     visualizer_mode = MAX(0, MIN((int)ARRAYLEN(visualizer_styles) - 1,
                                  visualizer_mode));
     save_on_track_load = !!save_on_track_load;
+    auto_burn = !!auto_burn;
+    click_sound = !!click_sound;
+    keylock_enabled = !!keylock_enabled;
+    if (auto_burn)
+        save_on_track_load = false;
     scrub_step_index = MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1,
                                   scrub_step_index));
     host_rpm_index = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1,
@@ -5580,17 +9502,34 @@ enum plugin_status plugin_start(const void *parameter)
     played_rpm_index = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1,
                                   played_rpm_index));
     tempo_x100 = MAX(5000, MIN(20000, tempo_x100));
+    apply_usb_choice(0);
+    usb_event_registered = rb->add_event(SYS_EVENT_USB_INSERTED,
+                                         rbprep_usb_inserted);
+    usb_extract_event_registered = rb->add_event(SYS_EVENT_USB_EXTRACTED,
+                                                 rbprep_usb_extracted);
     apply_playback_rate();
-    start_spectrum_capture();
+    if (!display_locked)
+        start_spectrum_capture();
     rebuild_waveform_height_lut();
     clear_analysis();
+    load_smart_query_flags();
     open_library_index();
     load_genre_rollup();
+    load_tool_macros();
+    restore_saved_macro_selection();
+    load_macro_links();
     refresh_pending_summary();
+    if (autoboot_launch)
+        draw_rekordpod_boot_splash();
+    if (auto_burn && (pending_snapshot_count > 0 ||
+                      pending_playlist_count > 0))
+        burn_request = BURN_REQUEST_ALL;
     reset_play_clock(playhead, *rb->current_tick);
     overview_deadline = *rb->current_tick;
     hud_scroll_deadline = *rb->current_tick;
+    status_deadline = *rb->current_tick;
     frame_deadline = *rb->current_tick;
+    storage_keepalive_deadline = *rb->current_tick + HZ * 30;
 
     /* Discard the release of SELECT used to launch the plugin. */
     rb->button_clear_queue();
@@ -5598,6 +9537,7 @@ enum plugin_status plugin_start(const void *parameter)
         struct mp3entry *id3 = rb->audio_current_track();
         if (service_display_lock())
             redraw = true;
+        service_storage_keepalive();
         if (selected_track_id >= 0 && id3 && id3->length > 0) {
             track_length = id3->length;
             if (track_year == 0 && id3->year > 0) {
@@ -5609,6 +9549,8 @@ enum plugin_status plugin_start(const void *parameter)
             redraw = true;
         if (update_play_clock())
             redraw = true;
+        service_play_statistics();
+        service_config_persistence();
         if (service_loop_playback())
             redraw = true;
         if (service_playlist_playback())
@@ -5622,34 +9564,52 @@ enum plugin_status plugin_start(const void *parameter)
             return PLUGIN_OK;
         }
 
-        if (mode >= MODE_DECK && !display_locked && !redraw) {
-            if (hud_scroll_active &&
-                !TIME_BEFORE(*rb->current_tick, hud_scroll_deadline)) {
-                draw_track_header(true);
-                rb->lcd_update_rect(0, 0, LCD_WIDTH, 32);
-                hud_scroll_deadline = *rb->current_tick +
-                                      RBPREP_HUD_SCROLL_TICKS;
-            }
-            if (!TIME_BEFORE(*rb->current_tick, overview_deadline)) {
-                overview_playhead_white = !overview_playhead_white;
-                draw_overview_waveform();
-                draw_tool_row();
-                rb->lcd_update_rect(0, RBPREP_OVERVIEW_Y, LCD_WIDTH,
-                                    RBPREP_WAVE_TOP - RBPREP_OVERVIEW_Y);
-                overview_deadline = *rb->current_tick +
-                                    RBPREP_OVERVIEW_TICKS;
-            }
-        }
-
-        if (!display_locked && redraw && (force_full_redraw ||
-            !TIME_BEFORE(*rb->current_tick, frame_deadline))) {
+        /* Rendering never owns the input rate. Coalesce rapid wheel/chord
+           edges into the next frame so the queue is drained before drawing;
+           menus remain event-driven while the deck keeps its timecode clock. */
+        if (!display_locked &&
+            !TIME_BEFORE(*rb->current_tick, frame_deadline) &&
+            (force_full_redraw || mode >= MODE_DECK || redraw)) {
             draw_screen();
             redraw = false;
-            frame_deadline = *rb->current_tick + RBPREP_FRAME_TICKS;
+            frame_deadline = *rb->current_tick +
+                             (mode >= MODE_DECK ? RBPREP_FRAME_TICKS
+                                                : RBPREP_MENU_FRAME_TICKS);
         }
-        button = rb->button_get_w_tmo(1);
+        button = rb->button_get_w_tmo(display_locked ? MAX(1, HZ / 20) : 1);
         if (button != BUTTON_NONE)
             redraw = true;
+        if (macro_chord_button != BUTTON_NONE) {
+            int chord_status = rb->button_status();
+            int chord_button = macro_chord_button;
+
+            /* A macro chord only arms another workflow cell.  Keep the
+               entire input path latched until both SELECT and the companion
+               button are physically up; otherwise SELECT's release can be
+               mistaken for a fresh press and execute the newly armed tool.
+               A deliberate second SELECT press is the sole execution path. */
+            if (!(chord_status & (chord_button | BUTTON_SELECT))) {
+                macro_chord_button = BUTTON_NONE;
+                pressed = BUTTON_NONE;
+                if (chord_button == BUTTON_LEFT)
+                    suppress_left = false;
+                else if (chord_button == BUTTON_RIGHT)
+                    suppress_right = false;
+                else if (chord_button == BUTTON_MENU) {
+                    suppress_menu = false;
+                    menu_button_down = false;
+                    menu_hold_fired = false;
+                } else if (chord_button == BUTTON_PLAY) {
+                    suppress_play = false;
+                }
+                select_hold_fired = false;
+                suppress_menu = suppress_play = false;
+                suppress_left = suppress_right = false;
+                menu_button_down = false;
+                menu_hold_fired = false;
+            }
+            continue;
+        }
         if (!confirm_active && menu_button_down && !menu_hold_fired &&
             (rb->button_status() & BUTTON_MENU) &&
             !TIME_BEFORE(*rb->current_tick,
@@ -5678,15 +9638,8 @@ enum plugin_status plugin_start(const void *parameter)
                 finish_confirmation(false);
             } else if (button == (BUTTON_SELECT | BUTTON_REL)) {
                 finish_confirmation(confirm_ok);
-            } else if (rb->default_event_handler(button) ==
-                       SYS_USB_CONNECTED) {
-                stop_editor_audio();
-                if (library_fd >= 0)
-                    rb->close(library_fd);
-                if (genre_fd >= 0)
-                    rb->close(genre_fd);
-                return PLUGIN_USB_CONNECTED;
-            }
+            } else if (handle_usb_system_event(button))
+                force_full_redraw = true;
             continue;
         }
         switch (button) {
@@ -5711,6 +9664,8 @@ enum plugin_status plugin_start(const void *parameter)
             break;
         case BUTTON_SELECT:
             select_hold_fired = false;
+            update_play_clock();
+            select_pressed_time = live_playhead_now();
             if (tool_menu_active) {
                 pressed = BUTTON_SELECT;
             } else if (mode == MODE_CUES &&
@@ -5729,9 +9684,19 @@ enum plugin_status plugin_start(const void *parameter)
             pressed = BUTTON_NONE;
             if (menu_hold_fired) {
                 menu_hold_fired = false;
+            } else if (mode == MODE_MACRO_VALUE) {
+                if (macro_tool_supports_fixed_value(macro_value_tool))
+                    macro_value_choose = !macro_value_choose;
+                if (!macro_value_choose)
+                    macro_value_lock = true;
+                force_full_redraw = true;
+            } else if (mode == MODE_MACRO_EDITOR) {
+                cycle_macro_operation(-1);
+            } else if (mode == MODE_MACRO_PICKER) {
+                bank_macro_picker(-1);
             } else if (mode >= MODE_DECK) {
                 if (tool_menu_active) {
-                    browse_tool_menu(-1);
+                    bank_tool_page(-1);
                 } else {
                     tool_menu_original = active_tool();
                     tool_menu_active = true;
@@ -5751,16 +9716,42 @@ enum plugin_status plugin_start(const void *parameter)
             }
             if (tool_menu_active && mode >= MODE_DECK) {
                 pressed = BUTTON_NONE;
-                browse_tool_menu(1);
+                bank_tool_page(1);
                 break;
             }
             if (pressed != BUTTON_PLAY)
                 break;
             pressed = BUTTON_NONE;
-            if (mode == MODE_TRACKS && active_playlist_node < 0) {
+            if (mode == MODE_MACRO_VALUE) {
+                if (!macro_value_choose)
+                    macro_value_lock = !macro_value_lock;
+                force_full_redraw = true;
+            } else if (mode == MODE_MACRO_EDITOR) {
+                cycle_macro_operation(1);
+            } else if (mode == MODE_MACRO_PICKER) {
+                bank_macro_picker(1);
+            } else if (mode == MODE_MACRO_ACTIONS) {
+                /* Playback is deliberately inert inside workflow setup. */
+            } else if (mode == MODE_TRACKS && active_playlist_node < 0) {
                 filter_selection = 0;
                 mode = MODE_FILTER;
                 force_full_redraw = true;
+            } else if (mode == MODE_PLAYLISTS && playlist_move_mode) {
+                playlist_action_parent_id =
+                    playlist_parent_source_id(
+                        tree_parent == RBPREP_ROOT_NODE
+                        ? -1 : (int)tree_parent);
+                if (tree_parent != RBPREP_ROOT_NODE &&
+                    !playlist_action_parent_id) {
+                    rb->splash(HZ * 2,
+                               "Rebuild cache for stable folder IDs");
+                    restore_black_canvas();
+                } else {
+                    rb->snprintf(confirm_message, sizeof(confirm_message),
+                                 "MOVE %.22s HERE?",
+                                 playlist_action_name);
+                    begin_confirmation(CONFIRM_PLAYLIST_MOVE);
+                }
             } else if (mode == MODE_PENDING) {
                 int changes = pending_snapshot_count + pending_playlist_count;
                 if (changes > 0) {
@@ -5778,7 +9769,15 @@ enum plugin_status plugin_start(const void *parameter)
                 break;
             pressed = BUTTON_NONE;
             if (tool_menu_active) {
+                enum rbprep_tool chosen = active_tool();
                 tool_menu_active = false;
+                if (chosen == TOOL_MACRO_ONE || chosen == TOOL_MACRO_TWO) {
+                    activate_macro(chosen == TOOL_MACRO_ONE ? 0 : 1);
+                } else {
+                    macro_active = -1;
+                    macro_wheel_locked = false;
+                    overview_dirty = true;
+                }
                 force_full_redraw = true;
             } else if (cue_audition_active) {
                 finish_cue_audition();
@@ -5789,7 +9788,14 @@ enum plugin_status plugin_start(const void *parameter)
             break;
         case BUTTON_SELECT | BUTTON_REPEAT:
             if (pressed == BUTTON_SELECT && !select_hold_fired &&
-                !tool_menu_active) {
+                tool_menu_active &&
+                (active_tool() == TOOL_MACRO_ONE ||
+                 active_tool() == TOOL_MACRO_TWO)) {
+                select_hold_fired = true;
+                tool_menu_active = false;
+                long_select();
+            } else if (pressed == BUTTON_SELECT && !select_hold_fired &&
+                       !tool_menu_active) {
                 select_hold_fired = true;
                 if (cue_audition_active)
                     latch_cue_audition();
@@ -5798,25 +9804,75 @@ enum plugin_status plugin_start(const void *parameter)
             }
             break;
         case BUTTON_SELECT | BUTTON_LEFT:
+            if (mode >= MODE_DECK && macro_active >= 0) {
+                step_macro(-1);
+                macro_chord_button = BUTTON_LEFT;
+                suppress_left = true;
+                select_hold_fired = true;
+                pressed = BUTTON_NONE;
+            }
+            break;
         case BUTTON_SELECT | BUTTON_LEFT | BUTTON_REPEAT:
+            /* One workflow step per physical chord press. */
+            break;
         case BUTTON_SELECT | BUTTON_RIGHT:
+            if (mode >= MODE_DECK && macro_active >= 0) {
+                step_macro(1);
+                macro_chord_button = BUTTON_RIGHT;
+                suppress_right = true;
+                select_hold_fired = true;
+                pressed = BUTTON_NONE;
+            }
+            break;
         case BUTTON_SELECT | BUTTON_RIGHT | BUTTON_REPEAT:
+            /* One workflow step per physical chord press. */
+            break;
         case BUTTON_SELECT | BUTTON_MENU:
         case BUTTON_SELECT | BUTTON_MENU | BUTTON_REPEAT:
+            if (mode >= MODE_DECK && macro_active >= 0) {
+                swap_macro(-1);
+                macro_chord_button = BUTTON_MENU;
+                suppress_menu = true;
+                menu_button_down = false;
+                menu_hold_fired = false;
+                select_hold_fired = true;
+                pressed = BUTTON_NONE;
+            }
+            break;
         case BUTTON_SELECT | BUTTON_PLAY:
         case BUTTON_SELECT | BUTTON_PLAY | BUTTON_REPEAT:
-            /* Tool and page chords are intentionally retired. */
+            if (mode >= MODE_DECK && macro_active >= 0) {
+                swap_macro(1);
+                macro_chord_button = BUTTON_PLAY;
+                suppress_play = true;
+                select_hold_fired = true;
+                pressed = BUTTON_NONE;
+            }
             break;
         case BUTTON_SELECT | BUTTON_LEFT | BUTTON_REL:
+            suppress_left = false;
+            pressed = BUTTON_NONE;
+            break;
         case BUTTON_SELECT | BUTTON_RIGHT | BUTTON_REL:
+            suppress_right = false;
+            pressed = BUTTON_NONE;
+            break;
         case BUTTON_SELECT | BUTTON_MENU | BUTTON_REL:
+            suppress_menu = false;
+            pressed = BUTTON_NONE;
+            break;
         case BUTTON_SELECT | BUTTON_PLAY | BUTTON_REL:
+            suppress_play = false;
             pressed = BUTTON_NONE;
             break;
         case BUTTON_SCROLL_FWD:
         case BUTTON_SCROLL_FWD | BUTTON_REPEAT:
+            if (click_sound)
+                rb->system_sound_play(SOUND_KEYCLICK);
             if (tool_menu_active && mode >= MODE_DECK)
                 browse_tool_menu(1);
+            else if (mode == MODE_MACRO_VALUE)
+                adjust_macro_value(1, false);
             else if (mode == MODE_LIBRARY)
                 selection = MIN(7, selection + 1);
             else if (mode == MODE_PLAYLISTS && tree_child_count > 0) {
@@ -5830,7 +9886,8 @@ enum plugin_status plugin_start(const void *parameter)
                 if (track_selection >= track_top + RBPREP_LIST_ROWS)
                     track_top = track_selection - RBPREP_LIST_ROWS + 1;
             } else if (mode == MODE_FILTER) {
-                filter_selection = MIN(7, filter_selection + 1);
+                filter_selection = MIN(TRACK_SORT_COUNT + 1,
+                                       filter_selection + 1);
             } else if (mode == MODE_PENDING &&
                        pending_snapshot_count + pending_playlist_count > 0) {
                 pending_selection = MIN(pending_snapshot_count +
@@ -5840,9 +9897,21 @@ enum plugin_status plugin_start(const void *parameter)
                     pending_top = pending_selection - RBPREP_PENDING_ROWS + 1;
             }
             else if (mode == MODE_USB)
-                usb_selection = 1;
+                usb_selection = MIN(2, usb_selection + 1);
             else if (mode == MODE_SETTINGS)
-                settings_selection = MIN(2, settings_selection + 1);
+                settings_selection = MIN(8, settings_selection + 1);
+            else if (mode == MODE_ACCENT)
+                adjust_active_color(1);
+            else if (mode == MODE_PLAYLIST_ACTIONS)
+                playlist_action_selection =
+                    MIN(4, playlist_action_selection + 1);
+            else if (mode == MODE_MACRO_ACTIONS)
+                macro_action_selection =
+                    MIN(2, macro_action_selection + 1);
+            else if (mode == MODE_MACRO_EDITOR)
+                move_macro_editor_cursor(1);
+            else if (mode == MODE_MACRO_PICKER)
+                move_macro_picker(1);
             else if (mode == MODE_GENRES) {
                 genre_selection = MIN(genre_count, genre_selection + 1);
                 if (genre_selection >= genre_top + RBPREP_LIST_ROWS)
@@ -5852,8 +9921,12 @@ enum plugin_status plugin_start(const void *parameter)
             break;
         case BUTTON_SCROLL_BACK:
         case BUTTON_SCROLL_BACK | BUTTON_REPEAT:
+            if (click_sound)
+                rb->system_sound_play(SOUND_KEYCLICK);
             if (tool_menu_active && mode >= MODE_DECK)
                 browse_tool_menu(-1);
+            else if (mode == MODE_MACRO_VALUE)
+                adjust_macro_value(-1, false);
             else if (mode == MODE_LIBRARY)
                 selection = MAX(0, selection - 1);
             else if (mode == MODE_PLAYLISTS) {
@@ -5874,6 +9947,18 @@ enum plugin_status plugin_start(const void *parameter)
                 usb_selection = 0;
             else if (mode == MODE_SETTINGS)
                 settings_selection = MAX(0, settings_selection - 1);
+            else if (mode == MODE_ACCENT)
+                adjust_active_color(-1);
+            else if (mode == MODE_PLAYLIST_ACTIONS)
+                playlist_action_selection =
+                    MAX(0, playlist_action_selection - 1);
+            else if (mode == MODE_MACRO_ACTIONS)
+                macro_action_selection =
+                    MAX(0, macro_action_selection - 1);
+            else if (mode == MODE_MACRO_EDITOR)
+                move_macro_editor_cursor(-1);
+            else if (mode == MODE_MACRO_PICKER)
+                move_macro_picker(-1);
             else if (mode == MODE_GENRES) {
                 genre_selection = MAX(0, genre_selection - 1);
                 if (genre_selection < genre_top)
@@ -5887,12 +9972,46 @@ enum plugin_status plugin_start(const void *parameter)
             if (tool_menu_active && mode >= MODE_DECK) {
                 browse_tool_menu(-1);
                 pressed = BUTTON_NONE;
+            } else if (mode == MODE_MACRO_VALUE) {
+                adjust_macro_value(-1, true);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_PLAYLIST_ACTIONS) {
+                playlist_action_selection =
+                    MAX(0, playlist_action_selection - 1);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_MACRO_ACTIONS) {
+                macro_action_selection =
+                    MAX(0, macro_action_selection - 1);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_MACRO_EDITOR) {
+                move_macro_editor_cursor(-1);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_MACRO_PICKER) {
+                move_macro_picker(-1);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_ACCENT) {
+                accent_component = MAX(0, accent_component - 1);
+                pressed = BUTTON_NONE;
             } else if (mode >= MODE_DECK)
                 pressed = BUTTON_LEFT;
             break;
         case BUTTON_LEFT | BUTTON_REPEAT:
             if (tool_menu_active && mode >= MODE_DECK)
                 browse_tool_menu(-1);
+            else if (mode == MODE_MACRO_VALUE)
+                adjust_macro_value(-1, true);
+            else if (mode == MODE_PLAYLIST_ACTIONS)
+                playlist_action_selection =
+                    MAX(0, playlist_action_selection - 1);
+            else if (mode == MODE_MACRO_ACTIONS)
+                macro_action_selection =
+                    MAX(0, macro_action_selection - 1);
+            else if (mode == MODE_MACRO_EDITOR)
+                move_macro_editor_cursor(-1);
+            else if (mode == MODE_MACRO_PICKER)
+                move_macro_picker(-1);
+            else if (mode == MODE_ACCENT)
+                accent_component = MAX(0, accent_component - 1);
             else if (!suppress_left && mode >= MODE_DECK)
                 adjust_active_tool_coarse(-1);
             break;
@@ -5914,12 +10033,46 @@ enum plugin_status plugin_start(const void *parameter)
             if (tool_menu_active && mode >= MODE_DECK) {
                 browse_tool_menu(1);
                 pressed = BUTTON_NONE;
+            } else if (mode == MODE_MACRO_VALUE) {
+                adjust_macro_value(1, true);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_PLAYLIST_ACTIONS) {
+                playlist_action_selection =
+                    MIN(4, playlist_action_selection + 1);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_MACRO_ACTIONS) {
+                macro_action_selection =
+                    MIN(2, macro_action_selection + 1);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_MACRO_EDITOR) {
+                move_macro_editor_cursor(1);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_MACRO_PICKER) {
+                move_macro_picker(1);
+                pressed = BUTTON_NONE;
+            } else if (mode == MODE_ACCENT) {
+                accent_component = MIN(2, accent_component + 1);
+                pressed = BUTTON_NONE;
             } else if (mode >= MODE_DECK)
                 pressed = BUTTON_RIGHT;
             break;
         case BUTTON_RIGHT | BUTTON_REPEAT:
             if (tool_menu_active && mode >= MODE_DECK)
                 browse_tool_menu(1);
+            else if (mode == MODE_MACRO_VALUE)
+                adjust_macro_value(1, true);
+            else if (mode == MODE_PLAYLIST_ACTIONS)
+                playlist_action_selection =
+                    MIN(4, playlist_action_selection + 1);
+            else if (mode == MODE_MACRO_ACTIONS)
+                macro_action_selection =
+                    MIN(2, macro_action_selection + 1);
+            else if (mode == MODE_MACRO_EDITOR)
+                move_macro_editor_cursor(1);
+            else if (mode == MODE_MACRO_PICKER)
+                move_macro_picker(1);
+            else if (mode == MODE_ACCENT)
+                accent_component = MIN(2, accent_component + 1);
             else if (!suppress_right && mode >= MODE_DECK)
                 adjust_active_tool_coarse(1);
             break;
@@ -5936,14 +10089,8 @@ enum plugin_status plugin_start(const void *parameter)
             }
             break;
         default:
-            if (rb->default_event_handler(button) == SYS_USB_CONNECTED) {
-                stop_editor_audio();
-                if (library_fd >= 0)
-                    rb->close(library_fd);
-                if (genre_fd >= 0)
-                    rb->close(genre_fd);
-                return PLUGIN_USB_CONNECTED;
-            }
+            if (handle_usb_system_event(button))
+                force_full_redraw = true;
             break;
         }
     }

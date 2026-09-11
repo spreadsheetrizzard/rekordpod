@@ -180,9 +180,14 @@ static inline bool usb_reboot_button(void)
 
 #ifdef HAVE_USBSTACK
 /* Enable / disable USB when the stack is enabled - otherwise a noop */
+static bool usb_stack_active = false;
+
 static inline void usb_stack_enable(bool enable)
 {
+    if (usb_stack_active == enable)
+        return;
     usb_enable(enable);
+    usb_stack_active = enable;
 }
 
 #ifdef HAVE_HOTSWAP
@@ -453,6 +458,9 @@ static void NORETURN_ATTR usb_thread(void)
 #endif /* HAVE_USBSTACK */
 
         case USB_INSERTED:
+        {
+            bool start_usb_stack = true;
+
             if(usb_state != USB_EXTRACTED)
                 break;
 
@@ -464,7 +472,6 @@ static void NORETURN_ATTR usb_thread(void)
 
             usb_state = USB_POWERED;
 
-            usb_stack_enable(true);
 #ifndef BOOTLOADER
 #ifndef HAVE_USB_POWER
             int usb_mode = -1;
@@ -477,13 +484,32 @@ static void NORETURN_ATTR usb_thread(void)
             if(button_status() & ~USBPOWER_BTN_IGNORE) {
                 usb_power_only = !usb_power_only;
             }
+#if defined(IPOD_6G) && defined(HAVE_USBSTACK)
+            /* Rekordpod POWER ONLY is intentionally electrically quiet: do
+             * not initialise or attach the device controller merely to
+             * advertise a charging-only interface.  DATA still starts MSC,
+             * and DAC still starts the charge-side USB audio interface. */
+            if (usb_power_only) {
+#ifdef USB_ENABLE_AUDIO
+                start_usb_stack = usb_audio == 1 || usb_audio == 2;
+#else
+                start_usb_stack = false;
+#endif
+            }
+#endif
 #endif
 
+            if (start_usb_stack)
+                usb_stack_enable(true);
+
 #ifndef USB_DETECT_BY_REQUEST
-            usb_state = USB_INSERTED;
-            usb_set_host_present(true);
+            if (start_usb_stack) {
+                usb_state = USB_INSERTED;
+                usb_set_host_present(true);
+            }
 #endif
             break;
+        }
             /* USB_INSERTED */
 
         case SYS_USB_CONNECTED_ACK:

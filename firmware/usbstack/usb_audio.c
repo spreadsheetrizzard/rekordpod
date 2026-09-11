@@ -354,7 +354,7 @@ int tmp_saved_vol;
 
 /* buffers used for usb, queuing and playback */
 static unsigned char *rx_buffer;
-int rx_buffer_handle;
+static int rx_buffer_handle = -1;
 /* buffer size */
 static int rx_buf_size[NR_BUFFERS]; // only used for debug screen counter now
 /* index of the next buffer to play */
@@ -370,7 +370,7 @@ bool usb_rx_overflow;
 #define DSP_BUF_SIZE (BUFFER_SIZE*4) // arbitrarily x4
 #define REAL_DSP_BUF_SIZE   ALIGN_UP(DSP_BUF_SIZE, 32)
 static uint16_t *dsp_buf;
-int dsp_buf_handle;
+static int dsp_buf_handle = -1;
 static int dsp_buf_size[NR_BUFFERS];
 struct dsp_config *dsp = NULL;
 
@@ -520,6 +520,15 @@ int usb_audio_request_buf(void)
     // stop playback first thing
     audio_stop();
 
+    /* SET_CONFIGURATION may be repeated by a host during probing. Refuse a
+       second allocation rather than leaking or replacing buffers that an
+       isochronous completion could still be using. */
+    if (rx_buffer_handle >= 0 || dsp_buf_handle >= 0)
+    {
+        alloc_failed = true;
+        return -1;
+    }
+
     // attempt to allocate the receive buffers
     rx_buffer_handle = core_alloc(REAL_BUF_SIZE);
     if (rx_buffer_handle < 0)
@@ -561,10 +570,12 @@ int usb_audio_request_buf(void)
 void usb_audio_free_buf(void)
 {
     // logf("usbaudio: free buffer");
-    rx_buffer_handle = core_free(rx_buffer_handle);
+    if (rx_buffer_handle >= 0)
+        rx_buffer_handle = core_free(rx_buffer_handle);
     rx_buffer = NULL;
 
-    dsp_buf_handle = core_free(dsp_buf_handle);
+    if (dsp_buf_handle >= 0)
+        dsp_buf_handle = core_free(dsp_buf_handle);
     dsp_buf = NULL;
 }
 
@@ -696,6 +707,14 @@ static void playback_audio_get_more(const void **start, size_t *size)
 
 static void usb_audio_start_playback(void)
 {
+    if (!usbaudio_active || !rx_buffer || !dsp_buf || !dsp)
+    {
+        logf("usbaudio: playback start without active buffers");
+        return;
+    }
+    if (usb_audio_playing)
+        return;
+
     usb_audio_playing = true;
     usb_rx_overflow = false;
     playback_audio_underflow = true;
@@ -706,6 +725,13 @@ static void usb_audio_start_playback(void)
     fb_startframe = usb_drv_get_frame_number();
     samples_fb = 0;
     samples_received_report = 0;
+    buffers_filled_old = 0;
+    buffers_filled_accumulator = 0;
+    buffers_filled_accumulator_old = 0;
+    buffers_filled_avgcount = 0;
+    buffers_filled_avgcount_old = 0;
+    send_fb = false;
+    sent_fb_this_frame = false;
 
     // debug screen info - frame drop counter
     frames_dropped = 0;
@@ -765,6 +791,13 @@ static int usb_audio_set_interface(int intf, int alt)
         if(alt < 0 || alt > 1)
         {
             logf("usbaudio: playback interface has no alternate %d", alt);
+            return -1;
+        }
+        if (alt == usb_as_playback_intf_alt)
+            return 0;
+        if (alt == 1 && (!usbaudio_active || !rx_buffer || !dsp_buf || !dsp))
+        {
+            logf("usbaudio: playback alternate requested while inactive");
             return -1;
         }
         usb_as_playback_intf_alt = alt;
@@ -1174,8 +1207,14 @@ static int usb_audio_init_connection(void)
     if (usb_audio_request_buf())
         return -1;
 
-    usbaudio_active = true;
     dsp = dsp_get_config(CODEC_IDX_AUDIO);
+    if (!dsp)
+    {
+        logf("usbaudio: no playback DSP");
+        usb_audio_free_buf();
+        alloc_failed = true;
+        return -1;
+    }
     dsp_configure(dsp, DSP_RESET, 0);
     dsp_configure(dsp, DSP_SET_STEREO_MODE, STEREO_INTERLEAVED);
     dsp_configure(dsp, DSP_SET_SAMPLE_DEPTH, 16);
@@ -1188,6 +1227,7 @@ static int usb_audio_init_connection(void)
     set_playback_sampling_frequency(HW_SAMPR_DEFAULT);
     tmp_saved_vol = sound_current(SOUND_VOLUME);
     usb_audio_playing = false;
+    usbaudio_active = true;
     return 0;
 }
 
@@ -1201,12 +1241,15 @@ static void usb_audio_disconnect(void)
 {
     logf("usbaudio: disconnect");
 
-    if(!usbaudio_active)
+    if(!usbaudio_active && rx_buffer_handle < 0 && dsp_buf_handle < 0)
         return;
 
+    /* Make late isochronous completions harmless before releasing memory. */
+    usb_as_playback_intf_alt = 0;
+    usbaudio_active = false;
     usb_audio_stop_playback();
     usb_audio_free_buf();
-    usbaudio_active = false;
+    dsp = NULL;
 }
 
 bool usb_audio_get_active(void)
@@ -1298,10 +1341,18 @@ static void usb_audio_transfer_complete(int ep, int dir, int status, int length)
  */
 static bool usb_audio_fast_transfer_complete(int ep, int dir, int status, int length)
 {
-    (void) dir;
     bool retval = false;
 
-    if(ep == EP_ISO_OUT && usb_as_playback_intf_alt == 1)
+    /* Some controllers allocate the OUT and feedback IN directions on the
+       same endpoint number. Use the direction bit instead of guessing from
+       packet length; a short/zero OUT packet must not stop reception. */
+    if (usbaudio_active && usb_audio_playing &&
+        (ep | dir) == EP_ISO_FEEDBACK_IN)
+        return true;
+
+    if(usbaudio_active && usb_audio_playing && rx_buffer && dsp_buf && dsp &&
+       (ep | dir) == EP_ISO_OUT &&
+       usb_as_playback_intf_alt == 1)
     {
         // check for dropped frames
         if (last_frame != usb_drv_get_frame_number())
@@ -1313,16 +1364,14 @@ static bool usb_audio_fast_transfer_complete(int ep, int dir, int status, int le
             last_frame = usb_drv_get_frame_number();
         }
 
-        // If audio and feedback EPs happen to have the same base number (with opposite directions, of course),
-        // we will get replies to the feedback here, don't want that to be interpreted as data.
-        if (length <= 4)
+        logf("usbaudio: frame: %d bytes: %d", usb_drv_get_frame_number(), length);
+        if(status != 0 || length <= 0)
         {
+            /* A transient/microframe error is not an end-of-stream signal.
+               Keep one receive queued while the alternate is still active. */
+            usb_drv_recv_nonblocking(EP_ISO_OUT, rx_buffer, BUFFER_SIZE);
             return true;
         }
-
-        logf("usbaudio: frame: %d bytes: %d", usb_drv_get_frame_number(), length);
-        if(status != 0)
-            return true; /* FIXME how to handle error here ? */
 
         /* store length, queue buffer */
         rx_buf_size[rx_usb_idx] = length;
@@ -1458,8 +1507,13 @@ static bool usb_audio_fast_transfer_complete(int ep, int dir, int status, int le
 }
 
 struct usb_class_driver usb_cdrv_audio = {
-    .needs_exclusive_storage = false,
-    .needs_cpu_boost = false,
+    /* Rekordpod uses Rockbox's blocking USB screen for DAC gain takeover and
+       to suspend plugin/file activity while USB owns the playback pipeline. */
+    .needs_exclusive_storage = true,
+    /* Isochronous RX and DSP conversion run at frame cadence. Once normal
+       playback is stopped there is otherwise no governor client keeping the
+       CPU fast enough, which can starve macOS streams before audio starts. */
+    .needs_cpu_boost = true,
     .config = 1,
     .ep_allocs_size = ARRAYLEN(ep_allocs),
     .ep_allocs = ep_allocs,

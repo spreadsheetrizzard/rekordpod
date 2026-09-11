@@ -1,0 +1,44 @@
+# Rekordpod Grey while-playing skin for the iPod 6G (320x240)
+# Fast, bitmap-free HUD matching the Rekordpod preparation deck.
+
+%wd
+
+# Brand/status blade.
+%V(0,0,320,16,1)%Vf(ECECEC)%Vb(101010)
+%al  REKORDPOD%ac%?mp<STOPPED|PLAYING|PAUSED|SEEK +|SEEK -|RECORD|REC PAUSE|RADIO|RADIO PAUSE>%ar%?mh<HOLD |>%bl%%  
+
+# Artist - title, matching the deck's full-width first data row.
+%V(7,19,306,19,1)%Vf(F4F4F4)%Vb(000000)
+%s%al%?ia<%ia|UNKNOWN ARTIST>  -  %?it<%it|%fn>
+
+# Dense metadata card.
+%V(7,39,306,17,1)%Vf(9E9E9E)%Vb(000000)
+%s%al%?id<%id  |>%?iy<%iy  |>%?ig<%ig  |>%fb kbps  %fk kHz
+
+# Full-width miniature track overview. The native progress bar is intentionally
+# narrow and cheap to redraw, like the static overview in Prep Deck.
+%V(7,61,306,20,1)%Vf(BEBEBE)%Vb(161616)
+%pb(0,6,306,8)
+
+# Playback position and remaining time.
+%V(7,83,306,18,1)%Vf(D8D8D8)%Vb(000000)
+%al%pc%ac%pp / %pe%ar-%pr
+
+# Main record/deck card.
+%V(7,106,306,67,1)%Vf(E8E8E8)%Vb(181818)
+%ac%?it<%it|%fn>
+%ac%?ia<%ia|UNKNOWN ARTIST>
+%ac%?id<%id|%?d(1)<%d(1)|ROOT>>
+
+# Hairline meter gives the lower card a restrained Pioneer-style edge.
+%V(7,176,306,2,1)%Vb(686868)
+
+# Next-up card.
+%V(7,181,306,31,1)%Vf(9A9A9A)%Vb(080808)
+%alNEXT  %?It<%It|-->
+%al%?Ia<%Ia|QUEUE EMPTY>
+
+# Tool/status footer. Text symbols are font-native; browser glyphs come from
+# Rockbox's bundled Tango icon strips selected by the theme configuration.
+%V(0,216,320,24,1)%Vf(E8E8E8)%Vb(202020)
+%al  %?mp<STOP|PLAY|PAUSE|SEEK +|SEEK -|REC|REC PAUSE|RADIO|RADIO PAUSE>%ac%?ps<SHUFFLE|ORDERED>%ar%?mm<LOOP|REPEAT 1|REPEAT ALL|SHUFFLE|>  

@@ -935,6 +935,7 @@ static void rbprep_autostart(void)
 {
     static bool attempted;
     const char *path = ROCKBOX_DIR "/rocks/apps/rbprep.rock";
+    const char *disabled = ROCKBOX_DIR "/rbprep/autoboot.off";
 
     if (attempted)
         return;
@@ -942,7 +943,8 @@ static void rbprep_autostart(void)
 
     /* MENU is a deliberately simple recovery bypass.  Returning from RBPrep
        continues into the normal Rockbox root menu and cannot relaunch it. */
-    if ((button_status() & BUTTON_MENU) || !file_exists(path))
+    if ((button_status() & BUTTON_MENU) || file_exists(disabled) ||
+        !file_exists(path))
         return;
     plugin_load(path, "autoboot");
 }

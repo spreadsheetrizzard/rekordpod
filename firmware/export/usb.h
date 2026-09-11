@@ -148,6 +148,11 @@ enum
 
 #if defined(BOOTLOADER)
 #define USBMODE_DEFAULT USB_MODE_MASS_STORAGE
+#elif defined(IPOD_6G)
+/* Rekordpod owns the explicit DATA/DAC handoff.  Starting the application
+ * firmware in charge-only mode prevents a cable present during boot from
+ * taking storage away before the device-side policy has loaded. */
+#define USBMODE_DEFAULT USB_MODE_CHARGE
 #else
 #define USBMODE_DEFAULT USB_MODE_MASS_STORAGE
 #endif

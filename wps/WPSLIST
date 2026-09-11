@@ -38,6 +38,40 @@ viewers iconset..+x2: icons/viewers.6x8x2.bmp
 </theme>
 
 <theme>
+Name: rekordpod-grey
+Authors: Maxim and OpenAI Codex
+
+WPS: yes
+SBS: yes
+RWPS: no
+RSBS: no
+FMS: no
+RFMS: no
+
+<main>
+wps.320x240x(16|24|32): rekordpod-grey.320x240x16.wps
+sbs.320x240x(16|24|32): rekordpod-grey.320x240x16.sbs
+
+Font.320x240x(16|24|32): 12-Adobe-Helvetica.fnt
+foreground color: D8D8D8
+background color: 000000
+line selector start color: 5A5A5A
+line selector end color: 242424
+line selector text color: FFFFFF
+selector type: bar (gradient)
+filetype colours: -
+
+iconset.320x240x(16|24|32): icons/tango_icons.16x16.bmp
+viewers iconset.320x240x(16|24|32): icons/tango_icons_viewers.16x16.bmp
+show icons: on
+statusbar: off
+ui viewport: -
+list separator height: 1
+list separator color: 242424
+</main>
+</theme>
+
+<theme>
 Name: rockbox_failsafe
 Author: Rockbox team
 
