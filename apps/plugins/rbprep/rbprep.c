@@ -33,11 +33,6 @@
 #define RBPREP_DECK_X 0
 #define RBPREP_VU_WIDTH 20
 #define RBPREP_DECK_WIDTH (LCD_WIDTH - RBPREP_VU_WIDTH - 1)
-#define RBPREP_FOCUS_WIDTH 160
-#define RBPREP_FOCUS_COLUMN \
-    ((RBPREP_DECK_WIDTH - RBPREP_FOCUS_WIDTH) / 2)
-#define RBPREP_FOCUS_X (RBPREP_DECK_X + RBPREP_FOCUS_COLUMN)
-#define RBPREP_FOCUS_RIGHT (RBPREP_FOCUS_X + RBPREP_FOCUS_WIDTH - 1)
 #define RBPREP_WAVE_TOP 86
 #define RBPREP_WAVE_BOTTOM (LCD_HEIGHT - 1)
 #define RBPREP_SIGNAL_HEIGHT 128
@@ -57,10 +52,10 @@
 #define RBPREP_CUE_SETTLE MAX(1, HZ / 50)
 #define RBPREP_PREVIEW_TICKS MAX(1, HZ * 4 / 25)
 #define RBPREP_OVERVIEW_TICKS MAX(1, HZ / 2)
-#define RBPREP_CONTEXT_TICKS MAX(1, HZ / 10)
 #define RBPREP_MENU_FRAME_TICKS MAX(1, HZ / 25)
 #define RBPREP_HUD_SCROLL_TICKS MAX(1, HZ / 10)
 #define RBPREP_STATUS_TICKS MAX(1, HZ)
+#define RBPREP_INDEX_PLAY_TICKS MAX(1, HZ / 4)
 #define RBPREP_CONFIG_VERSION 4
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
 #define RBPREP_DEVICE_NAME_FILE "/.rockbox/rbprep/device-name.txt"
@@ -269,9 +264,6 @@ static int waveform_column_first;
 static int waveform_column_span;
 static bool waveform_columns_valid;
 static bool waveform_columns_exact;
-static int waveform_context_first;
-static int waveform_context_span;
-static bool waveform_context_valid;
 static int waveform_points;
 static int beat_count;
 static int beat_search_hint;
@@ -295,8 +287,7 @@ static bool overview_dirty = true;
 static long overview_deadline;
 static long hud_scroll_deadline;
 static long status_deadline;
-static long waveform_io_deadline;
-static long waveform_context_deadline;
+static long wave_index_service_deadline;
 static int title_scroll_px;
 static int metadata_scroll_px;
 static bool hud_scroll_active;
@@ -1235,7 +1226,7 @@ static const struct mixer_buffer_cbs spectrum_buffer_cbs = {
 
 static void start_spectrum_capture(void)
 {
-    if (spectrum_capture_active || visualizer_mode == 0 || display_locked)
+    if (spectrum_capture_active)
         return;
     pcm_capture_index = 0;
     pcm_capture_frames[0] = pcm_capture_frames[1] = 0;
@@ -2799,12 +2790,6 @@ static int beat_period_ms(void)
     return MAX(1, (first * (100 - fraction) + second * fraction + 50) / 100);
 }
 
-static bool imported_grid_resident(void)
-{
-    return beat_count > 0 &&
-           rbprep_grid_range_cached(&grid_reader, 0, beat_count);
-}
-
 static bool source_beat_at(int index, int *time_ms, int *number)
 {
     struct rbprep_grid_beat beat;
@@ -3032,63 +3017,6 @@ static void viewport(int *first, int *span)
     *first = zoom == 1 ? 0 : center - *span / 2;
 }
 
-static bool service_deep_zoom_cache(void)
-{
-#if RBPREP_WAVE_INDEX_FINE
-    int first;
-    int span;
-    int visible_begin;
-    int visible_end;
-    int buffered_begin;
-    int buffered_end;
-
-    if (capabilities.device_class != RBPREP_DEVICE_CLASSIC ||
-        mode < MODE_DECK || visualizer_mode != 0 || zoom < 64 ||
-        waveform_points <= 0)
-        return false;
-    viewport(&first, &span);
-    visible_begin = first +
-        (long long)RBPREP_FOCUS_COLUMN * span / RBPREP_DECK_WIDTH;
-    visible_end = first +
-        (long long)(RBPREP_FOCUS_COLUMN + RBPREP_FOCUS_WIDTH) * span /
-        RBPREP_DECK_WIDTH;
-    visible_begin = MAX(0, visible_begin);
-    visible_end = MIN(waveform_points, visible_end);
-    if (visible_begin >= visible_end)
-        return false;
-
-    /* Only the central focus lens needs raw RBW samples. The dim context
-       wings are always rendered from the resident peak pyramid, keeping
-       storage completely outside the frame path. */
-    if (!rbprep_wave_range_cached(&wave_reader,
-                                  visible_begin, visible_end)) {
-        bool loaded = rbprep_wave_cache_range(&wave_reader,
-                                              visible_begin, visible_end);
-
-        if (loaded)
-            waveform_columns_valid = false;
-        return loaded;
-    }
-
-    /* One focus window behind and ahead makes ordinary playback cross page
-       boundaries without falling back from exact samples. Fast seeking is
-       still safe: the resident peak pyramid supplies the interim frame. */
-    span = visible_end - visible_begin;
-    buffered_begin = MAX(0, visible_begin - span);
-    buffered_end = MIN(waveform_points, visible_end + span);
-    if (!rbprep_wave_range_cached(&wave_reader,
-                                  buffered_begin, buffered_end)) {
-        bool loaded = rbprep_wave_cache_range(&wave_reader,
-                                              buffered_begin, buffered_end);
-
-        if (loaded)
-            waveform_columns_valid = false;
-        return loaded;
-    }
-#endif
-    return false;
-}
-
 static int time_to_x(int time_ms, int first, int span)
 {
     long long sample;
@@ -3101,7 +3029,7 @@ static int time_to_x(int time_ms, int first, int span)
            (sample - first) * RBPREP_DECK_WIDTH / span;
 }
 
-static void draw_beatgrid(int first, int span, int clip_left, int clip_right)
+static void draw_beatgrid(int first, int span)
 {
     long long view_start;
     long long view_end;
@@ -3122,7 +3050,7 @@ static void draw_beatgrid(int first, int span, int clip_left, int clip_right)
     pixels_per_beat = (long long)period * RBPREP_DECK_WIDTH /
                       MAX(1, view_end - view_start);
 
-    if (imported_grid_resident()) {
+    if (beat_count > 0) {
         int low = 0;
         int high = beat_count;
 
@@ -3148,7 +3076,8 @@ static void draw_beatgrid(int first, int span, int clip_left, int clip_right)
                 number == 1 && ((i / 4) & 3))
                 continue;
             x = time_to_x(time_ms, first, span);
-            if (x >= clip_left && x <= clip_right) {
+            if (x >= RBPREP_DECK_X &&
+                x < RBPREP_DECK_X + RBPREP_DECK_WIDTH) {
                 rb->lcd_set_foreground(number == 1
                     ? LCD_RGBPACK(255, 45, 45)
                     : LCD_RGBPACK(85, 105, 90));
@@ -3173,7 +3102,8 @@ static void draw_beatgrid(int first, int span, int clip_left, int clip_right)
         int time_ms = base + i * period;
         int x;
         x = time_to_x(time_ms, first, span);
-        if (x >= clip_left && x <= clip_right) {
+        if (x >= RBPREP_DECK_X &&
+            x < RBPREP_DECK_X + RBPREP_DECK_WIDTH) {
             rb->lcd_set_foreground((i & 3) == 0
                 ? LCD_RGBPACK(255, 45, 45)
                 : LCD_RGBPACK(85, 105, 90));
@@ -3182,7 +3112,7 @@ static void draw_beatgrid(int first, int span, int clip_left, int clip_right)
     }
 }
 
-static void draw_cues(int first, int span, int clip_left, int clip_right)
+static void draw_cues(int first, int span)
 {
     int i;
 
@@ -3194,7 +3124,8 @@ static void draw_cues(int first, int span, int clip_left, int clip_right)
         if (hotcues[i] < 0)
             continue;
         x = time_to_x(hotcues[i], first, span);
-        if (x < clip_left || x > clip_right)
+        if (x < RBPREP_DECK_X ||
+            x >= RBPREP_DECK_X + RBPREP_DECK_WIDTH)
             continue;
 
         color = cue_palette[hotcue_colors[i] & 7];
@@ -3214,8 +3145,7 @@ static void draw_cues(int first, int span, int clip_left, int clip_right)
     }
 }
 
-static void draw_loop_markers(int first, int span,
-                              int clip_left, int clip_right)
+static void draw_loop_markers(int first, int span)
 {
     int in_x;
     int out_x;
@@ -3228,20 +3158,22 @@ static void draw_loop_markers(int first, int span,
     color = loop_active ? LCD_RGBPACK(255, 145, 40)
                         : LCD_RGBPACK(92, 98, 94);
     rb->lcd_set_foreground(color);
-    if (in_x >= clip_left && in_x <= clip_right) {
+    if (in_x >= RBPREP_DECK_X &&
+        in_x < RBPREP_DECK_X + RBPREP_DECK_WIDTH) {
         rb->lcd_vline(in_x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
-        rb->lcd_hline(in_x, MIN(in_x + 6, clip_right),
+        rb->lcd_hline(in_x, MIN(in_x + 6,
+                      RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1),
                       RBPREP_WAVE_TOP + 2);
     }
-    if (out_x >= clip_left && out_x <= clip_right) {
+    if (out_x >= RBPREP_DECK_X &&
+        out_x < RBPREP_DECK_X + RBPREP_DECK_WIDTH) {
         rb->lcd_vline(out_x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
-        rb->lcd_hline(MAX(clip_left, out_x - 6), out_x,
+        rb->lcd_hline(MAX(RBPREP_DECK_X, out_x - 6), out_x,
                       RBPREP_WAVE_TOP + 2);
     }
 }
 
-static void draw_loop_zone(int first, int span,
-                           int clip_left, int clip_right)
+static void draw_loop_zone(int first, int span)
 {
     int in_x;
     int out_x;
@@ -3252,8 +3184,8 @@ static void draw_loop_zone(int first, int span,
         return;
     in_x = time_to_x(loop_in, first, span);
     out_x = time_to_x(loop_out, first, span);
-    left = MAX(clip_left, in_x);
-    right = MIN(clip_right, out_x);
+    left = MAX(RBPREP_DECK_X, in_x);
+    right = MIN(RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1, out_x);
     if (right < left)
         return;
     rb->lcd_set_foreground(loop_active ? LCD_RGBPACK(43, 25, 3)
@@ -3262,40 +3194,23 @@ static void draw_loop_zone(int first, int span,
                      RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
 }
 
-static void waveform_sample_range(int first, int span,
-                                  int column_begin, int column_end,
-                                  int *sample_begin, int *sample_end)
+static void rebuild_waveform_columns(int first, int span)
 {
-    *sample_begin = first +
-        (long long)column_begin * span / RBPREP_DECK_WIDTH;
-    *sample_end = first +
-        (long long)column_end * span / RBPREP_DECK_WIDTH;
-    *sample_begin = MAX(0, *sample_begin);
-    *sample_end = MIN(waveform_points, *sample_end);
-}
-
-static bool waveform_focus_exact_available(int first, int span)
-{
-    int sample_begin;
-    int sample_end;
-
-    if (capabilities.device_class != RBPREP_DEVICE_CLASSIC || zoom < 64)
-        return false;
-    waveform_sample_range(first, span, RBPREP_FOCUS_COLUMN,
-                          RBPREP_FOCUS_COLUMN + RBPREP_FOCUS_WIDTH,
-                          &sample_begin, &sample_end);
-    return sample_begin < sample_end &&
-           rbprep_wave_range_cached(&wave_reader,
-                                    sample_begin, sample_end);
-}
-
-static void rebuild_waveform_column_range(int first, int span,
-                                          int column_begin, int column_end,
-                                          bool exact)
-{
+    int audio_status = rb->audio_status();
+    bool transport_active = (audio_status & AUDIO_STATUS_PLAY) &&
+                            !(audio_status & AUDIO_STATUS_PAUSE);
+    int samples_per_column = (span + RBPREP_DECK_WIDTH - 1) /
+                             RBPREP_DECK_WIDTH;
+    bool exact = !transport_active &&
+                 span <= (int)rbprep_wave_resident_points(&wave_reader) &&
+                 samples_per_column < 16;
     int x;
 
-    for (x = column_begin; x < column_end; x++) {
+    if (waveform_columns_valid && first == waveform_column_first &&
+        span == waveform_column_span && exact == waveform_columns_exact)
+        return;
+
+    for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
         int begin;
         int end;
         struct rbprep_wave_sample peak;
@@ -3313,12 +3228,12 @@ static void rebuild_waveform_column_range(int first, int span,
         end = MIN(end, waveform_points);
 
         if (exact) {
-            if (!rbprep_wave_sample_cached(&wave_reader, begin, &peak))
+            if (!rbprep_wave_sample_at(&wave_reader, begin, &peak))
                 continue;
             for (index = begin + 1; index < end; index++) {
                 struct rbprep_wave_sample sample;
 
-                if (!rbprep_wave_sample_cached(&wave_reader, index, &sample))
+                if (!rbprep_wave_sample_at(&wave_reader, index, &sample))
                     break;
                 if (sample.amplitude > peak.amplitude)
                     peak = sample;
@@ -3354,37 +3269,10 @@ static void rebuild_waveform_column_range(int first, int span,
         waveform_columns[x].blue = peak.blue;
         waveform_columns[x].valid = true;
     }
-}
-
-static void rebuild_waveform_focus(int first, int span)
-{
-    bool exact = waveform_focus_exact_available(first, span);
-
-    if (waveform_columns_valid && first == waveform_column_first &&
-        span == waveform_column_span && exact == waveform_columns_exact)
-        return;
-    rebuild_waveform_column_range(first, span, RBPREP_FOCUS_COLUMN,
-                                  RBPREP_FOCUS_COLUMN + RBPREP_FOCUS_WIDTH,
-                                  exact);
     waveform_column_first = first;
     waveform_column_span = span;
     waveform_columns_exact = exact;
     waveform_columns_valid = true;
-}
-
-static void rebuild_waveform_context(int first, int span)
-{
-    if (waveform_context_valid && first == waveform_context_first &&
-        span == waveform_context_span)
-        return;
-    rebuild_waveform_column_range(first, span, 0, RBPREP_FOCUS_COLUMN,
-                                  false);
-    rebuild_waveform_column_range(first, span,
-                                  RBPREP_FOCUS_COLUMN + RBPREP_FOCUS_WIDTH,
-                                  RBPREP_DECK_WIDTH, false);
-    waveform_context_first = first;
-    waveform_context_span = span;
-    waveform_context_valid = true;
 }
 
 static int integer_log2(uint64_t value)
@@ -4276,59 +4164,11 @@ static void draw_turntable(void)
          LCD_RGBPACK(155, 174, 161));
 }
 
-static int waveform_column_color(const struct rbprep_wave_column *column,
-                                 int column_index)
-{
-    int distance;
-    int wing_width;
-    int scale;
-
-    if (column_index >= RBPREP_FOCUS_COLUMN &&
-        column_index < RBPREP_FOCUS_COLUMN + RBPREP_FOCUS_WIDTH)
-        return LCD_RGBPACK(column->red, column->green, column->blue);
-
-    if (column_index < RBPREP_FOCUS_COLUMN) {
-        distance = RBPREP_FOCUS_COLUMN - column_index;
-        wing_width = MAX(1, RBPREP_FOCUS_COLUMN);
-    } else {
-        distance = column_index -
-                   (RBPREP_FOCUS_COLUMN + RBPREP_FOCUS_WIDTH - 1);
-        wing_width = MAX(1, RBPREP_DECK_WIDTH -
-                         RBPREP_FOCUS_COLUMN - RBPREP_FOCUS_WIDTH);
-    }
-
-    /* The resident-index wings recede from 42% brightness at the lens seam
-       to 20% at the outer edge. RGB identity remains visible without
-       competing with the exact center samples. */
-    scale = MAX(52, 108 - distance * 56 / wing_width);
-    return LCD_RGBPACK(column->red * scale / 255,
-                       column->green * scale / 255,
-                       column->blue * scale / 255);
-}
-
-static void draw_waveform_focus_frame(void)
-{
-    rb->lcd_set_foreground(LCD_RGBPACK(52, 68, 58));
-    rb->lcd_vline(RBPREP_FOCUS_X, RBPREP_WAVE_TOP,
-                  RBPREP_WAVE_BOTTOM);
-    rb->lcd_vline(RBPREP_FOCUS_RIGHT, RBPREP_WAVE_TOP,
-                  RBPREP_WAVE_BOTTOM);
-    rb->lcd_set_foreground(LCD_RGBPACK(105, 125, 112));
-    rb->lcd_hline(RBPREP_FOCUS_X, RBPREP_FOCUS_X + 5,
-                  RBPREP_WAVE_TOP);
-    rb->lcd_hline(RBPREP_FOCUS_RIGHT - 5, RBPREP_FOCUS_RIGHT,
-                  RBPREP_WAVE_TOP);
-}
-
-static void draw_waveform(bool full_context)
+static void draw_waveform(void)
 {
     int first;
     int span;
     int x;
-    int column_begin;
-    int column_end;
-    int clip_left;
-    int clip_right;
     int mid = (RBPREP_SIGNAL_TOP + RBPREP_SIGNAL_BOTTOM) / 2;
 
     if (visualizer_mode >= 1)
@@ -4344,18 +4184,10 @@ static void draw_waveform(bool full_context)
         return;
     }
     viewport(&first, &span);
-    column_begin = full_context ? 0 : RBPREP_FOCUS_COLUMN;
-    column_end = full_context ? RBPREP_DECK_WIDTH
-                              : RBPREP_FOCUS_COLUMN + RBPREP_FOCUS_WIDTH;
-    clip_left = RBPREP_DECK_X + column_begin;
-    clip_right = RBPREP_DECK_X + column_end - 1;
-    draw_loop_zone(first, span, clip_left, clip_right);
-    if (waveform_points > 0) {
-        if (full_context)
-            rebuild_waveform_context(first, span);
-        rebuild_waveform_focus(first, span);
-    }
-    for (x = column_begin; x < column_end; x++) {
+    draw_loop_zone(first, span);
+    if (waveform_points > 0)
+        rebuild_waveform_columns(first, span);
+    for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
         struct rbprep_wave_column *column = &waveform_columns[x];
         int screen_x = RBPREP_DECK_X + x;
         int height;
@@ -4381,10 +4213,7 @@ static void draw_waveform(bool full_context)
         }
 
         height = waveform_height_lut[column->amplitude];
-        color = waveform_column_color(column, x);
-        if (x < RBPREP_FOCUS_COLUMN ||
-            x >= RBPREP_FOCUS_COLUMN + RBPREP_FOCUS_WIDTH)
-            height = MAX(1, height * 3 / 4);
+        color = LCD_RGBPACK(column->red, column->green, column->blue);
         rb->lcd_set_foreground(color);
         if (waveform_half)
             rb->lcd_vline(screen_x, RBPREP_SIGNAL_BOTTOM - height,
@@ -4393,16 +4222,14 @@ static void draw_waveform(bool full_context)
             rb->lcd_vline(screen_x, mid - height, mid + height);
     }
 
-    draw_waveform_focus_frame();
-    draw_beatgrid(first, span, clip_left, clip_right);
-    draw_loop_markers(first, span, clip_left, clip_right);
-    draw_cues(first, span, clip_left, clip_right);
+    draw_beatgrid(first, span);
+    draw_loop_markers(first, span);
+    draw_cues(first, span);
     rb->lcd_set_foreground(LCD_RGBPACK(255, 45, 45));
     x = MAX(RBPREP_DECK_X,
             MIN(RBPREP_DECK_X + RBPREP_DECK_WIDTH - 1,
                    time_to_x(playhead, first, span)));
-    if (x >= clip_left && x <= clip_right)
-        rb->lcd_vline(x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
+    rb->lcd_vline(x, RBPREP_WAVE_TOP, RBPREP_WAVE_BOTTOM);
 }
 
 static void draw_overview_waveform(void)
@@ -4536,7 +4363,6 @@ static void clear_analysis(void)
     waveform_points = 0;
     waveform_columns_valid = false;
     waveform_columns_exact = false;
-    waveform_context_valid = false;
     rb->memset(overview_waveform, 0, sizeof(overview_waveform));
     beat_count = 0;
     beat_search_hint = 0;
@@ -5609,8 +5435,6 @@ static bool load_waveform(int track_id)
         !rbprep_grid_open(&grid_reader, filename, beat_count,
                           beat_data_offset))
         beat_count = 0;
-    if (beat_count > 0)
-        rbprep_grid_cache_all(&grid_reader);
     beat_search_hint = 0;
     rb->close(fd);
     overview_dirty = true;
@@ -6962,8 +6786,7 @@ static void draw_beat_phase(void)
     char position[8];
     int bar = 1;
     int beat = 1;
-    int index = imported_grid_resident()
-              ? current_beat_index(playhead) : -1;
+    int index = current_beat_index(playhead);
     int i;
 
     if (index >= 0) {
@@ -6971,7 +6794,7 @@ static void draw_beat_phase(void)
 
         beat = adjusted_beat_number(index);
         bar = (index + first_beat - 1) / 4 + 1;
-    } else {
+    } else if (beat_count <= 0) {
         int ordinal = (playhead - grid_phase_ms - grid_offset) /
                       beat_period_ms();
         if (ordinal >= 0) {
@@ -8309,7 +8132,6 @@ static void draw_confirmation(void)
 static void draw_screen(void)
 {
     bool full_frame_update = false;
-    bool full_context_update;
     long now = *rb->current_tick;
 
     rb->lcd_set_background(LCD_BLACK);
@@ -8387,23 +8209,12 @@ static void draw_screen(void)
         }
     }
 
-    full_context_update = force_full_redraw || full_frame_update ||
-                          visualizer_mode != 0 || confirm_active ||
-                          !TIME_BEFORE(now, waveform_context_deadline);
     rb->lcd_set_foreground(LCD_BLACK);
-    if (full_context_update) {
-        rb->lcd_fillrect(RBPREP_DECK_X, RBPREP_WAVE_TOP,
-                         RBPREP_DECK_WIDTH,
-                         RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
-        draw_waveform(true);
-        draw_vu_meter();
-        waveform_context_deadline = now + RBPREP_CONTEXT_TICKS;
-    } else {
-        rb->lcd_fillrect(RBPREP_FOCUS_X, RBPREP_WAVE_TOP,
-                         RBPREP_FOCUS_WIDTH,
-                         RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
-        draw_waveform(false);
-    }
+    rb->lcd_fillrect(RBPREP_DECK_X, RBPREP_WAVE_TOP,
+                     RBPREP_DECK_WIDTH,
+                     RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
+    draw_waveform();
+    draw_vu_meter();
     if (confirm_active)
         draw_confirmation();
 
@@ -8415,12 +8226,10 @@ static void draw_screen(void)
         hud_scroll_deadline = now + RBPREP_HUD_SCROLL_TICKS;
         status_deadline = now + RBPREP_STATUS_TICKS;
     } else {
-        if (full_context_update) {
-            rb->lcd_set_foreground(LCD_BLACK);
-            rb->lcd_fillrect(232, RBPREP_TOOL_TOP,
-                             LCD_WIDTH - 232, RBPREP_TOOL_HEIGHT);
-            draw_tool_indicators();
-        }
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_fillrect(232, RBPREP_TOOL_TOP,
+                         LCD_WIDTH - 232, RBPREP_TOOL_HEIGHT);
+        draw_tool_indicators();
         /* The S5L8702 panel has a single DMA staging buffer rather than
            framebuffer page flipping. Multiple update_rect calls serialize
            on that buffer and visibly shear adjacent HUD regions. Submit one
@@ -8428,13 +8237,9 @@ static void draw_screen(void)
            complete static HUD in that same transfer. */
         if (full_frame_update)
             rb->lcd_update();
-        else if (full_context_update)
+        else
             rb->lcd_update_rect(0, RBPREP_TOOL_TOP, LCD_WIDTH,
                                 RBPREP_WAVE_BOTTOM - RBPREP_TOOL_TOP + 1);
-        else
-            rb->lcd_update_rect(RBPREP_FOCUS_X, RBPREP_WAVE_TOP,
-                                RBPREP_FOCUS_WIDTH,
-                                RBPREP_WAVE_BOTTOM - RBPREP_WAVE_TOP + 1);
     }
 }
 
@@ -9752,10 +9557,6 @@ static void short_select(void)
             visualizer_mode = 2;
         else if (tool == TOOL_VIS_TURNTABLE)
             visualizer_mode = 3;
-        if (visualizer_mode == 0)
-            stop_spectrum_capture();
-        else
-            start_spectrum_capture();
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     } else if (mode == MODE_MACRO) {
@@ -9877,10 +9678,6 @@ static void change_zoom(bool zoom_in)
         zoom = zoom >= RBPREP_MAX_ZOOM ? 1 : zoom * 2;
     else
         zoom = zoom <= 1 ? RBPREP_MAX_ZOOM : zoom / 2;
-    waveform_columns_valid = false;
-    waveform_context_valid = false;
-    waveform_io_deadline = *rb->current_tick;
-    waveform_context_deadline = *rb->current_tick;
 }
 
 static void change_volume(int direction)
@@ -9968,10 +9765,6 @@ static void adjust_active_tool(int direction)
         visualizer_mode = tool == TOOL_WAVEFORM_STYLE ? 0 :
                           tool == TOOL_VIS_BOOMBOX ? 1 :
                           tool == TOOL_VIS_EQ ? 2 : 3;
-        if (visualizer_mode == 0)
-            stop_spectrum_capture();
-        else
-            start_spectrum_capture();
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     }
@@ -11213,8 +11006,7 @@ enum plugin_status plugin_start(const void *parameter)
     overview_deadline = *rb->current_tick;
     hud_scroll_deadline = *rb->current_tick;
     status_deadline = *rb->current_tick;
-    waveform_io_deadline = *rb->current_tick;
-    waveform_context_deadline = *rb->current_tick;
+    wave_index_service_deadline = *rb->current_tick;
     frame_deadline = *rb->current_tick;
     storage_keepalive_deadline = *rb->current_tick + HZ * 30;
 
@@ -11271,32 +11063,26 @@ enum plugin_status plugin_start(const void *parameter)
                                                 : RBPREP_MENU_FRAME_TICKS);
         }
         if (!display_locked && selected_track_id >= 0 &&
-            seek_state == SEEK_IDLE && rb->button_status() == BUTTON_NONE) {
+            seek_state == SEEK_IDLE && rb->button_status() == BUTTON_NONE &&
+            wave_index.stage != RBPREP_WAVE_INDEX_IDLE &&
+            wave_index.stage != RBPREP_WAVE_INDEX_FAILED) {
             int status = rb->audio_status();
             bool transport_active = (status & AUDIO_STATUS_PLAY) &&
                                     !(status & AUDIO_STATUS_PAUSE);
             long now = *rb->current_tick;
 
-            /* Playback owns storage exclusively. Even an 8 KiB analysis read
-               can queue behind a slow PATA/flash erase cycle and starve the
-               codec or freeze the UI. Cache and index maintenance therefore
-               run only while paused/stopped; active playback falls back to
-               the fully resident peak pyramid on a raw-cache miss. */
-            if (!transport_active &&
-                !TIME_BEFORE(now, waveform_io_deadline)) {
-                bool cache_loaded = service_deep_zoom_cache();
-                bool complete = false;
+            /* The renderer never reads RBW data. Index construction is the
+               sole background reader; pace it while audio is running so a
+               slow HDD/PATA bridge gets ample time to refill the codec
+               between small slices. Paused decks may finish at full speed. */
+            if (!transport_active ||
+                !TIME_BEFORE(now, wave_index_service_deadline)) {
+                bool complete = rbprep_wave_index_service(&wave_index);
 
-                if (!cache_loaded &&
-                    wave_index.stage != RBPREP_WAVE_INDEX_IDLE &&
-                    wave_index.stage != RBPREP_WAVE_INDEX_FAILED)
-                    complete = rbprep_wave_index_service(&wave_index);
-                waveform_io_deadline = now + 1;
-                if (cache_loaded)
-                    redraw = true;
+                wave_index_service_deadline = now +
+                    (transport_active ? RBPREP_INDEX_PLAY_TICKS : 1);
                 if (complete) {
                     waveform_columns_valid = false;
-                    waveform_context_valid = false;
                     overview_dirty = true;
                     redraw = true;
                 }

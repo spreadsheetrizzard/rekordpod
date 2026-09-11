@@ -40,11 +40,5 @@ bool rbprep_grid_open(struct rbprep_grid_reader *reader, const char *path,
 void rbprep_grid_close(struct rbprep_grid_reader *reader);
 bool rbprep_grid_beat_at(struct rbprep_grid_reader *reader, uint32_t index,
                          struct rbprep_grid_beat *beat);
-bool rbprep_grid_beat_cached(struct rbprep_grid_reader *reader,
-                             uint32_t index,
-                             struct rbprep_grid_beat *beat);
-bool rbprep_grid_range_cached(struct rbprep_grid_reader *reader,
-                              uint32_t begin, uint32_t end);
-bool rbprep_grid_cache_all(struct rbprep_grid_reader *reader);
 
 #endif
