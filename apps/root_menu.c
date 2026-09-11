@@ -934,7 +934,7 @@ static int root_menu_setup_screens(void)
 static void rbprep_autostart(void)
 {
     static bool attempted;
-    const char *path = ROCKBOX_DIR "/rocks/apps/rbprep.rock";
+    const char *path = ROCKBOX_DIR "/rocks/apps/rekordpod.rock";
     const char *disabled = ROCKBOX_DIR "/rbprep/autoboot.off";
 
     if (attempted)

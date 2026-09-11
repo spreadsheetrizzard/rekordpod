@@ -4,14 +4,14 @@
 RBPREPSRCDIR := $(APPSDIR)/plugins/rbprep
 RBPREPBUILDDIR := $(BUILDDIR)/apps/plugins/rbprep
 
-ROCKS += $(RBPREPBUILDDIR)/rbprep.rock
+ROCKS += $(RBPREPBUILDDIR)/rekordpod.rock
 
 RBPREP_SRC := $(call preprocess, $(RBPREPSRCDIR)/SOURCES)
 RBPREP_OBJ := $(call c2obj, $(RBPREP_SRC))
 
 OTHER_SRC += $(RBPREP_SRC)
 
-$(RBPREPBUILDDIR)/rbprep.rock: $(RBPREP_OBJ)
+$(RBPREPBUILDDIR)/rekordpod.rock: $(RBPREP_OBJ)
 
 $(RBPREPBUILDDIR)/%.o: $(RBPREPSRCDIR)/%.c $(RBPREPSRCDIR)/rbprep.make
 	$(SILENT)mkdir -p $(dir $@)

@@ -57,6 +57,7 @@
 #define RBPREP_STATUS_TICKS MAX(1, HZ)
 #define RBPREP_CONFIG_VERSION 4
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
+#define RBPREP_DEVICE_NAME_FILE "/.rockbox/rbprep/device-name.txt"
 #define RBPREP_USB_STATUS "/.rockbox/rbprep/usb-status.rbs"
 #define RBPREP_AUTOBOOT_OFF "/.rockbox/rbprep/autoboot.off"
 #define RBPREP_MACRO_FILE_A "/.rockbox/rbprep/state/macros.a"
@@ -303,6 +304,7 @@ static int visualizer_mode;
 static int save_on_track_load;
 static int auto_burn;
 static int click_sound;
+static int platter_wheel_mode = 1;
 static int keylock_enabled = 1;
 static int autoplay_enabled = 1;
 static int autoboot_enabled = 1;
@@ -327,9 +329,12 @@ static int theme_body = LCD_RGBPACK(220, 224, 221);
 static int theme_body_shadow = LCD_RGBPACK(70, 76, 72);
 static int theme_wheel = LCD_RGBPACK(25, 28, 26);
 static int theme_wheel_outline = LCD_RGBPACK(145, 153, 148);
-static int main_wheel_phase;
-static int main_wheel_direction;
-static long main_wheel_deadline;
+static int main_wheel_phase_fp;
+static int main_wheel_velocity_fp;
+static int main_wheel_touch_position;
+static long main_wheel_motion_tick;
+static long main_name_scroll_deadline;
+static char device_usb_name[32] = "REKORDPOD";
 static int scrub_step_index = 4;
 static int settings_selection;
 static int usb_selection;
@@ -497,6 +502,13 @@ static int seek_target;
 static int seek_applied_target;
 static long seek_deadline;
 static long seek_applied_tick;
+#ifdef HAVE_WHEEL_POSITION
+static int seek_wheel_touch_position;
+static int seek_wheel_velocity_fp;
+static int seek_wheel_delta_fp;
+static bool seek_wheel_gesture_tracked;
+static long seek_wheel_motion_tick;
+#endif
 static int play_clock_anchor;
 static long play_clock_tick;
 static int reported_audio_elapsed = -1;
@@ -847,6 +859,20 @@ static const char *track_sort_names[] = {
 static const int scrub_steps[] = {
     1, 2, 5, 10, 20, 50, 100, 250, 500, 1000
 };
+static const int16_t wheel_cosine[64] = {
+    256,255,251,245,237,226,213,198,181,162,142,121,98,74,50,25,
+    0,-25,-50,-74,-98,-121,-142,-162,-181,-198,-213,-226,-237,
+    -245,-251,-255,-256,-255,-251,-245,-237,-226,-213,-198,-181,
+    -162,-142,-121,-98,-74,-50,-25,0,25,50,74,98,121,142,162,
+    181,198,213,226,237,245,251,255
+};
+static const int16_t wheel_sine[64] = {
+    0,25,50,74,98,121,142,162,181,198,213,226,237,245,251,255,
+    256,255,251,245,237,226,213,198,181,162,142,121,98,74,50,25,
+    0,-25,-50,-74,-98,-121,-142,-162,-181,-198,-213,-226,-237,
+    -245,-251,-255,-256,-255,-251,-245,-237,-226,-213,-198,-181,
+    -162,-142,-121,-98,-74,-50,-25
+};
 
 static const struct configdata rbprep_config[] = {
     { TYPE_ENUM, 0, 1, { .int_p = &waveform_half },
@@ -862,6 +888,8 @@ static const struct configdata rbprep_config[] = {
       { .int_p = &scrub_step_index }, "scrub step", NULL },
     { TYPE_ENUM, 0, 1, { .int_p = &click_sound },
       "wheel click", off_on_styles },
+    { TYPE_ENUM, 0, 1, { .int_p = &platter_wheel_mode },
+      "platter wheel mode", off_on_styles },
     { TYPE_ENUM, 0, 1, { .int_p = &keylock_enabled },
       "keylock", off_on_styles },
     { TYPE_ENUM, 0, 1, { .int_p = &autoplay_enabled },
@@ -930,6 +958,35 @@ static bool save_rbprep_config(void)
 static void mark_rbprep_config_dirty(void)
 {
     config_dirty = true;
+}
+
+static void load_device_usb_name(void)
+{
+    char raw[sizeof(device_usb_name)];
+    int fd;
+    int count;
+    int first = 0;
+    int last;
+
+    rb->strlcpy(device_usb_name, "REKORDPOD", sizeof(device_usb_name));
+    fd = rb->open(RBPREP_DEVICE_NAME_FILE, O_RDONLY);
+    if (fd < 0)
+        return;
+    count = rb->read(fd, raw, sizeof(raw) - 1);
+    rb->close(fd);
+    if (count <= 0)
+        return;
+    raw[count] = '\0';
+    while (first < count && (raw[first] == ' ' || raw[first] == '\t' ||
+                             raw[first] == '\r' || raw[first] == '\n'))
+        first++;
+    last = count;
+    while (last > first && (raw[last - 1] == ' ' || raw[last - 1] == '\t' ||
+                            raw[last - 1] == '\r' || raw[last - 1] == '\n'))
+        last--;
+    raw[last] = '\0';
+    if (raw[first])
+        rb->strlcpy(device_usb_name, raw + first, sizeof(device_usb_name));
 }
 
 static void service_config_persistence(void)
@@ -3587,22 +3644,100 @@ static void draw_twenty_band_eq(void)
     }
 }
 
+static void draw_turntable_headshell(int style, int stylus_x, int stylus_y)
+{
+    int shell_color = LCD_RGBPACK(218, 224, 220);
+
+    if (style == 0 || style == 2) {
+        /* Universal SME shell: a broad perforated casting, connector collar,
+           offset finger lift and cartridge below the nose. Its long axis is
+           set close to the groove tangent instead of following screen axes. */
+        rb->lcd_set_foreground(LCD_BLACK);
+        xlcd_filltriangle(stylus_x - 3, stylus_y - 4,
+                          stylus_x + 6, stylus_y - 1,
+                          stylus_x + 13, stylus_y - 15);
+        xlcd_filltriangle(stylus_x - 3, stylus_y - 4,
+                          stylus_x + 13, stylus_y - 15,
+                          stylus_x + 5, stylus_y - 19);
+        rb->lcd_set_foreground(style == 0 ? shell_color
+                                         : LCD_RGBPACK(130, 139, 133));
+        xlcd_filltriangle(stylus_x - 1, stylus_y - 4,
+                          stylus_x + 5, stylus_y - 2,
+                          stylus_x + 11, stylus_y - 15);
+        xlcd_filltriangle(stylus_x - 1, stylus_y - 4,
+                          stylus_x + 11, stylus_y - 15,
+                          stylus_x + 6, stylus_y - 17);
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_drawline(stylus_x + 1, stylus_y - 5,
+                         stylus_x + 6, stylus_y - 13);
+        rb->lcd_drawline(stylus_x + 4, stylus_y - 4,
+                         stylus_x + 9, stylus_y - 12);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_drawpixel(stylus_x + 7, stylus_y - 15);
+        rb->lcd_drawpixel(stylus_x + 10, stylus_y - 14);
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_drawline(stylus_x + 11, stylus_y - 15,
+                         stylus_x + 20, stylus_y - 12);
+        rb->lcd_set_foreground(shell_color);
+        rb->lcd_drawline(stylus_x + 11, stylus_y - 16,
+                         stylus_x + 20, stylus_y - 13);
+        if (style == 2) {
+            rb->lcd_set_foreground(LCD_BLACK);
+            rb->lcd_fillrect(stylus_x - 3, stylus_y - 4, 7, 7);
+            rb->lcd_set_foreground(LCD_RGBPACK(235, 238, 236));
+            rb->lcd_fillrect(stylus_x - 2, stylus_y - 3, 5, 4);
+            rb->lcd_set_foreground(LCD_RGBPACK(60, 64, 62));
+            rb->lcd_hline(stylus_x - 2, stylus_x + 2, stylus_y);
+        } else {
+            rb->lcd_set_foreground(LCD_RGBPACK(28, 31, 29));
+            rb->lcd_fillrect(stylus_x - 2, stylus_y - 3, 5, 5);
+        }
+    } else if (style == 1) {
+        /* Concorde-style integrated pickup: slim tapered body, bright spine
+           and colored stylus nose. */
+        rb->lcd_set_foreground(LCD_BLACK);
+        xlcd_filltriangle(stylus_x - 3, stylus_y - 2,
+                          stylus_x + 4, stylus_y + 1,
+                          stylus_x + 12, stylus_y - 17);
+        xlcd_filltriangle(stylus_x - 3, stylus_y - 2,
+                          stylus_x + 12, stylus_y - 17,
+                          stylus_x + 7, stylus_y - 19);
+        rb->lcd_set_foreground(LCD_WHITE);
+        xlcd_filltriangle(stylus_x - 1, stylus_y - 2,
+                          stylus_x + 3, stylus_y,
+                          stylus_x + 10, stylus_y - 17);
+        xlcd_filltriangle(stylus_x - 1, stylus_y - 2,
+                          stylus_x + 10, stylus_y - 17,
+                          stylus_x + 8, stylus_y - 18);
+        rb->lcd_set_foreground(LCD_RGBPACK(255, 65, 45));
+        xlcd_fillcircle(stylus_x, stylus_y + 1, 2);
+    } else {
+        /* The playful iPod shell still obeys the same pickup angle: the body
+           is the pod, its screen is the slot, and a real stylus remains at
+           the groove contact point. */
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_drawline(stylus_x + 6, stylus_y - 9,
+                         stylus_x + 11, stylus_y - 17);
+        xlcd_fillcircle(stylus_x + 5, stylus_y - 8, 7);
+        rb->lcd_set_foreground(theme_body_shadow);
+        xlcd_fillcircle(stylus_x + 5, stylus_y - 8, 6);
+        rb->lcd_set_foreground(theme_body);
+        xlcd_fillcircle(stylus_x + 5, stylus_y - 8, 5);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_drawrect(stylus_x + 2, stylus_y - 12, 7, 4);
+        rb->lcd_drawpixel(stylus_x + 5, stylus_y - 5);
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_fillrect(stylus_x - 2, stylus_y - 3, 5, 5);
+    }
+    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_drawline(stylus_x, stylus_y,
+                     stylus_x - 1, stylus_y + 3);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_drawpixel(stylus_x - 1, stylus_y + 4);
+}
+
 static void draw_turntable(void)
 {
-    static const int16_t cosine[64] = {
-        256,255,251,245,237,226,213,198,181,162,142,121,98,74,50,25,
-        0,-25,-50,-74,-98,-121,-142,-162,-181,-198,-213,-226,-237,
-        -245,-251,-255,-256,-255,-251,-245,-237,-226,-213,-198,-181,
-        -162,-142,-121,-98,-74,-50,-25,0,25,50,74,98,121,142,162,
-        181,198,213,226,237,245,251,255
-    };
-    static const int16_t sine[64] = {
-        0,25,50,74,98,121,142,162,181,198,213,226,237,245,251,255,
-        256,255,251,245,237,226,213,198,181,162,142,121,98,74,50,25,
-        0,-25,-50,-74,-98,-121,-142,-162,-181,-198,-213,-226,-237,
-        -245,-251,-255,-256,-255,-251,-245,-237,-226,-213,-198,-181,
-        -162,-142,-121,-98,-74,-50,-25
-    };
     static const int target_rpm_x100[] = { 3333, 4500, 7800 };
     const int cx = 86;
     const int cy = (RBPREP_WAVE_TOP + RBPREP_WAVE_BOTTOM) / 2;
@@ -3614,6 +3749,8 @@ static void draw_turntable(void)
     int groove_radius;
     int stylus_x;
     int stylus_y;
+    int arm_end_x;
+    int arm_end_y;
     int arm_mid1_x;
     int arm_mid1_y;
     int arm_mid2_x;
@@ -3661,8 +3798,8 @@ static void draw_turntable(void)
        arc under the red target lamp is illuminated like a real SL-1200. */
     for (point = 0; point < 24; point++) {
         int angle = (point * 64 / 24 + phase) & 63;
-        int x = cx + cosine[angle] * 65 / 256;
-        int y = cy + sine[angle] * 65 / 256;
+        int x = cx + wheel_cosine[angle] * 65 / 256;
+        int y = cy + wheel_sine[angle] * 65 / 256;
         bool lamp_arc = angle >= 54 && angle <= 62;
 
         rb->lcd_set_foreground(lamp_arc
@@ -3722,29 +3859,51 @@ static void draw_turntable(void)
             (long long)hotcues[slot] * 1000 / track_length));
         cue_radius = 56 - cue_progress_x1000 * 22 / 1000;
         angle = (phase + (long long)hotcues[slot] * 64 / track_length) & 63;
-        x = cx + cosine[angle] * cue_radius / 256;
-        y = cy + sine[angle] * cue_radius / 256;
+        x = cx + wheel_cosine[angle] * cue_radius / 256;
+        y = cy + wheel_sine[angle] * cue_radius / 256;
         draw_radial_cue_marker(cx, cy, x, y, slot,
                                cue_palette[hotcue_colors[slot] & 7]);
     }
 
-    /* No record label masks the scope. A normal pickup gets a pin-sized
-       spindle; Phase mode parks its remote visibly over the spindle. */
+    /* Phase rides the record instead of impersonating a spindle cap. Its
+       long axis remains tangent to the groove and rotates with the platter. */
     if (turntable_headshell_style == 4) {
+        int remote_angle = (phase + 10) & 63;
+        int remote_x = cx + wheel_cosine[remote_angle] * 29 / 256;
+        int remote_y = cy + wheel_sine[remote_angle] * 29 / 256;
+        int tangent_x = -wheel_sine[remote_angle] * 6 / 256;
+        int tangent_y = wheel_cosine[remote_angle] * 6 / 256;
+        int radial_x = wheel_cosine[remote_angle] * 2 / 256;
+        int radial_y = wheel_sine[remote_angle] * 2 / 256;
+
         rb->lcd_set_foreground(LCD_BLACK);
-        rb->lcd_fillrect(cx - 4, cy - 10, 9, 20);
+        rb->lcd_drawline(remote_x - tangent_x - radial_x,
+                         remote_y - tangent_y - radial_y,
+                         remote_x + tangent_x - radial_x,
+                         remote_y + tangent_y - radial_y);
+        rb->lcd_drawline(remote_x - tangent_x,
+                         remote_y - tangent_y,
+                         remote_x + tangent_x,
+                         remote_y + tangent_y);
+        rb->lcd_drawline(remote_x - tangent_x + radial_x,
+                         remote_y - tangent_y + radial_y,
+                         remote_x + tangent_x + radial_x,
+                         remote_y + tangent_y + radial_y);
         rb->lcd_set_foreground(LCD_WHITE);
-        rb->lcd_drawrect(cx - 3, cy - 9, 7, 18);
+        rb->lcd_drawline(remote_x - tangent_x,
+                         remote_y - tangent_y,
+                         remote_x + tangent_x,
+                         remote_y + tangent_y);
         rb->lcd_set_foreground(RBPREP_GREEN);
-        rb->lcd_fillrect(cx - 1, cy - 6, 3, 9);
+        rb->lcd_drawpixel(remote_x, remote_y);
         rb->lcd_set_foreground(LCD_RGBPACK(255, 55, 45));
-        rb->lcd_drawpixel(cx, cy + 6);
-    } else {
-        rb->lcd_set_foreground(LCD_BLACK);
-        xlcd_fillcircle(cx, cy, 2);
-        rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
-        rb->lcd_drawpixel(cx, cy);
+        rb->lcd_drawpixel(remote_x + tangent_x,
+                          remote_y + tangent_y);
     }
+    rb->lcd_set_foreground(LCD_BLACK);
+    xlcd_fillcircle(cx, cy, 2);
+    rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
+    rb->lcd_drawpixel(cx, cy);
 
     /* A real tonearm moves inward over the full side.  The stylus follows a
        fixed pickup angle while its groove radius falls from 56 to 34 pixels. */
@@ -3752,19 +3911,30 @@ static void draw_turntable(void)
                    ? MAX(0, MIN(1000,
                        (long long)playhead * 1000 / track_length)) : 0;
     groove_radius = 56 - progress_x1000 * 22 / 1000;
-    stylus_x = cx + cosine[7] * groove_radius / 256;
-    stylus_y = cy + sine[7] * groove_radius / 256;
+    stylus_x = cx + wheel_cosine[7] * groove_radius / 256;
+    stylus_y = cy + wheel_sine[7] * groove_radius / 256;
     if (turntable_headshell_style == 4) {
-        stylus_x = 209;
-        stylus_y = RBPREP_WAVE_TOP + 72;
-    }
-    arm_mid1_x = (192 * 2 + stylus_x) / 3;
-    arm_mid1_y = ((RBPREP_WAVE_TOP + 30) * 2 + stylus_y) / 3;
-    arm_mid2_x = (192 + stylus_x * 2) / 3;
-    arm_mid2_y = (RBPREP_WAVE_TOP + 30 + stylus_y * 2) / 3;
-    if (turntable_arm_style && turntable_headshell_style != 4) {
-        arm_mid1_x += 5;
-        arm_mid2_x -= 5;
+        /* Full-length park position down the arm rail. The endpoint passes
+           through the rest hook instead of collapsing back into the pivot. */
+        arm_end_x = 211;
+        arm_end_y = RBPREP_WAVE_BOTTOM - 18;
+        arm_mid1_x = 200;
+        arm_mid1_y = RBPREP_WAVE_TOP + 62;
+        arm_mid2_x = 208;
+        arm_mid2_y = RBPREP_WAVE_TOP + 101;
+    } else {
+        /* The headshell connector is behind the stylus along the tangent;
+           the tonearm ends at that collar, not at the needle itself. */
+        arm_end_x = stylus_x + 10;
+        arm_end_y = stylus_y - 17;
+        arm_mid1_x = (192 * 2 + arm_end_x) / 3;
+        arm_mid1_y = ((RBPREP_WAVE_TOP + 30) * 2 + arm_end_y) / 3;
+        arm_mid2_x = (192 + arm_end_x * 2) / 3;
+        arm_mid2_y = (RBPREP_WAVE_TOP + 30 + arm_end_y * 2) / 3;
+        if (turntable_arm_style) {
+            arm_mid1_x += 5;
+            arm_mid2_x -= 5;
+        }
     }
     /* A three-pixel brushed-metal tube reads much more like the curved arm
        on a real deck than a single, computer-perfect line. */
@@ -3774,73 +3944,37 @@ static void draw_turntable(void)
     rb->lcd_drawline(arm_mid1_x, arm_mid1_y + 1,
                      arm_mid2_x, arm_mid2_y + 1);
     rb->lcd_drawline(arm_mid2_x, arm_mid2_y + 1,
-                     stylus_x, stylus_y + 1);
+                     arm_end_x, arm_end_y + 1);
     rb->lcd_set_foreground(LCD_RGBPACK(178, 186, 181));
     rb->lcd_drawline(192, RBPREP_WAVE_TOP + 30, arm_mid1_x, arm_mid1_y);
     rb->lcd_drawline(arm_mid1_x, arm_mid1_y, arm_mid2_x, arm_mid2_y);
-    rb->lcd_drawline(arm_mid2_x, arm_mid2_y, stylus_x, stylus_y);
+    rb->lcd_drawline(arm_mid2_x, arm_mid2_y, arm_end_x, arm_end_y);
     rb->lcd_drawline(192, RBPREP_WAVE_TOP + 29,
                      arm_mid1_x, arm_mid1_y - 1);
     rb->lcd_drawline(arm_mid1_x, arm_mid1_y - 1,
                      arm_mid2_x, arm_mid2_y - 1);
     rb->lcd_drawline(arm_mid2_x, arm_mid2_y - 1,
-                     stylus_x, stylus_y - 1);
+                     arm_end_x, arm_end_y - 1);
     rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
     xlcd_fillcircle(arm_mid1_x, arm_mid1_y, 1);
     xlcd_fillcircle(arm_mid2_x, arm_mid2_y, 1);
-    /* High-contrast pickup silhouettes remain readable over the black record
-       and bright scope. Phase has no cartridge: the arm sits on its rest. */
-    if (turntable_headshell_style == 0) {
-        rb->lcd_set_foreground(LCD_BLACK);
-        rb->lcd_drawline(stylus_x - 5, stylus_y - 3,
-                         stylus_x + 4, stylus_y + 3);
-        rb->lcd_drawline(stylus_x - 5, stylus_y - 2,
-                         stylus_x + 4, stylus_y + 4);
-        rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
-        rb->lcd_drawline(stylus_x - 4, stylus_y - 2,
-                         stylus_x + 3, stylus_y + 3);
-        rb->lcd_drawline(stylus_x - 3, stylus_y - 2,
-                         stylus_x + 3, stylus_y + 2);
-    } else if (turntable_headshell_style == 1) {
-        rb->lcd_set_foreground(LCD_BLACK);
-        rb->lcd_drawline(stylus_x - 6, stylus_y - 4,
-                         stylus_x + 3, stylus_y + 3);
-        rb->lcd_drawline(stylus_x - 6, stylus_y - 3,
-                         stylus_x + 3, stylus_y + 4);
-        rb->lcd_set_foreground(LCD_WHITE);
-        rb->lcd_drawline(stylus_x - 5, stylus_y - 3,
-                         stylus_x + 2, stylus_y + 3);
-        rb->lcd_drawline(stylus_x - 4, stylus_y - 3,
-                         stylus_x + 2, stylus_y + 2);
-        rb->lcd_set_foreground(LCD_RGBPACK(255, 65, 45));
-        xlcd_fillcircle(stylus_x + 2, stylus_y + 3, 1);
-    } else if (turntable_headshell_style == 2) {
-        rb->lcd_set_foreground(LCD_BLACK);
-        rb->lcd_fillrect(stylus_x - 5, stylus_y - 4, 10, 8);
-        rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
-        rb->lcd_fillrect(stylus_x - 4, stylus_y - 3, 8, 6);
-        rb->lcd_set_foreground(LCD_RGBPACK(55, 65, 59));
-        rb->lcd_hline(stylus_x - 3, stylus_x + 3, stylus_y);
-        rb->lcd_set_foreground(LCD_WHITE);
-        rb->lcd_drawpixel(stylus_x + 4, stylus_y + 3);
-    } else if (turntable_headshell_style == 3) {
-        rb->lcd_set_foreground(theme_body_shadow);
-        xlcd_fillcircle(stylus_x - 1, stylus_y, 5);
-        rb->lcd_set_foreground(theme_body);
-        xlcd_fillcircle(stylus_x - 1, stylus_y, 4);
-        rb->lcd_set_foreground(LCD_WHITE);
-        rb->lcd_drawline(stylus_x - 3, stylus_y - 2,
-                         stylus_x + 3, stylus_y + 2);
+    if (turntable_headshell_style != 4) {
+        draw_turntable_headshell(turntable_headshell_style,
+                                 stylus_x, stylus_y);
     } else {
-        rb->lcd_set_foreground(LCD_RGBPACK(105, 116, 109));
-        rb->lcd_drawrect(stylus_x - 4, stylus_y - 4, 9, 10);
-        rb->lcd_vline(stylus_x + 4, stylus_y - 1, stylus_y + 8);
+        int rest_y = RBPREP_WAVE_BOTTOM - 26;
+
+        /* A visible Technics-style arm rest: tall post, lower cradle and an
+           upper retaining hook wrapped around the parked tube. */
+        rb->lcd_set_foreground(LCD_RGBPACK(108, 118, 112));
+        rb->lcd_vline(217, rest_y - 13, rest_y + 11);
+        rb->lcd_hline(210, 217, rest_y + 10);
+        rb->lcd_hline(209, 216, rest_y - 5);
+        rb->lcd_vline(209, rest_y - 5, rest_y - 1);
         rb->lcd_set_foreground(LCD_WHITE);
-        rb->lcd_hline(stylus_x - 2, stylus_x + 2, stylus_y - 2);
+        rb->lcd_hline(210, 215, rest_y - 4);
+        rb->lcd_drawpixel(211, rest_y);
     }
-    rb->lcd_set_foreground(LCD_BLACK);
-    if (turntable_headshell_style != 4)
-        rb->lcd_drawpixel(stylus_x, stylus_y + 4);
     rb->lcd_set_foreground(LCD_RGBPACK(115, 124, 119));
     xlcd_fillcircle(192, RBPREP_WAVE_TOP + 30, 10);
     rb->lcd_set_foreground(LCD_BLACK);
@@ -3965,7 +4099,9 @@ static void draw_turntable(void)
     rb->lcd_set_foreground(LCD_RGBPACK(72, 82, 76));
     rb->lcd_drawrect(218, RBPREP_WAVE_TOP + 7, 77, 98);
     rb->lcd_hline(218, 294, RBPREP_WAVE_TOP + 24);
-    text(224, RBPREP_WAVE_TOP + 11, "DECK DATA", RBPREP_GREEN);
+    text(224, RBPREP_WAVE_TOP + 11,
+         turntable_headshell_style == 4 ? "PHASE" : "DECK DATA",
+         RBPREP_GREEN);
     rb->snprintf(line, sizeof(line), "RPM %s>%s",
                  rpm_styles[host_rpm_index], rpm_styles[played_rpm_index]);
     text(222, RBPREP_WAVE_TOP + 29, line, LCD_WHITE);
@@ -6862,7 +6998,7 @@ static void draw_settings(void)
         "AUTOBOOT REKORDPOD", "AUTO-NEXT DEFAULT", "WAVEFORM SHAPE",
         "TRACK EXIT", "COMMIT POLICY", "WHEEL CLICK", "ACCENT COLOR",
         "IPOD BODY COLOR", "WHEEL / VINYL COLOR", "TURNTABLE ARM",
-        "HEADSHELL DESIGN"
+        "HEADSHELL DESIGN", "PLATTER WHEEL MODE"
     };
     const char *values[] = {
         autoboot_enabled ? "ON" : "OFF",
@@ -6871,7 +7007,8 @@ static void draw_settings(void)
         "ASK EACH TIME", "SAVE & LOAD",
         click_sound ? "ON" : "OFF", "HSB", "HSB", "HSB",
         turntable_arm_style ? "S-SHAPED" : "STRAIGHT",
-        turntable_headshell_styles[turntable_headshell_style]
+        turntable_headshell_styles[turntable_headshell_style],
+        platter_wheel_mode ? "ON" : "OFF"
     };
     const char *description;
 
@@ -6879,9 +7016,9 @@ static void draw_settings(void)
     text(10, 29, "PLAYBACK  /  WORKFLOW  /  DISPLAY",
          LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < (int)ARRAYLEN(names); row++) {
-        int y = 34 + row * 15;
+        int y = 34 + row * 13;
         if (row == settings_selection)
-            draw_blade_selection(y - 1, 14, RBPREP_GREEN);
+            draw_blade_selection(y - 1, 12, RBPREP_GREEN);
         rb->lcd_set_foreground(row == settings_selection
                                ? LCD_WHITE : RBPREP_GREEN);
         xlcd_fillcircle(17, y + 6, row == settings_selection ? 4 : 3);
@@ -6894,7 +7031,7 @@ static void draw_settings(void)
         rb->lcd_set_foreground(row == settings_selection
                                ? LCD_RGBPACK(7, 25, 15)
                                : LCD_RGBPACK(17, 25, 20));
-        rb->lcd_fillrect(value_x - 5, y, value_width + 10, 13);
+        rb->lcd_fillrect(value_x - 5, y, value_width + 10, 12);
         text(value_x, y + 1, values[row], RBPREP_GREEN);
     }
     description = settings_selection == 0
@@ -6920,7 +7057,11 @@ static void draw_settings(void)
          ? "Color of the boot record, wheel and record motifs"
          : settings_selection == 9
          ? "Choose a straight or classic S-shaped pickup arm"
-         : "Technics, Concorde, M44, iPod shell, or wireless Phase";
+         : settings_selection == 10
+         ? "Technics, Concorde, M44, iPod shell, or wireless Phase"
+         : (platter_wheel_mode
+            ? "Touch, drag + momentum drive platter and seek"
+            : "Discrete wheel events; touch physics isolated");
     rb->lcd_set_foreground(LCD_RGBPACK(13, 19, 16));
     rb->lcd_fillrect(8, 198, LCD_WIDTH - 16, 22);
     text(13, 204, description, LCD_RGBPACK(145, 165, 151));
@@ -7046,27 +7187,90 @@ static void draw_genre_picker(void)
     text(7, 226, "WHEEL: BROWSE   SELECT: ASSIGN   MENU: BACK", LCD_WHITE);
 }
 
+static void wrap_main_wheel_phase(void)
+{
+    const int cycle = 64 * 256;
+
+    main_wheel_phase_fp %= cycle;
+    if (main_wheel_phase_fp < 0)
+        main_wheel_phase_fp += cycle;
+}
+
+static bool main_wheel_motion_active(void)
+{
+#ifdef HAVE_WHEEL_POSITION
+    return platter_wheel_mode &&
+           (rb->wheel_status() >= 0 || main_wheel_touch_position >= 0 ||
+            ABS(main_wheel_velocity_fp) >= 96);
+#else
+    return false;
+#endif
+}
+
+static void update_main_wheel_motion(void)
+{
+#ifdef HAVE_WHEEL_POSITION
+    long now = *rb->current_tick;
+    long elapsed = now - main_wheel_motion_tick;
+    int position = rb->wheel_status();
+
+    if (!platter_wheel_mode) {
+        main_wheel_touch_position = -1;
+        main_wheel_velocity_fp = 0;
+        main_wheel_motion_tick = now;
+        return;
+    }
+    if (elapsed <= 0)
+        return;
+    elapsed = MIN(elapsed, MAX(1, HZ / 4));
+    if (position >= 0) {
+        if (main_wheel_touch_position >= 0) {
+            int delta = position - main_wheel_touch_position;
+            int movement;
+            int instantaneous;
+
+            if (delta > 48)
+                delta -= 96;
+            else if (delta < -48)
+                delta += 96;
+            movement = delta * 512 / 3; /* 96 touch units = one turn. */
+            main_wheel_phase_fp += movement;
+            if (delta) {
+                instantaneous = movement * HZ / elapsed;
+                main_wheel_velocity_fp =
+                    (main_wheel_velocity_fp + instantaneous * 2) / 3;
+            } else {
+                main_wheel_velocity_fp = main_wheel_velocity_fp * 3 / 4;
+            }
+        }
+        main_wheel_touch_position = position;
+    } else {
+        main_wheel_touch_position = -1;
+        if (ABS(main_wheel_velocity_fp) >= 96) {
+            int damping = MIN(224, (int)(elapsed * 700 / MAX(1, HZ)));
+
+            main_wheel_phase_fp +=
+                (long long)main_wheel_velocity_fp * elapsed / HZ;
+            main_wheel_velocity_fp =
+                (long long)main_wheel_velocity_fp * (256 - damping) / 256;
+        } else {
+            main_wheel_velocity_fp = 0;
+        }
+    }
+    wrap_main_wheel_phase();
+    main_wheel_motion_tick = now;
+#endif
+}
+
 static void draw_main_menu_fx(void)
 {
-    static const int16_t orbit_x[16] = {
-        256, 237, 181, 98, 0, -98, -181, -237,
-        -256, -237, -181, -98, 0, 98, 181, 237
-    };
-    static const int16_t orbit_y[16] = {
-        0, 98, 181, 237, 256, 237, 181, 98,
-        0, -98, -181, -237, -256, -237, -181, -98
-    };
     int cx = 246;
     int cy = 130;
+    int phase;
     int point;
 
-    if (main_wheel_direction != 0) {
-        if (TIME_BEFORE(*rb->current_tick, main_wheel_deadline))
-            main_wheel_phase = (main_wheel_phase +
-                                main_wheel_direction + 16) & 15;
-        else
-            main_wheel_direction = 0;
-    }
+    update_main_wheel_motion();
+    phase = (main_wheel_phase_fp >> 8) & 63;
 
     /* One complete CDJ jog wheel occupies the right half—no backing panel,
        scanner or decorative footer competes with the menu. */
@@ -7084,9 +7288,9 @@ static void draw_main_menu_fx(void)
     rb->lcd_set_foreground(RBPREP_GREEN_DIM);
     xlcd_drawcircle(cx, cy, 42);
     for (point = 0; point < 16; point++) {
-        int angle = (point + main_wheel_phase) & 15;
-        int x = cx + orbit_x[angle] * 63 / 256;
-        int y = cy + orbit_y[angle] * 63 / 256;
+        int angle = (point * 4 + phase) & 63;
+        int x = cx + wheel_cosine[angle] * 63 / 256;
+        int y = cy + wheel_sine[angle] * 63 / 256;
 
         rb->lcd_set_foreground(point % 4 == 0 ? LCD_WHITE
                                               : RBPREP_GREEN);
@@ -7095,20 +7299,58 @@ static void draw_main_menu_fx(void)
         else
             rb->lcd_drawpixel(x, y);
     }
-    point = main_wheel_phase;
+#ifdef HAVE_WHEEL_POSITION
+    if (platter_wheel_mode && rb->wheel_status() >= 0) {
+        int touch_angle = rb->wheel_status() * 64 / 96;
+        int touch_x = cx + wheel_cosine[touch_angle] * 55 / 256;
+        int touch_y = cy + wheel_sine[touch_angle] * 55 / 256;
+
+        rb->lcd_set_foreground(LCD_BLACK);
+        xlcd_fillcircle(touch_x, touch_y, 3);
+        rb->lcd_set_foreground(theme_accent);
+        xlcd_fillcircle(touch_x, touch_y, 2);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_drawpixel(touch_x, touch_y);
+    }
+#endif
+    point = phase;
     rb->lcd_set_foreground(LCD_WHITE);
     rb->lcd_drawline(cx, cy,
-        cx + orbit_x[point] * 49 / 256,
-        cy + orbit_y[point] * 49 / 256);
+        cx + wheel_cosine[point] * 49 / 256,
+        cy + wheel_sine[point] * 49 / 256);
     rb->lcd_set_foreground(LCD_RGBPACK(5, 14, 10));
     xlcd_fillcircle(cx, cy, 22);
     rb->lcd_set_foreground(RBPREP_GREEN);
     xlcd_drawcircle(cx, cy, 22);
     rb->lcd_set_foreground(LCD_RGBPACK(35, 205, 255));
     xlcd_drawcircle(cx, cy, 16);
-    centered_text(cx - 20, 40, cy - 5, "CDJ", LCD_WHITE);
+    {
+        char marquee[7];
+        int length = rb->strlen(device_usb_name);
+        int visible = 5;
+        int start = 0;
+        int index;
+
+        if (length > visible)
+            start = (*rb->current_tick / MAX(1, HZ / 5)) % (length + 3);
+        for (index = 0; index < visible; index++) {
+            int source = start + index;
+
+            if (length <= visible)
+                marquee[index] = index < length ? device_usb_name[index] : ' ';
+            else if (source < length)
+                marquee[index] = device_usb_name[source];
+            else if (source < length + 3)
+                marquee[index] = ' ';
+            else
+                marquee[index] = device_usb_name[source - length - 3];
+        }
+        marquee[visible] = '\0';
+        centered_text(cx - 18, 36, cy - 5, marquee, LCD_WHITE);
+    }
     rb->lcd_set_foreground(LCD_WHITE);
     xlcd_fillcircle(cx, cy + 9, 2);
+    main_name_scroll_deadline = *rb->current_tick + MAX(1, HZ / 5);
 }
 
 static void draw_main_selection(int y, int height)
@@ -7134,11 +7376,16 @@ static void navigate_main_menu(int direction)
 {
     int next = MAX(0, MIN(7, selection + direction));
 
-    if (next == selection)
-        return;
+    /* The platter is an input trace, not a selection-position dial. Every
+       physical wheel event rotates it, even at the first or last menu row. */
+#ifdef HAVE_WHEEL_POSITION
+    if (!platter_wheel_mode || main_wheel_touch_position < 0)
+#endif
+    {
+        main_wheel_phase_fp += direction > 0 ? 4 * 256 : -4 * 256;
+        wrap_main_wheel_phase();
+    }
     selection = next;
-    main_wheel_direction = direction > 0 ? 1 : -1;
-    main_wheel_deadline = *rb->current_tick + MAX(1, HZ * 2 / 5);
 }
 
 static void draw_main_menu(void)
@@ -8129,6 +8376,118 @@ static void seek_by(int delta, bool audition)
         request_audio_seek(true);
 }
 
+#ifdef HAVE_WHEEL_POSITION
+static bool seek_wheel_physics_enabled(void)
+{
+    return platter_wheel_mode && !display_locked && !confirm_active &&
+           !tool_menu_active && mode >= MODE_DECK &&
+           active_tool() == TOOL_SEEK;
+}
+
+static bool seek_wheel_event_owned(void)
+{
+    return seek_wheel_physics_enabled() && seek_wheel_gesture_tracked;
+}
+
+static bool service_seek_wheel_physics(void)
+{
+    const int maximum_velocity = 120000 * 256;
+    long now = *rb->current_tick;
+    long elapsed = now - seek_wheel_motion_tick;
+    int position = rb->wheel_status();
+    int movement_fp = 0;
+    bool changed = false;
+
+    if (!seek_wheel_physics_enabled()) {
+        seek_wheel_touch_position = -1;
+        seek_wheel_velocity_fp = 0;
+        seek_wheel_delta_fp = 0;
+        seek_wheel_gesture_tracked = false;
+        seek_wheel_motion_tick = now;
+        return false;
+    }
+    if (elapsed <= 0)
+        return false;
+    elapsed = MIN(elapsed, MAX(1, HZ / 4));
+    if (position >= 0) {
+        if (seek_wheel_touch_position >= 0) {
+            int delta = position - seek_wheel_touch_position;
+
+            if (delta > 48)
+                delta -= 96;
+            else if (delta < -48)
+                delta += 96;
+            /* Four capacitive position units are one legacy scroll detent.
+               Keep fractional milliseconds until they add up to a real seek. */
+            movement_fp = delta * scrub_step_ms() * 256 / 4;
+            if (delta) {
+                int instantaneous = (long long)movement_fp * HZ / elapsed;
+
+                instantaneous = MAX(-maximum_velocity,
+                                    MIN(maximum_velocity, instantaneous));
+                seek_wheel_velocity_fp =
+                    (seek_wheel_velocity_fp + instantaneous * 2) / 3;
+                seek_wheel_gesture_tracked = true;
+            } else {
+                int damping = MIN(128,
+                    (int)(elapsed * 700 / MAX(1, HZ)));
+
+                seek_wheel_velocity_fp =
+                    (long long)seek_wheel_velocity_fp *
+                    (256 - damping) / 256;
+            }
+        }
+        seek_wheel_touch_position = position;
+    } else {
+        seek_wheel_touch_position = -1;
+        if (ABS(seek_wheel_velocity_fp) >= 20 * 256) {
+            int damping = MIN(224,
+                (int)(elapsed * 700 / MAX(1, HZ)));
+
+            movement_fp =
+                (long long)seek_wheel_velocity_fp * elapsed / HZ;
+            seek_wheel_velocity_fp =
+                (long long)seek_wheel_velocity_fp *
+                (256 - damping) / 256;
+        } else {
+            seek_wheel_velocity_fp = 0;
+            seek_wheel_gesture_tracked = false;
+        }
+    }
+    if (movement_fp) {
+        int before = playhead;
+        int delta;
+
+        seek_wheel_delta_fp += movement_fp;
+        delta = seek_wheel_delta_fp / 256;
+        seek_wheel_delta_fp -= delta * 256;
+        if (delta) {
+            seek_by(delta, true);
+            changed = playhead != before;
+            if (!changed)
+                seek_wheel_velocity_fp = 0;
+        }
+    }
+    seek_wheel_motion_tick = now;
+    return changed;
+}
+#else
+static bool seek_wheel_physics_enabled(void)
+{
+    return false;
+}
+
+static bool seek_wheel_event_owned(void)
+{
+    return false;
+}
+
+static bool service_seek_wheel_physics(void)
+{
+    return false;
+}
+#endif
+
 static void beat_jump(int direction)
 {
     int index = current_beat_index(playhead);
@@ -8681,10 +9040,20 @@ static void short_select(void)
             mode = MODE_ACCENT;
         } else if (settings_selection == 9) {
             turntable_arm_style = !turntable_arm_style;
-        } else {
+        } else if (settings_selection == 10) {
             turntable_headshell_style =
                 (turntable_headshell_style + 1) %
                 ARRAYLEN(turntable_headshell_styles);
+        } else {
+            platter_wheel_mode = !platter_wheel_mode;
+#ifdef HAVE_WHEEL_POSITION
+            main_wheel_touch_position = -1;
+            main_wheel_velocity_fp = 0;
+            seek_wheel_touch_position = -1;
+            seek_wheel_velocity_fp = 0;
+            seek_wheel_delta_fp = 0;
+            seek_wheel_gesture_tracked = false;
+#endif
         }
         rebuild_waveform_height_lut();
         mark_rbprep_config_dirty();
@@ -10231,16 +10600,20 @@ enum plugin_status plugin_start(const void *parameter)
     wheel_hue = MAX(0, MIN(359, wheel_hue));
     wheel_saturation = MAX(0, MIN(100, wheel_saturation));
     wheel_brightness = MAX(5, MIN(100, wheel_brightness));
+    platter_wheel_mode = !!platter_wheel_mode;
     turntable_arm_style = !!turntable_arm_style;
     turntable_headshell_style = MAX(0,
         MIN((int)ARRAYLEN(turntable_headshell_styles) - 1,
             turntable_headshell_style));
+    load_device_usb_name();
     update_theme_colors();
     mode = MODE_LIBRARY;
     selection = 0;
-    main_wheel_phase = 0;
-    main_wheel_direction = 0;
-    main_wheel_deadline = *rb->current_tick;
+    main_wheel_phase_fp = 0;
+    main_wheel_velocity_fp = 0;
+    main_wheel_touch_position = -1;
+    main_wheel_motion_tick = *rb->current_tick;
+    main_name_scroll_deadline = *rb->current_tick;
     playhead = 0;
     zoom = 1;
     grid_offset = 0;
@@ -10267,6 +10640,13 @@ enum plugin_status plugin_start(const void *parameter)
     cue_audition_latched = false;
     overview_playhead_white = true;
     seek_state = SEEK_IDLE;
+#ifdef HAVE_WHEEL_POSITION
+    seek_wheel_touch_position = -1;
+    seek_wheel_velocity_fp = 0;
+    seek_wheel_delta_fp = 0;
+    seek_wheel_gesture_tracked = false;
+    seek_wheel_motion_tick = *rb->current_tick;
+#endif
     suppress_menu = suppress_play = false;
     suppress_left = suppress_right = false;
     macro_chord_button = BUTTON_NONE;
@@ -10374,6 +10754,8 @@ enum plugin_status plugin_start(const void *parameter)
                 force_full_redraw = true;
             }
         }
+        if (service_seek_wheel_physics())
+            redraw = true;
         if (service_audio_seek())
             redraw = true;
         if (update_play_clock())
@@ -10399,7 +10781,9 @@ enum plugin_status plugin_start(const void *parameter)
         if (!display_locked &&
             !TIME_BEFORE(*rb->current_tick, frame_deadline) &&
             (force_full_redraw ||
-             (mode == MODE_LIBRARY && main_wheel_direction != 0) ||
+             (mode == MODE_LIBRARY &&
+              (!TIME_BEFORE(*rb->current_tick, main_name_scroll_deadline) ||
+               main_wheel_motion_active())) ||
              mode >= MODE_DECK || redraw)) {
             draw_screen();
             redraw = false;
@@ -10754,7 +11138,7 @@ enum plugin_status plugin_start(const void *parameter)
                 usb_selection = MIN(capabilities.usb_audio ? 2 : 1,
                                     usb_selection + 1);
             else if (mode == MODE_SETTINGS)
-                settings_selection = MIN(10, settings_selection + 1);
+                settings_selection = MIN(11, settings_selection + 1);
             else if (mode == MODE_ACCENT)
                 adjust_active_color(1);
             else if (mode == MODE_PLAYLIST_ACTIONS)
@@ -10771,7 +11155,8 @@ enum plugin_status plugin_start(const void *parameter)
                 genre_selection = MIN(genre_count, genre_selection + 1);
                 if (genre_selection >= genre_top + RBPREP_LIST_ROWS)
                     genre_top = genre_selection - RBPREP_LIST_ROWS + 1;
-            } else if (mode != MODE_PENDING && mode != MODE_INDEX)
+            } else if (mode != MODE_PENDING && mode != MODE_INDEX &&
+                       !seek_wheel_event_owned())
                 adjust_active_tool(1);
             break;
         case BUTTON_SCROLL_BACK:
@@ -10818,7 +11203,8 @@ enum plugin_status plugin_start(const void *parameter)
                 genre_selection = MAX(0, genre_selection - 1);
                 if (genre_selection < genre_top)
                     genre_top = genre_selection;
-            } else if (mode != MODE_PENDING && mode != MODE_INDEX)
+            } else if (mode != MODE_PENDING && mode != MODE_INDEX &&
+                       !seek_wheel_event_owned())
                 adjust_active_tool(-1);
             break;
         case BUTTON_LEFT:
