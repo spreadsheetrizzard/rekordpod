@@ -138,7 +138,8 @@ enum rbprep_mode {
     MODE_PNAV,
     MODE_VISUALIZER,
     MODE_MACRO,
-    MODE_VISUALIZER_TWO
+    MODE_VISUALIZER_TWO,
+    MODE_PITCH
 };
 
 enum rbprep_color_target {
@@ -193,7 +194,9 @@ enum rbprep_tool {
     TOOL_VIS_ORBIT = 40,
     TOOL_VIS_REACTOR = 41,
     TOOL_VIS_HARMONIC = 42,
-    TOOL_COUNT = 43
+    TOOL_META_KEY = 43,
+    TOOL_KEY_NOTATION = 44,
+    TOOL_COUNT = 45
 };
 
 enum rbprep_confirm_action {
@@ -305,6 +308,7 @@ static int grid_tool;
 static int cue_tool;
 static int loop_tool;
 static int metadata_tool;
+static int pitch_tool;
 static int visualizer_tool;
 static int visualizer_two_tool;
 static int list_tool;
@@ -317,6 +321,7 @@ static int auto_burn;
 static int click_sound;
 static int platter_wheel_mode = 1;
 static int keylock_enabled = 1;
+static int key_notation;
 static int autoplay_enabled = 1;
 static int autoboot_enabled = 1;
 static int favorite_playlist_ids[2];
@@ -420,6 +425,7 @@ static int confirm_time;
 static int confirm_playlist_node;
 static int staged_tool = -1;
 static int staged_original;
+static char staged_original_key[24];
 static int pending_snapshot_count;
 static int pending_playlist_count;
 static bool pending_summary_overflow;
@@ -822,7 +828,7 @@ static const char *mode_names[] = {
     "INDEX", "GENRES", "PLAYLIST MANAGER", "ACCENT", "WORKFLOW MANAGER",
     "WORKFLOW EDITOR", "TOOL PICKER", "DEFAULT VALUE", "PLAYBACK", "TEMPO",
     "BEATGRID", "HOT CUES", "LOOP", "METADATA", "LIST", "PLAYLIST NAV",
-    "VISUALIZER", "WORKFLOWS", "VISUALIZER II"
+    "VISUALIZER", "WORKFLOWS", "VISUALIZER II", "PITCH"
 };
 
 static const char * const tool_names[TOOL_COUNT] = {
@@ -835,7 +841,8 @@ static const char * const tool_names[TOOL_COUNT] = {
     "LOOP ACTIVE", "RATING", "TRACK COLOR", "YEAR", "GENRE",
     "BURN TRACK", "BURN ALL", "PREV TRACK", "NEXT TRACK",
     "RESTART", "RELOAD", "SPECTRAL CANYON", "STEREO ORBIT",
-    "BEAT REACTOR", "HARMONIC CONSTELLATION"
+    "BEAT REACTOR", "HARMONIC CONSTELLATION", "KEY EDITOR",
+    "KEY NOTATION"
 };
 
 /* On-disk workflow identities are deliberately independent of enum order.
@@ -885,6 +892,8 @@ static const uint16_t macro_tool_storage_ids[TOOL_COUNT] = {
     [TOOL_VIS_ORBIT]         = 0x0128,
     [TOOL_VIS_REACTOR]       = 0x0129,
     [TOOL_VIS_HARMONIC]      = 0x012a,
+    [TOOL_META_KEY]          = 0x012b,
+    [TOOL_KEY_NOTATION]      = 0x012c,
 };
 
 static char *waveform_styles[] = { "full", "half" };
@@ -904,6 +913,17 @@ static const char *spectrum_labels[] = {
 static char *save_on_load_styles[] = { "immediate", "next track" };
 static char *auto_burn_styles[] = { "off", "next track load" };
 static char *off_on_styles[] = { "off", "on" };
+static char *key_notation_styles[] = { "chromatic", "camelot" };
+static const char * const chromatic_key_names[] = {
+    "C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
+    "Cm", "Dbm", "Dm", "Ebm", "Em", "Fm", "F#m", "Gm", "Abm", "Am",
+    "Bbm", "Bm"
+};
+static const char * const camelot_key_names[] = {
+    "8B", "3B", "10B", "5B", "12B", "7B", "2B", "9B", "4B", "11B",
+    "6B", "1B", "5A", "12A", "7A", "2A", "9A", "4A", "11A", "6A",
+    "1A", "8A", "3A", "10A"
+};
 static char *turntable_arm_styles[] = { "straight", "s-shaped" };
 static char *turntable_headshell_styles[] = {
     "technics", "ortofon concorde", "shure m44", "ipod body", "phase"
@@ -947,6 +967,8 @@ static const struct configdata rbprep_config[] = {
       "platter wheel mode", off_on_styles },
     { TYPE_ENUM, 0, 1, { .int_p = &keylock_enabled },
       "keylock", off_on_styles },
+    { TYPE_ENUM, 0, 1, { .int_p = &key_notation },
+      "key notation", key_notation_styles },
     { TYPE_ENUM, 0, 1, { .int_p = &autoplay_enabled },
       "autoplay default", off_on_styles },
     { TYPE_ENUM, 0, 1, { .int_p = &autoboot_enabled },
@@ -1103,6 +1125,8 @@ static const struct rbprep_tool_page tool_pages[] = {
       { TOOL_LOOP_LENGTH, TOOL_LOOP_IN, TOOL_LOOP_OUT, TOOL_LOOP_ACTIVE } },
     { MODE_METADATA, "DETAIL", 4,
       { TOOL_META_RATING, TOOL_META_COLOR, TOOL_META_YEAR, TOOL_META_GENRE } },
+    { MODE_PITCH, "PITCH", 3,
+      { TOOL_META_KEY, TOOL_KEY_NOTATION, TOOL_KEYLOCK } },
     { MODE_LIST, "LISTS", 4,
       { TOOL_PLAYLIST_MODE, TOOL_ADD_PLAYLIST,
         TOOL_BURN_SONG, TOOL_BURN_ALL } },
@@ -1112,8 +1136,8 @@ static const struct rbprep_tool_page tool_pages[] = {
     { MODE_VISUALIZER_TWO, "REACTR", 4,
       { TOOL_VIS_CANYON, TOOL_VIS_ORBIT, TOOL_VIS_REACTOR,
         TOOL_VIS_HARMONIC } },
-    { MODE_MACRO, "MACROS", 3,
-      { TOOL_MACRO_ONE, TOOL_MACRO_TWO, TOOL_KEYLOCK } }
+    { MODE_MACRO, "MACROS", 2,
+      { TOOL_MACRO_ONE, TOOL_MACRO_TWO } }
 };
 
 static int hsb_rgb(int hue, int saturation, int brightness)
@@ -1152,6 +1176,72 @@ static void update_theme_colors(void)
     theme_wheel_outline = hsb_rgb(wheel_hue,
                                   MAX(0, wheel_saturation - 8),
                                   MIN(100, wheel_brightness + 38));
+}
+
+static int key_index_from_name(const char *name)
+{
+    int index;
+    int pitch;
+    int position = 1;
+    bool minor = false;
+    char letter;
+
+    if (!name || !name[0])
+        return -1;
+    while (*name == ' ')
+        name++;
+    for (index = 0; index < (int)ARRAYLEN(chromatic_key_names); index++) {
+        if (!rb->strcasecmp(name, chromatic_key_names[index]) ||
+            !rb->strcasecmp(name, camelot_key_names[index]))
+            return index;
+    }
+
+    /* Accept enharmonic spellings not used by the canonical rekordbox list. */
+    letter = name[0];
+    if (letter >= 'a' && letter <= 'g')
+        letter -= 'a' - 'A';
+    if (letter == 'C') pitch = 0;
+    else if (letter == 'D') pitch = 2;
+    else if (letter == 'E') pitch = 4;
+    else if (letter == 'F') pitch = 5;
+    else if (letter == 'G') pitch = 7;
+    else if (letter == 'A') pitch = 9;
+    else if (letter == 'B') pitch = 11;
+    else return -1;
+    if (name[position] == '#') {
+        pitch++;
+        position++;
+    } else if (name[position] == 'b') {
+        pitch--;
+        position++;
+    }
+    while (name[position] == ' ')
+        position++;
+    minor = name[position] == 'm' ||
+            (name[position] == 'M' &&
+             (name[position + 1] == 'i' || name[position + 1] == 'I'));
+    return (minor ? 12 : 0) + (pitch + 12) % 12;
+}
+
+static void format_key_name(const char *source, char *buffer, size_t size)
+{
+    int index = key_index_from_name(source);
+
+    if (index < 0) {
+        rb->strlcpy(buffer, source && source[0] ? source : "--", size);
+        return;
+    }
+    rb->strlcpy(buffer, key_notation
+                        ? camelot_key_names[index]
+                        : chromatic_key_names[index], size);
+}
+
+static void set_selected_key_index(int index)
+{
+    index = (index + ARRAYLEN(chromatic_key_names)) %
+            ARRAYLEN(chromatic_key_names);
+    rb->strlcpy(selected_key, chromatic_key_names[index],
+                sizeof(selected_key));
 }
 
 static void active_color_channels(int **hue, int **saturation,
@@ -4109,48 +4199,9 @@ static void draw_beat_reactor(void)
 
 static int track_key_pitch_class(void)
 {
-    static const signed char camelot_minor[12] = {
-        8, 3, 10, 5, 0, 7, 2, 9, 4, 11, 6, 1
-    };
-    static const signed char camelot_major[12] = {
-        11, 6, 1, 8, 3, 10, 5, 0, 7, 2, 9, 4
-    };
-    const char *key = selected_key;
-    int number = 0;
-    int pitch;
-    char letter;
+    int index = key_index_from_name(selected_key);
 
-    while (*key == ' ')
-        key++;
-    if (*key >= '0' && *key <= '9') {
-        while (*key >= '0' && *key <= '9') {
-            number = number * 10 + *key - '0';
-            key++;
-        }
-        if (number >= 1 && number <= 12) {
-            if (*key == 'A' || *key == 'a')
-                return camelot_minor[number - 1];
-            if (*key == 'B' || *key == 'b')
-                return camelot_major[number - 1];
-        }
-    }
-
-    letter = *key;
-    if (letter >= 'a' && letter <= 'g')
-        letter -= 'a' - 'A';
-    if (letter == 'C') pitch = 0;
-    else if (letter == 'D') pitch = 2;
-    else if (letter == 'E') pitch = 4;
-    else if (letter == 'F') pitch = 5;
-    else if (letter == 'G') pitch = 7;
-    else if (letter == 'A') pitch = 9;
-    else if (letter == 'B') pitch = 11;
-    else return 0;
-    if (key[1] == '#')
-        pitch++;
-    else if (key[1] == 'b')
-        pitch--;
-    return (pitch + 12) % 12;
+    return index < 0 ? 0 : index % 12;
 }
 
 static void draw_harmonic_constellation(void)
@@ -4179,6 +4230,7 @@ static void draw_harmonic_constellation(void)
     int note;
     int edge;
     char line[32];
+    char display_key[24];
 
     text(5, RBPREP_WAVE_TOP + 3, "HARMONIC CONSTELLATION",
          LCD_RGBPACK(255, 120, 220));
@@ -4236,8 +4288,9 @@ static void draw_harmonic_constellation(void)
              note_names[note], level > 65 ? LCD_WHITE : LCD_DARKGRAY);
     }
 
+    format_key_name(selected_key, display_key, sizeof(display_key));
     rb->snprintf(line, sizeof(line), "KEY %s",
-                 selected_key[0] ? selected_key : note_names[root]);
+                 selected_key[0] ? display_key : note_names[root]);
     centered_text(cx - 38, 76, cy - 4, line, LCD_WHITE);
 }
 
@@ -4994,9 +5047,11 @@ static void clear_analysis(void)
 
 static bool valid_edit_record(const unsigned char *data)
 {
+    uint16_t version = read_u16(data + 6);
+
     return !rb->memcmp(data, "RBE1", 4) &&
            read_u16(data + 4) == RBPREP_EDIT_RECORD_SIZE &&
-           read_u16(data + 6) == 1;
+           (version == 1 || version == 2);
 }
 
 static void apply_edit_record(const unsigned char *data)
@@ -5020,6 +5075,10 @@ static void apply_edit_record(const unsigned char *data)
     }
     rb->memcpy(selected_genre, data + 120, sizeof(selected_genre));
     selected_genre[sizeof(selected_genre) - 1] = '\0';
+    if (read_u16(data + 6) >= 2) {
+        rb->memcpy(selected_key, data + 192, sizeof(selected_key));
+        selected_key[sizeof(selected_key) - 1] = '\0';
+    }
     overview_dirty = true;
 }
 
@@ -5053,7 +5112,7 @@ static bool pack_current_edit_snapshot(unsigned char *data)
     rb->memset(data, 0, RBPREP_EDIT_RECORD_SIZE);
     rb->memcpy(data, "RBE1", 4);
     write_u16(data + 4, RBPREP_EDIT_RECORD_SIZE);
-    write_u16(data + 6, 1);
+    write_u16(data + 6, 2);
     write_u32(data + 8, selected_track_id);
     write_u32(data + 12, *rb->current_tick);
     data[16] = rating;
@@ -5070,7 +5129,8 @@ static bool pack_current_edit_snapshot(unsigned char *data)
         data[104 + i] = hotcue_colors[i];
     }
     rb->strlcpy((char *)data + 120, selected_genre, 32);
-    rb->strlcpy((char *)data + 152, selected_title, 64);
+    rb->strlcpy((char *)data + 152, selected_title, 40);
+    rb->strlcpy((char *)data + 192, selected_key, 24);
     return true;
 }
 
@@ -5440,7 +5500,9 @@ static void refresh_pending_summary_from_offsets(uint32_t edit_offset,
             entry->rating = MIN(5, data[16]);
             entry->color = normalize_track_color(data[17]);
             entry->bpm_x100 = read_u32(data + 24);
-            rb->memcpy(entry->title, data + 152, sizeof(entry->title));
+            rb->memset(entry->title, 0, sizeof(entry->title));
+            rb->memcpy(entry->title, data + 152,
+                       read_u16(data + 6) >= 2 ? 40 : 64);
             entry->title[sizeof(entry->title) - 1] = '\0';
         }
         rb->close(fd);
@@ -7001,6 +7063,7 @@ static void draw_track_browser(void)
     char artist_buffer[72];
     char genre_buffer[48];
     char key_buffer[24];
+    char display_key[24];
     char name[80];
     char line[96];
 
@@ -7050,6 +7113,7 @@ static void draw_track_browser(void)
         if (!read_index_string(track.key_offset, key_buffer,
                                sizeof(key_buffer)))
             key_buffer[0] = '\0';
+        format_key_name(key_buffer, display_key, sizeof(display_key));
         if (track_sort_key == TRACK_SORT_COMMENTS)
             read_index_string(track.comments_offset, artist_buffer,
                               sizeof(artist_buffer));
@@ -7097,7 +7161,7 @@ static void draw_track_browser(void)
                      track.bpm_x100 / 100, track.bpm_x100 % 100);
         text(232, y + 10, line, RBPREP_GREEN);
         rb->snprintf(line, sizeof(line), "%.6s",
-                     key_buffer[0] ? key_buffer : "--");
+                     key_buffer[0] ? display_key : "--");
         text(276, y + 10, line, LCD_WHITE);
     }
     rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
@@ -7166,6 +7230,7 @@ static enum rbprep_tool active_tool(void)
         else if (mode == MODE_CUES) selected = cue_tool;
         else if (mode == MODE_LOOP) selected = loop_tool;
         else if (mode == MODE_METADATA) selected = metadata_tool;
+        else if (mode == MODE_PITCH) selected = pitch_tool;
         else if (mode == MODE_LIST) selected = list_tool;
         else if (mode == MODE_PNAV) selected = pnav_tool;
         else if (mode == MODE_VISUALIZER) selected = visualizer_tool;
@@ -7206,6 +7271,8 @@ static int *tool_selection(void)
         return &loop_tool;
     if (mode == MODE_METADATA)
         return &metadata_tool;
+    if (mode == MODE_PITCH)
+        return &pitch_tool;
     if (mode == MODE_LIST)
         return &list_tool;
     if (mode == MODE_PNAV)
@@ -7315,6 +7382,17 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
         rb->lcd_vline(cx - 3, cy - 3, cy - 1);
         rb->lcd_vline(cx + 3, cy - 3, cy - 1);
         rb->lcd_vline(cx, cy + 1, cy + 3);
+    } else if (tool == TOOL_META_KEY) {
+        rb->lcd_drawline(x + 1, y + 1, x + 1, y + 7);
+        rb->lcd_drawline(x + 1, y + 1, x + 6, y);
+        rb->lcd_drawline(x + 6, y, x + 6, y + 6);
+        xlcd_fillcircle(x, y + 7, 2);
+        xlcd_fillcircle(x + 5, y + 6, 2);
+    } else if (tool == TOOL_KEY_NOTATION) {
+        rb->lcd_drawline(x, cy - 2, x + 7, cy - 2);
+        rb->lcd_drawline(x + 7, cy - 2, x + 5, cy - 4);
+        rb->lcd_drawline(x + 8, cy + 2, x + 1, cy + 2);
+        rb->lcd_drawline(x + 1, cy + 2, x + 3, cy + 4);
     } else if (tool == TOOL_VIS_BOOMBOX) {
         rb->lcd_drawrect(x, y + 1, 9, 8);
         xlcd_drawcircle(cx - 2, cy + 1, 2);
@@ -7531,7 +7609,8 @@ static bool macro_tool_supports_fixed_value(enum rbprep_tool tool)
            tool == TOOL_GAIN || tool == TOOL_HOST_RPM ||
            tool == TOOL_PLAY_RPM || tool == TOOL_PITCH_BEND ||
            tool == TOOL_TEMPO || tool == TOOL_PLAYLIST_MODE ||
-           tool == TOOL_KEYLOCK || tool == TOOL_GRID_BPM ||
+           tool == TOOL_KEYLOCK || tool == TOOL_META_KEY ||
+           tool == TOOL_KEY_NOTATION || tool == TOOL_GRID_BPM ||
            tool == TOOL_GRID_QUANTIZE || tool == TOOL_CUE_SLOT ||
            tool == TOOL_CUE_MOVE || tool == TOOL_CUE_COLOR ||
            tool == TOOL_CUE_DELETE || tool == TOOL_LOOP_LENGTH ||
@@ -7558,6 +7637,12 @@ static int macro_current_tool_value(enum rbprep_tool tool)
         return playlist_playback;
     if (tool == TOOL_KEYLOCK)
         return keylock_enabled;
+    if (tool == TOOL_META_KEY) {
+        int index = key_index_from_name(selected_key);
+        return index < 0 ? 0 : index;
+    }
+    if (tool == TOOL_KEY_NOTATION)
+        return key_notation;
     if (tool == TOOL_GRID_BPM)
         return grid_bpm_x100;
     if (tool == TOOL_GRID_QUANTIZE)
@@ -7598,6 +7683,14 @@ static void format_macro_value(char *buffer, size_t size,
     } else if (tool == TOOL_GRID_BPM) {
         rb->snprintf(buffer, size, "%d.%02d BPM", value / 100,
                      ABS(value % 100));
+    } else if (tool == TOOL_META_KEY) {
+        value = MAX(0, MIN((int)ARRAYLEN(chromatic_key_names) - 1, value));
+        rb->snprintf(buffer, size, "KEY %s",
+                     key_notation ? camelot_key_names[value]
+                                  : chromatic_key_names[value]);
+    } else if (tool == TOOL_KEY_NOTATION) {
+        rb->snprintf(buffer, size, "KEY DISPLAY %s",
+                     value ? "CAMELOT" : "CHROMATIC");
     } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE ||
                tool == TOOL_CUE_COLOR || tool == TOOL_CUE_DELETE) {
         rb->snprintf(buffer, size, "CUE %02d", value + 1);
@@ -7878,6 +7971,7 @@ static void draw_track_header(bool advance_scroll)
     char fixed[64];
     char tail[96];
     char fitted[64];
+    char display_key[24];
     int width;
     bool title_overflow;
     bool metadata_overflow;
@@ -7945,9 +8039,10 @@ static void draw_track_header(bool advance_scroll)
     /* The left metadata block also acts as a clip for the scrolling tail. */
     rb->lcd_set_foreground(LCD_RGBPACK(8, 8, 8));
     rb->lcd_fillrect(0, RBPREP_STATUS_HEIGHT + 13, 132, 13);
+    format_key_name(selected_key, display_key, sizeof(display_key));
     rb->snprintf(fixed, sizeof(fixed), "%d.%02d  %s",
                  grid_bpm_x100 / 100, grid_bpm_x100 % 100,
-                 selected_key[0] ? selected_key : "--");
+                 selected_key[0] ? display_key : "--");
     fit_text(fitted, sizeof(fitted), fixed, 72);
     text(2, RBPREP_STATUS_HEIGHT + 15, fitted,
          LCD_RGBPACK(85, 220, 255));
@@ -8057,6 +8152,24 @@ static void draw_tool_status(void)
     else if (tool == TOOL_KEYLOCK)
         rb->snprintf(line, sizeof(line), "PITCH LOCK  %s",
                      keylock_enabled ? "ON" : "OFF");
+    else if (tool == TOOL_META_KEY) {
+        char primary[24];
+        char alternate[24];
+        int index = key_index_from_name(selected_key);
+
+        format_key_name(selected_key, primary, sizeof(primary));
+        if (index < 0)
+            rb->strlcpy(alternate, "--", sizeof(alternate));
+        else
+            rb->strlcpy(alternate, key_notation
+                        ? chromatic_key_names[index]
+                        : camelot_key_names[index], sizeof(alternate));
+        rb->snprintf(line, sizeof(line), "KEY  %s  [%s]",
+                     primary, alternate);
+    }
+    else if (tool == TOOL_KEY_NOTATION)
+        rb->snprintf(line, sizeof(line), "KEY DISPLAY  %s",
+                     key_notation ? "CAMELOT" : "CHROMATIC");
     else if (tool == TOOL_VIS_BOOMBOX)
         rb->snprintf(line, sizeof(line), "BOOMBOX  BASS");
     else if (tool == TOOL_VIS_EQ)
@@ -8121,8 +8234,10 @@ static void draw_tool_status(void)
                      color_labels[color_index]);
     else if (tool == TOOL_META_YEAR)
         rb->snprintf(line, sizeof(line), "YEAR  %04d", track_year);
-    else
+    else if (tool == TOOL_META_GENRE)
         rb->snprintf(line, sizeof(line), "GENRE  %.30s", selected_genre);
+    else
+        rb->snprintf(line, sizeof(line), "%s", tool_names[tool]);
     if (macro_wheel_locked)
         rb->strlcat(line, " [LOCK/SEEK]", sizeof(line));
     if (!pnav_tool_available(tool))
@@ -8739,6 +8854,9 @@ static void discard_staged_edit(void)
         color_index = staged_original;
     } else if (staged_tool == TOOL_META_YEAR) {
         track_year = staged_original;
+    } else if (staged_tool == TOOL_META_KEY) {
+        rb->strlcpy(selected_key, staged_original_key,
+                    sizeof(selected_key));
     }
     staged_tool = -1;
 }
@@ -8765,6 +8883,9 @@ static void stage_active_edit(void)
         staged_original = color_index;
     else if (tool == TOOL_META_YEAR)
         staged_original = track_year;
+    else if (tool == TOOL_META_KEY)
+        rb->strlcpy(staged_original_key, selected_key,
+                    sizeof(staged_original_key));
     else
         staged_tool = -1;
 }
@@ -10552,6 +10673,22 @@ static void short_select(void)
                          "KEEP METADATA CHANGE?");
             begin_confirmation(CONFIRM_KEEP_EDIT);
         }
+    } else if (mode == MODE_PITCH) {
+        enum rbprep_tool tool = active_tool();
+        if (tool == TOOL_KEYLOCK) {
+            keylock_enabled = !keylock_enabled;
+            apply_playback_rate();
+            mark_rbprep_config_dirty();
+            force_full_redraw = true;
+        } else if (tool == TOOL_KEY_NOTATION) {
+            key_notation = !key_notation;
+            mark_rbprep_config_dirty();
+            force_full_redraw = true;
+        } else if (tool == TOOL_META_KEY && staged_tool == tool) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "KEEP KEY CHANGE?");
+            begin_confirmation(CONFIRM_KEEP_EDIT);
+        }
     } else if (mode == MODE_LIST) {
         enum rbprep_tool tool = active_tool();
         if (tool == TOOL_PLAYLIST_MODE) {
@@ -10622,11 +10759,7 @@ static void short_select(void)
         force_full_redraw = true;
     } else if (mode == MODE_MACRO) {
         enum rbprep_tool tool = active_tool();
-        if (tool == TOOL_KEYLOCK) {
-            keylock_enabled = !keylock_enabled;
-            apply_playback_rate();
-            mark_rbprep_config_dirty();
-        } else if (tool == TOOL_MACRO_ONE) {
+        if (tool == TOOL_MACRO_ONE) {
             activate_macro(0);
         } else if (tool == TOOL_MACRO_TWO) {
             activate_macro(1);
@@ -10816,6 +10949,20 @@ static void adjust_active_tool(int direction)
     else if (tool == TOOL_KEYLOCK) {
         keylock_enabled = direction > 0;
         apply_playback_rate();
+        mark_rbprep_config_dirty();
+        force_full_redraw = true;
+    }
+    else if (tool == TOOL_META_KEY) {
+        int index = key_index_from_name(selected_key);
+
+        stage_active_edit();
+        if (index < 0)
+            index = direction > 0 ? -1 : 0;
+        set_selected_key_index(index + (direction > 0 ? 1 : -1));
+        force_full_redraw = true;
+    }
+    else if (tool == TOOL_KEY_NOTATION) {
+        key_notation = direction > 0;
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     }
@@ -11181,6 +11328,10 @@ static void adjust_macro_value(int direction, bool coarse)
     } else if (tool == TOOL_GRID_BPM) {
         macro_value_draft = MAX(2000, MIN(25000,
             macro_value_draft + direction * (coarse ? 100 : 1)));
+    } else if (tool == TOOL_META_KEY) {
+        macro_value_draft = (macro_value_draft +
+            (direction > 0 ? 1 : ARRAYLEN(chromatic_key_names) - 1)) %
+            ARRAYLEN(chromatic_key_names);
     } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE ||
                tool == TOOL_CUE_COLOR || tool == TOOL_CUE_DELETE) {
         macro_value_draft = (macro_value_draft +
@@ -11315,6 +11466,13 @@ static void apply_macro_step(const struct rbprep_macro_step *step)
     } else if (tool == TOOL_KEYLOCK) {
         keylock_enabled = !!value;
         apply_playback_rate();
+        mark_rbprep_config_dirty();
+    } else if (tool == TOOL_META_KEY) {
+        stage_active_edit();
+        set_selected_key_index(value);
+    } else if (tool == TOOL_KEY_NOTATION) {
+        key_notation = !!value;
+        mark_rbprep_config_dirty();
     } else if (tool == TOOL_GRID_BPM) {
         stage_active_edit();
         grid_bpm_x100 = MAX(2000, MIN(25000, value));
@@ -11401,6 +11559,7 @@ static void select_tool(enum rbprep_tool tool)
             else if (mode == MODE_CUES) cue_tool = index;
             else if (mode == MODE_LOOP) loop_tool = index;
             else if (mode == MODE_METADATA) metadata_tool = index;
+            else if (mode == MODE_PITCH) pitch_tool = index;
             else if (mode == MODE_LIST) list_tool = index;
             else if (mode == MODE_PNAV) pnav_tool = index;
             else if (mode == MODE_VISUALIZER) visualizer_tool = index;
@@ -12071,7 +12230,7 @@ enum plugin_status plugin_start(const void *parameter)
     grid_beat_shift = 0;
     cue_slot = 0;
     deck_tool = tempo_tool = grid_tool = cue_tool = loop_tool = 0;
-    metadata_tool = visualizer_tool = visualizer_two_tool = 0;
+    metadata_tool = pitch_tool = visualizer_tool = visualizer_two_tool = 0;
     list_tool = pnav_tool = macro_tool = 0;
     rating = 0;
     color_index = RBPREP_TRACK_COLOR_NONE;
@@ -12159,6 +12318,7 @@ enum plugin_status plugin_start(const void *parameter)
     auto_burn = false;
     click_sound = !!click_sound;
     keylock_enabled = !!keylock_enabled;
+    key_notation = !!key_notation;
     scrub_step_index = MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1,
                                   scrub_step_index));
     host_rpm_index = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1,

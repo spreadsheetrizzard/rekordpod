@@ -1065,16 +1065,94 @@ static int pdb_get_or_create_genre(struct rbprep_pdb *pdb, const char *name)
     return max_id + 1;
 }
 
+static int pdb_find_key(struct rbprep_pdb *pdb, const char *name,
+                        uint32_t *max_id)
+{
+    uint32_t entry;
+    unsigned char table[16];
+    uint32_t page;
+    uint32_t last;
+    int guard = 0;
+
+    *max_id = 0;
+    if (!pdb_table_entry(pdb, 5, &entry) ||
+        !burn_read_at(pdb->fd, entry, table, sizeof(table)))
+        return -1;
+    page = read_u32(table + 8);
+    last = read_u32(table + 12);
+    while (guard++ < 100000) {
+        int slots;
+        int slot;
+        if (!burn_read_at(pdb->fd, page * pdb->page_size,
+                          rbprep_burn_page, pdb->page_size))
+            return -1;
+        slots = pdb_slot_count(rbprep_burn_page);
+        if (!(rbprep_burn_page[0x1b] & 0x40)) {
+            for (slot = 0; slot < slots; slot++) {
+                uint32_t row;
+                unsigned char raw[8];
+                char existing[24];
+                uint32_t id;
+
+                if (!pdb_row_present(rbprep_burn_page, pdb->page_size, slot))
+                    continue;
+                row = page * pdb->page_size + 0x28 +
+                      pdb_row_heap_offset(rbprep_burn_page,
+                                          pdb->page_size, slot);
+                if (!burn_read_at(pdb->fd, row, raw, sizeof(raw)))
+                    return -1;
+                id = read_u32(raw);
+                *max_id = MAX(*max_id, id);
+                if (read_u32(raw + 4) == id &&
+                    pdb_decode_string(pdb, row + 8, existing,
+                                      sizeof(existing)) &&
+                    !rb->strcasecmp(existing, name))
+                    return id;
+            }
+        }
+        if (page == last)
+            break;
+        if (!pdb_next_page(pdb, page, &page))
+            return -1;
+    }
+    return 0;
+}
+
+static int pdb_get_or_create_key(struct rbprep_pdb *pdb, const char *name)
+{
+    unsigned char row[48];
+    uint32_t max_id;
+    int id = pdb_find_key(pdb, name, &max_id);
+    int string_size;
+    int row_size;
+    int alloc;
+
+    if (id != 0)
+        return id;
+    write_u32(row, max_id + 1);
+    write_u32(row + 4, max_id + 1);
+    string_size = pdb_encode_name(name, row + 8, sizeof(row) - 8);
+    if (string_size < 0)
+        return -1;
+    row_size = 8 + string_size;
+    alloc = (row_size + 3) & ~3;
+    if (!pdb_append_row(pdb, 5, row, row_size, alloc))
+        return -1;
+    return max_id + 1;
+}
+
 static bool pdb_patch_snapshot(struct rbprep_pdb *pdb,
                                const unsigned char *snapshot,
                                struct rbprep_pdb_track *track)
 {
     uint32_t track_id = read_u32(snapshot + 8);
     uint32_t genre_id;
+    uint32_t key_id;
     unsigned char raw[4];
     unsigned char current_color;
     unsigned char desired_color;
     char genre[32];
+    char key[24];
     int found;
 
     if (!pdb_find_track(pdb, track_id, track))
@@ -1087,6 +1165,20 @@ static bool pdb_patch_snapshot(struct rbprep_pdb *pdb,
         if (found < 0)
             return false;
         genre_id = found;
+    }
+    if (read_u16(snapshot + 6) >= 2) {
+        rb->memcpy(key, snapshot + 192, sizeof(key));
+        key[sizeof(key) - 1] = '\0';
+        key_id = 0;
+        if (key[0]) {
+            found = pdb_get_or_create_key(pdb, key);
+            if (found < 0)
+                return false;
+            key_id = found;
+        }
+        write_u32(raw, key_id);
+        if (!burn_write_at(pdb->fd, track->row + 0x20, raw, 4))
+            return false;
     }
     write_u32(raw, read_u32(snapshot + 24));
     if (!burn_write_at(pdb->fd, track->row + 0x38, raw, 4))
