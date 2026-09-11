@@ -60,6 +60,7 @@ void rbprep_grid_close(struct rbprep_grid_reader *reader)
     reader->fd = -1;
     reader->beat_count = 0;
     reader->stamp = 0;
+    reader->fully_resident = false;
     for (page = 0; page < reader->page_count; page++)
         reader->pages[page].valid = false;
 }
@@ -77,7 +78,33 @@ bool rbprep_grid_open(struct rbprep_grid_reader *reader, const char *path,
     reader->data_offset = data_offset;
     reader->cache_hits = 0;
     reader->cache_misses = 0;
+    reader->fully_resident = false;
     return true;
+}
+
+static struct rbprep_grid_page *cached_page(
+    struct rbprep_grid_reader *reader, uint32_t index)
+{
+    int page;
+
+    for (page = 0; page < reader->page_count; page++) {
+        struct rbprep_grid_page *candidate = &reader->pages[page];
+
+        if (candidate->valid && index >= candidate->first &&
+            index - candidate->first < candidate->count)
+            return candidate;
+    }
+    return NULL;
+}
+
+static void decode_beat(const struct rbprep_grid_page *page, uint32_t index,
+                        struct rbprep_grid_beat *beat)
+{
+    const unsigned char *source = page->data +
+        (index - page->first) * RBPREP_GRID_RECORD_BYTES;
+
+    beat->time_ms = read_u32(source);
+    beat->number = MAX(1, MIN(4, source[4]));
 }
 
 static struct rbprep_grid_page *find_page(struct rbprep_grid_reader *reader,
@@ -125,11 +152,86 @@ static bool load_page(struct rbprep_grid_reader *reader,
     return true;
 }
 
+bool rbprep_grid_beat_cached(struct rbprep_grid_reader *reader,
+                             uint32_t index,
+                             struct rbprep_grid_beat *beat)
+{
+    struct rbprep_grid_page *page;
+
+    if (index >= reader->beat_count)
+        return false;
+    page = cached_page(reader, index);
+    if (!page)
+        return false;
+    page->stamp = ++reader->stamp;
+    reader->cache_hits++;
+    decode_beat(page, index, beat);
+    return true;
+}
+
+bool rbprep_grid_range_cached(struct rbprep_grid_reader *reader,
+                              uint32_t begin, uint32_t end)
+{
+    uint32_t cursor;
+
+    if (begin >= end || end > reader->beat_count)
+        return false;
+    cursor = begin;
+    while (cursor < end) {
+        const struct rbprep_grid_page *page = cached_page(reader, cursor);
+        uint32_t page_end;
+
+        if (!page)
+            return false;
+        page_end = page->first + page->count;
+        if (page_end <= cursor)
+            return false;
+        cursor = page_end;
+    }
+    return true;
+}
+
+bool rbprep_grid_cache_all(struct rbprep_grid_reader *reader)
+{
+    uint32_t records_per_page;
+    uint32_t required_pages;
+    uint32_t cursor = 0;
+
+    reader->fully_resident = false;
+    if (reader->fd < 0 || reader->page_count <= 0 || !reader->beat_count)
+        return false;
+    records_per_page = reader->page_bytes / RBPREP_GRID_RECORD_BYTES;
+    if (!records_per_page)
+        return false;
+    required_pages = (reader->beat_count + records_per_page - 1) /
+                     records_per_page;
+    if (required_pages > (uint32_t)reader->page_count)
+        return false;
+
+    while (cursor < reader->beat_count) {
+        struct rbprep_grid_page *page = find_page(reader, cursor);
+
+        if (!page || !(page->valid && cursor >= page->first &&
+                       cursor - page->first < page->count)) {
+            if (!page || !load_page(reader, page, cursor))
+                return false;
+        }
+        cursor = page->first + page->count;
+    }
+    reader->fully_resident =
+        rbprep_grid_range_cached(reader, 0, reader->beat_count);
+    return reader->fully_resident;
+}
+
+bool rbprep_grid_fully_resident(const struct rbprep_grid_reader *reader)
+{
+    return reader->fully_resident;
+}
+
 bool rbprep_grid_beat_at(struct rbprep_grid_reader *reader, uint32_t index,
                          struct rbprep_grid_beat *beat)
 {
     struct rbprep_grid_page *page;
-    const unsigned char *source;
 
     if (reader->fd < 0 || index >= reader->beat_count)
         return false;
@@ -139,9 +241,6 @@ bool rbprep_grid_beat_at(struct rbprep_grid_reader *reader, uint32_t index,
         if (!page || !load_page(reader, page, index))
             return false;
     }
-    source = page->data + (index - page->first) *
-             RBPREP_GRID_RECORD_BYTES;
-    beat->time_ms = read_u32(source);
-    beat->number = MAX(1, MIN(4, source[4]));
+    decode_beat(page, index, beat);
     return true;
 }

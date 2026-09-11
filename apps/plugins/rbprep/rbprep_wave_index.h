@@ -29,6 +29,13 @@ enum rbprep_wave_index_stage {
     RBPREP_WAVE_INDEX_FAILED
 };
 
+enum rbprep_wave_index_service_result {
+    RBPREP_WAVE_INDEX_SERVICE_IDLE,
+    RBPREP_WAVE_INDEX_SERVICE_PROGRESS,
+    RBPREP_WAVE_INDEX_SERVICE_READY,
+    RBPREP_WAVE_INDEX_SERVICE_FAILED
+};
+
 struct rbprep_wave_index {
     const struct plugin_api *api;
     unsigned char *payload;
@@ -51,6 +58,8 @@ struct rbprep_wave_index {
     unsigned char (*overview)[4];
     char path[MAX_PATH];
     char temporary[MAX_PATH];
+    /* True once a verified sidecar is loaded or a source scan is complete.
+       Persistence may still be in progress or may have failed. */
     bool valid;
 };
 
@@ -73,6 +82,9 @@ bool rbprep_wave_index_start(struct rbprep_wave_index *index,
                              const char *source_path,
                              off_t source_data_offset,
                              unsigned char (*overview)[4]);
+enum rbprep_wave_index_service_result
+rbprep_wave_index_service_step(struct rbprep_wave_index *index);
+/* Compatibility wrapper: true only on the call that publishes the index. */
 bool rbprep_wave_index_service(struct rbprep_wave_index *index);
 bool rbprep_wave_index_range_peak(const struct rbprep_wave_index *index,
                                   uint32_t begin, uint32_t end,

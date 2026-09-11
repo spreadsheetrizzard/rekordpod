@@ -1,6 +1,14 @@
 # Rekordpod Stability and Performance Refactor
 
-Status: agreed design baseline, 2026-09-11
+Status: public-beta implementation baseline, 2026-09-11
+
+Public Beta 1 deliberately refines the original memory rule below: the iPod
+Video keeps a bounded raw window plus a resident coarse peak pyramid, while
+the iPod Classic uses its larger plugin region to preload the complete RBW3
+waveform and a fine resident peak pyramid before playback resumes.  Neither
+target reads analysis data from storage while the deck is running.  This is
+the measured compromise that preserves the detailed Classic 64x/128x view
+without reintroducing the periodic storage stalls that prompted the refactor.
 
 ## Purpose
 
@@ -17,7 +25,8 @@ cache-building step.
 
 - Playback and input handling always have priority over drawing and storage.
 - Rockbox's reported audio position is the only authoritative playback clock.
-- A complete waveform is never loaded into plugin memory.
+- A complete waveform is never loaded on the iPod Video; the iPod Classic may
+  preload it at a visible, recoverable track-load boundary.
 - Existing RBW3 analysis remains the source format and works without changes.
 - Any acceleration data is generated on the iPod from RBW3 in bounded chunks.
 - Track experiments remain in RAM until the user leaves the track.
@@ -87,9 +96,9 @@ overrun the plugin region.
 ### Enhanced profile: iPod Classic 6G/7G
 
 - S5L8702 performance path.
-- Approximately 96-192 KiB waveform/read-ahead cache, chosen from actual free
-  plugin workspace.
-- 16-32 KiB cooperative I/O slices when playback remains healthy.
+- Up to 512 KiB resident raw waveform cache, clamped to actual free plugin
+  workspace, plus a fine multi-resolution peak pyramid.
+- 8 KiB cooperative I/O slices during the visible pre-playback load only.
 - Deck rendering targets 30 fps.
 - More adjacent waveform tiles and visualizer history remain resident.
 - USB DAC appears only when USB audio is compiled and operational.
@@ -162,7 +171,8 @@ The iPod may build `/.rockbox/rbprep/wave-index/<track-id>.rbx` from RBW3. This
 is an acceleration cache, never the sole copy of analysis.
 
 - It is built by streaming RBW3 through a 4-16 KiB buffer.
-- The waveform is never resident in full.
+- The waveform is never resident in full on the iPod Video. The Classic may
+  keep it fully resident; both targets render active playback from RAM only.
 - Each raw tile produces peak/color summaries for blocks of 16, 64, 256, and
   1,024 source points.
 - A 320-column full-track overview is produced in the same pass.
@@ -401,7 +411,9 @@ different node.
 ## Verification matrix
 
 - Both target builds link within their plugin limits.
-- Zero full-waveform allocations and zero whole-library pending arrays.
+- Zero full-waveform allocation on the iPod Video and zero whole-library
+  pending arrays; the Classic's optional full preload is bounded by its
+  runtime plugin buffer.
 - RBW3 tracks at minimum, median, and maximum point counts.
 - Missing, truncated, stale, interrupted, and valid RBX1 sidecars.
 - Waveform playback, prolonged playback, rapid seek, scrub, loop, and cue use.
@@ -429,4 +441,3 @@ different node.
 - Failed PDB/index transactions remain recoverable and never report success.
 - 6G/7G devices demonstrate measurably higher cache hit rate and frame cadence
   without producing incompatible device data.
-

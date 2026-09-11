@@ -297,15 +297,19 @@ static bool service_scan(struct rbprep_wave_index *index)
         processed++;
     }
     if (index->scan_position == index->source_points) {
-        if (index->api->close(index->fd) < 0) {
-            index->fd = -1;
-            index->stage = RBPREP_WAVE_INDEX_FAILED;
-            return false;
-        }
+        bool closed = index->api->close(index->fd) >= 0;
+
         index->fd = -1;
         index->payload_checksum = checksum_update(
             2166136261u, index->payload, index->payload_size);
-        index->stage = RBPREP_WAVE_INDEX_OPEN_WRITE;
+        /* The peak pyramid is complete and safe to render now. Publishing the
+           sidecar is persistence only: a write, verify, rename, or even source
+           close failure must not discard valid resident analysis. */
+        index->valid = true;
+        index->stage = closed ? RBPREP_WAVE_INDEX_OPEN_WRITE
+                              : RBPREP_WAVE_INDEX_FAILED;
+        if (!closed)
+            return false;
     }
     return true;
 }
@@ -354,7 +358,7 @@ static bool service_write(struct rbprep_wave_index *index)
         index->fd = -1;
         index->stage = RBPREP_WAVE_INDEX_OPEN_VERIFY;
     }
-    return false;
+    return true;
 }
 
 static bool service_verify(struct rbprep_wave_index *index)
@@ -387,16 +391,18 @@ static bool service_verify(struct rbprep_wave_index *index)
         index->stage = ok ? RBPREP_WAVE_INDEX_PUBLISH
                           : RBPREP_WAVE_INDEX_FAILED;
     }
-    return false;
+    return index->stage != RBPREP_WAVE_INDEX_FAILED;
 }
 
-bool rbprep_wave_index_service(struct rbprep_wave_index *index)
+enum rbprep_wave_index_service_result
+rbprep_wave_index_service_step(struct rbprep_wave_index *index)
 {
     unsigned char header[RBX_HEADER_SIZE];
 
     switch (index->stage) {
     case RBPREP_WAVE_INDEX_SCAN:
-        return service_scan(index);
+        return service_scan(index) ? RBPREP_WAVE_INDEX_SERVICE_PROGRESS
+                                   : RBPREP_WAVE_INDEX_SERVICE_FAILED;
     case RBPREP_WAVE_INDEX_OPEN_WRITE:
         if (!index->api->dir_exists(RBX_DIR))
             index->api->mkdir(RBX_DIR);
@@ -404,20 +410,21 @@ bool rbprep_wave_index_service(struct rbprep_wave_index *index)
                                      O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (index->fd < 0) {
             index->stage = RBPREP_WAVE_INDEX_FAILED;
-            return false;
+            return RBPREP_WAVE_INDEX_SERVICE_FAILED;
         }
         build_header(index, header);
         if (!write_exact(index->api, index->fd, header, sizeof(header))) {
             index->api->close(index->fd);
             index->fd = -1;
             index->stage = RBPREP_WAVE_INDEX_FAILED;
-            return false;
+            return RBPREP_WAVE_INDEX_SERVICE_FAILED;
         }
         index->transfer_position = 0;
         index->stage = RBPREP_WAVE_INDEX_WRITE;
-        return false;
+        return RBPREP_WAVE_INDEX_SERVICE_PROGRESS;
     case RBPREP_WAVE_INDEX_WRITE:
-        return service_write(index);
+        return service_write(index) ? RBPREP_WAVE_INDEX_SERVICE_PROGRESS
+                                    : RBPREP_WAVE_INDEX_SERVICE_FAILED;
     case RBPREP_WAVE_INDEX_OPEN_VERIFY:
         index->fd = index->api->open(index->temporary, O_RDONLY);
         if (index->fd < 0 ||
@@ -427,27 +434,37 @@ bool rbprep_wave_index_service(struct rbprep_wave_index *index)
                 index->api->close(index->fd);
             index->fd = -1;
             index->stage = RBPREP_WAVE_INDEX_FAILED;
-            return false;
+            return RBPREP_WAVE_INDEX_SERVICE_FAILED;
         }
         index->transfer_position = 0;
         index->verify_checksum = 2166136261u;
         index->stage = RBPREP_WAVE_INDEX_VERIFY;
-        return false;
+        return RBPREP_WAVE_INDEX_SERVICE_PROGRESS;
     case RBPREP_WAVE_INDEX_VERIFY:
-        return service_verify(index);
+        return service_verify(index) ? RBPREP_WAVE_INDEX_SERVICE_PROGRESS
+                                     : RBPREP_WAVE_INDEX_SERVICE_FAILED;
     case RBPREP_WAVE_INDEX_PUBLISH:
         if (index->api->file_exists(index->path))
             index->api->remove(index->path);
         if (index->api->rename(index->temporary, index->path) < 0) {
             index->stage = RBPREP_WAVE_INDEX_FAILED;
-            return false;
+            return RBPREP_WAVE_INDEX_SERVICE_FAILED;
         }
         index->valid = true;
         index->stage = RBPREP_WAVE_INDEX_IDLE;
-        return true;
+        return RBPREP_WAVE_INDEX_SERVICE_READY;
+    case RBPREP_WAVE_INDEX_FAILED:
+        return RBPREP_WAVE_INDEX_SERVICE_FAILED;
+    case RBPREP_WAVE_INDEX_IDLE:
     default:
-        return false;
+        return RBPREP_WAVE_INDEX_SERVICE_IDLE;
     }
+}
+
+bool rbprep_wave_index_service(struct rbprep_wave_index *index)
+{
+    return rbprep_wave_index_service_step(index) ==
+           RBPREP_WAVE_INDEX_SERVICE_READY;
 }
 
 bool rbprep_wave_index_range_peak(const struct rbprep_wave_index *index,

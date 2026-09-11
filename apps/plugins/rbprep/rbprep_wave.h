@@ -4,7 +4,11 @@
 #include "plugin.h"
 
 #define RBPREP_WAVE_SAMPLE_BYTES 4
+#if defined(IPOD_6G) || CONFIG_CPU == S5L8702
+#define RBPREP_WAVE_MAX_PAGES 64
+#else
 #define RBPREP_WAVE_MAX_PAGES 16
+#endif
 
 struct rbprep_wave_sample {
     unsigned char amplitude;
@@ -32,6 +36,7 @@ struct rbprep_wave_reader {
     struct rbprep_wave_page pages[RBPREP_WAVE_MAX_PAGES];
     uint32_t cache_hits;
     uint32_t cache_misses;
+    bool fully_cached;
 };
 
 void rbprep_wave_init(struct rbprep_wave_reader *reader,
@@ -40,6 +45,15 @@ void rbprep_wave_init(struct rbprep_wave_reader *reader,
 bool rbprep_wave_open(struct rbprep_wave_reader *reader, const char *path,
                       uint32_t point_count, off_t data_offset);
 void rbprep_wave_close(struct rbprep_wave_reader *reader);
+/* Preload the complete open waveform.  This is the only new API here that
+   may perform storage I/O. */
+bool rbprep_wave_cache_all(struct rbprep_wave_reader *reader);
+/* These two cache queries never seek or read from storage. */
+bool rbprep_wave_range_cached(const struct rbprep_wave_reader *reader,
+                              uint32_t first, uint32_t count);
+bool rbprep_wave_sample_cached(struct rbprep_wave_reader *reader,
+                               uint32_t index,
+                               struct rbprep_wave_sample *sample);
 bool rbprep_wave_sample_at(struct rbprep_wave_reader *reader, uint32_t index,
                            struct rbprep_wave_sample *sample);
 uint32_t rbprep_wave_resident_points(const struct rbprep_wave_reader *reader);

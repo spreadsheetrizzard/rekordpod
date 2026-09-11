@@ -55,7 +55,6 @@
 #define RBPREP_MENU_FRAME_TICKS MAX(1, HZ / 25)
 #define RBPREP_HUD_SCROLL_TICKS MAX(1, HZ / 10)
 #define RBPREP_STATUS_TICKS MAX(1, HZ)
-#define RBPREP_INDEX_PLAY_TICKS MAX(1, HZ / 4)
 #define RBPREP_CONFIG_VERSION 4
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
 #define RBPREP_DEVICE_NAME_FILE "/.rockbox/rbprep/device-name.txt"
@@ -267,6 +266,7 @@ static bool waveform_columns_exact;
 static int waveform_points;
 static int beat_count;
 static int beat_search_hint;
+static bool imported_grid_cached;
 static int zoom = 1;
 static int grid_offset;
 static int grid_phase_ms = 26;
@@ -287,7 +287,6 @@ static bool overview_dirty = true;
 static long overview_deadline;
 static long hud_scroll_deadline;
 static long status_deadline;
-static long wave_index_service_deadline;
 static int title_scroll_px;
 static int metadata_scroll_px;
 static bool hud_scroll_active;
@@ -500,13 +499,11 @@ enum rbprep_seek_state {
 static enum rbprep_seek_state seek_state;
 static bool seek_preview;
 static bool seek_was_paused;
+static bool seek_prepared;
 static int seek_target;
 static int seek_applied_target;
 static long seek_deadline;
 static long seek_applied_tick;
-static bool jog_pitch_active;
-static int jog_pitch_x100;
-static long jog_pitch_deadline;
 #ifdef HAVE_WHEEL_POSITION
 static int seek_wheel_touch_position;
 static int seek_wheel_velocity_fp;
@@ -520,6 +517,9 @@ static int reported_audio_elapsed = -1;
 static long audio_sync_after;
 static bool overview_playhead_white;
 static bool display_locked;
+static bool deck_cpu_boosted;
+static unsigned long maximum_frame_ticks;
+static unsigned long late_frame_count;
 
 struct rbprep_track_record {
     uint32_t id;
@@ -618,6 +618,12 @@ static char selected_extension[12];
 static int usb_armed_selection;
 static bool usb_event_registered;
 static bool usb_extract_event_registered;
+static uint32_t usb_active_playlist_source_id;
+static uint32_t usb_tree_parent_source_id;
+static bool usb_library_context_captured;
+static bool usb_persistence_warning;
+static bool usb_unsaved_edit_valid;
+static unsigned char usb_unsaved_edit[RBPREP_EDIT_RECORD_SIZE];
 
 static void stop_editor_audio(void);
 static void reset_play_clock(int anchor, long tick);
@@ -641,6 +647,7 @@ static void clear_macro(int slot);
 static bool handle_usb_system_event(int button);
 static bool save_rbprep_config(void);
 static bool save_tool_macros(void);
+static bool persist_usb_arm_state(void);
 static void begin_track_load_confirmation(int index, int row,
                                           enum rbprep_mode return_mode,
                                           bool force_reload);
@@ -672,6 +679,18 @@ static void set_storage_performance_mode(bool enabled)
                                  : rb->global_settings->disk_spindown);
 #else
     (void)enabled;
+#endif
+}
+
+static void update_deck_cpu_boost(void)
+{
+#ifdef HAVE_ADJUSTABLE_CPU_FREQ
+    bool wanted = !display_locked && mode >= MODE_DECK;
+
+    if (wanted == deck_cpu_boosted)
+        return;
+    rb->cpu_boost(wanted);
+    deck_cpu_boosted = wanted;
 #endif
 }
 
@@ -729,6 +748,12 @@ static void rbprep_cleanup(void)
     rbprep_wave_close(&wave_reader);
     rbprep_grid_close(&grid_reader);
     rbprep_wave_index_close(&wave_index);
+#ifdef HAVE_ADJUSTABLE_CPU_FREQ
+    if (deck_cpu_boosted) {
+        rb->cpu_boost(false);
+        deck_cpu_boosted = false;
+    }
+#endif
     if (search_result_fd >= 0) {
         rb->close(search_result_fd);
         search_result_fd = -1;
@@ -757,6 +782,7 @@ static bool service_display_lock(void)
         rb->backlight_on();
 #endif
     }
+    update_deck_cpu_boost();
     force_full_redraw = true;
     return true;
 #else
@@ -1226,7 +1252,11 @@ static const struct mixer_buffer_cbs spectrum_buffer_cbs = {
 
 static void start_spectrum_capture(void)
 {
-    if (spectrum_capture_active)
+    /* The callback runs in Rockbox's mixer path.  The RGB waveform is already
+       driven by imported analysis and must not spend audio-thread time copying
+       PCM that it never consumes. */
+    if (spectrum_capture_active || visualizer_mode == 0 || display_locked ||
+        mode < MODE_DECK)
         return;
     pcm_capture_index = 0;
     pcm_capture_frames[0] = pcm_capture_frames[1] = 0;
@@ -1250,6 +1280,14 @@ static void stop_spectrum_capture(void)
         return;
     rb->mixer_channel_set_buffer_hook(PCM_MIXER_CHAN_PLAYBACK, NULL);
     spectrum_capture_active = false;
+}
+
+static void update_spectrum_capture_state(void)
+{
+    if (!display_locked && mode >= MODE_DECK && visualizer_mode != 0)
+        start_spectrum_capture();
+    else
+        stop_spectrum_capture();
 }
 
 static const int cue_palette[] = {
@@ -2430,6 +2468,44 @@ static int collection_sorted_index_at(int row)
     return read_u32(data);
 }
 
+static int find_track_row_in_collection(int track_index)
+{
+    unsigned char rows[64 * 4];
+    uint32_t position;
+
+    if (track_index < 0 || (uint32_t)track_index >= library_track_count)
+        return -1;
+    if (track_sort_key == TRACK_SORT_TITLE ||
+        library_sort_offsets[track_sort_key] == 0)
+        position = track_index;
+    else {
+        uint32_t base;
+
+        position = library_track_count;
+        for (base = 0; base < library_track_count; base += 64) {
+            uint32_t count = MIN(64u, library_track_count - base);
+            uint32_t item;
+
+            if (!read_index_at(library_sort_offsets[track_sort_key] +
+                               base * 4, rows, count * 4))
+                return -1;
+            for (item = 0; item < count; item++) {
+                if ((int)read_u32(rows + item * 4) == track_index) {
+                    position = base + item;
+                    break;
+                }
+            }
+            if (position < library_track_count)
+                break;
+        }
+        if (position >= library_track_count)
+            return -1;
+    }
+    if (track_sort_descending)
+        position = library_track_count - 1 - position;
+    return position <= INT_MAX ? (int)position : -1;
+}
+
 static int track_index_at_row(int row)
 {
     unsigned char data[4];
@@ -2790,12 +2866,20 @@ static int beat_period_ms(void)
     return MAX(1, (first * (100 - fraction) + second * fraction + 50) / 100);
 }
 
+static bool imported_grid_resident(void)
+{
+    return imported_grid_cached && beat_count > 0;
+}
+
 static bool source_beat_at(int index, int *time_ms, int *number)
 {
     struct rbprep_grid_beat beat;
 
-    if (index < 0 || index >= beat_count ||
-        !rbprep_grid_beat_at(&grid_reader, index, &beat))
+    /* This function is used directly by the frame renderer.  Cached-only is a
+       deliberate safety boundary: a missing page falls back to the synthetic
+       BPM grid instead of seeking the RBW file while audio owns storage. */
+    if (!imported_grid_resident() || index < 0 || index >= beat_count ||
+        !rbprep_grid_beat_cached(&grid_reader, index, &beat))
         return false;
     if (time_ms)
         *time_ms = beat.time_ms;
@@ -2866,7 +2950,8 @@ static int current_beat_index(int time_ms)
     int low;
     int high;
 
-    if (beat_count <= 0 || time_ms < adjusted_beat_time(0))
+    if (!imported_grid_resident() ||
+        time_ms < adjusted_beat_time(0))
         return -1;
     index = MAX(0, MIN(beat_count - 1, beat_search_hint));
     if (adjusted_beat_time(index) <= time_ms) {
@@ -2910,7 +2995,7 @@ static int nearest_beat_index(int time_ms)
     int before = current_beat_index(time_ms);
     int after;
 
-    if (beat_count <= 0)
+    if (!imported_grid_resident())
         return -1;
     if (before < 0)
         return 0;
@@ -3050,7 +3135,7 @@ static void draw_beatgrid(int first, int span)
     pixels_per_beat = (long long)period * RBPREP_DECK_WIDTH /
                       MAX(1, view_end - view_start);
 
-    if (beat_count > 0) {
+    if (imported_grid_resident()) {
         int low = 0;
         int high = beat_count;
 
@@ -3201,9 +3286,20 @@ static void rebuild_waveform_columns(int first, int span)
                             !(audio_status & AUDIO_STATUS_PAUSE);
     int samples_per_column = (span + RBPREP_DECK_WIDTH - 1) /
                              RBPREP_DECK_WIDTH;
-    bool exact = !transport_active &&
-                 span <= (int)rbprep_wave_resident_points(&wave_reader) &&
-                 samples_per_column < 16;
+    int cached_begin = MAX(0, first);
+    int cached_end = MIN(waveform_points, first + span);
+    bool active_raw_fallback = transport_active && !wave_index.valid &&
+                 capabilities.device_class == RBPREP_DEVICE_CLASSIC &&
+                 wave_reader.fully_cached;
+    bool exact = (!transport_active || active_raw_fallback) &&
+                 samples_per_column < 16 &&
+                 cached_end > cached_begin &&
+                 rbprep_wave_range_cached(&wave_reader, cached_begin,
+                                          cached_end - cached_begin);
+    int source = first;
+    int source_step = span / RBPREP_DECK_WIDTH;
+    int source_remainder = span % RBPREP_DECK_WIDTH;
+    int source_error = 0;
     int x;
 
     if (waveform_columns_valid && first == waveform_column_first &&
@@ -3211,13 +3307,20 @@ static void rebuild_waveform_columns(int first, int span)
         return;
 
     for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
-        int begin;
+        int begin = source;
         int end;
         struct rbprep_wave_sample peak;
         int index;
 
-        begin = first + (long long)x * span / RBPREP_DECK_WIDTH;
-        end = first + (long long)(x + 1) * span / RBPREP_DECK_WIDTH;
+        /* Bresenham-style source stepping exactly partitions the viewport with
+           one division per frame instead of two 64-bit divisions per column. */
+        source += source_step;
+        source_error += source_remainder;
+        if (source_error >= RBPREP_DECK_WIDTH) {
+            source++;
+            source_error -= RBPREP_DECK_WIDTH;
+        }
+        end = source;
         waveform_columns[x].valid = false;
         if (end <= 0 || begin >= waveform_points) {
             continue;
@@ -3228,39 +3331,22 @@ static void rebuild_waveform_columns(int first, int span)
         end = MIN(end, waveform_points);
 
         if (exact) {
-            if (!rbprep_wave_sample_at(&wave_reader, begin, &peak))
+            if (!rbprep_wave_sample_cached(&wave_reader, begin, &peak))
                 continue;
             for (index = begin + 1; index < end; index++) {
                 struct rbprep_wave_sample sample;
 
-                if (!rbprep_wave_sample_at(&wave_reader, index, &sample))
+                if (!rbprep_wave_sample_cached(&wave_reader, index, &sample))
                     break;
                 if (sample.amplitude > peak.amplitude)
                     peak = sample;
             }
         } else if (!rbprep_wave_index_range_peak(&wave_index, begin, end,
                                                   &peak)) {
-            int overview_begin = (long long)begin *
-                                 RBPREP_OVERVIEW_WIDTH / waveform_points;
-            int overview_end = ((long long)end * RBPREP_OVERVIEW_WIDTH +
-                                waveform_points - 1) / waveform_points;
-
-            overview_begin = MAX(0, MIN(RBPREP_OVERVIEW_WIDTH - 1,
-                                         overview_begin));
-            overview_end = MAX(overview_begin + 1,
-                               MIN(RBPREP_OVERVIEW_WIDTH, overview_end));
-            peak.amplitude = overview_waveform[overview_begin][0];
-            peak.red = overview_waveform[overview_begin][1];
-            peak.green = overview_waveform[overview_begin][2];
-            peak.blue = overview_waveform[overview_begin][3];
-            for (index = overview_begin + 1; index < overview_end; index++) {
-                if (overview_waveform[index][0] > peak.amplitude) {
-                    peak.amplitude = overview_waveform[index][0];
-                    peak.red = overview_waveform[index][1];
-                    peak.green = overview_waveform[index][2];
-                    peak.blue = overview_waveform[index][3];
-                }
-            }
+            /* Never substitute the miniature 320-column overview for the main
+               deck.  Missing resident data is shown as unavailable rather
+               than silently reducing 64x/128x detail. */
+            continue;
         }
 
         waveform_columns[x].amplitude = peak.amplitude;
@@ -4366,6 +4452,7 @@ static void clear_analysis(void)
     rb->memset(overview_waveform, 0, sizeof(overview_waveform));
     beat_count = 0;
     beat_search_hint = 0;
+    imported_grid_cached = false;
     grid_offset = 0;
     grid_phase_ms = 0;
     grid_beat_shift = 0;
@@ -4434,17 +4521,13 @@ static bool load_latest_edit(int track_id)
     return found;
 }
 
-static bool save_edit_snapshot(void)
+static bool pack_current_edit_snapshot(unsigned char *data)
 {
-    unsigned char data[RBPREP_EDIT_RECORD_SIZE];
-    off_t original_size;
-    int fd;
     int i;
-    bool ok;
 
     if (selected_track_id < 0)
         return false;
-    rb->memset(data, 0, sizeof(data));
+    rb->memset(data, 0, RBPREP_EDIT_RECORD_SIZE);
     rb->memcpy(data, "RBE1", 4);
     write_u16(data + 4, RBPREP_EDIT_RECORD_SIZE);
     write_u16(data + 6, 1);
@@ -4465,6 +4548,18 @@ static bool save_edit_snapshot(void)
     }
     rb->strlcpy((char *)data + 120, selected_genre, 32);
     rb->strlcpy((char *)data + 152, selected_title, 64);
+    return true;
+}
+
+static bool save_edit_snapshot(void)
+{
+    unsigned char data[RBPREP_EDIT_RECORD_SIZE];
+    off_t original_size;
+    int fd;
+    bool ok;
+
+    if (!pack_current_edit_snapshot(data))
+        return false;
 
     fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDWR | O_CREAT, 0666);
     if (fd < 0)
@@ -5155,25 +5250,34 @@ static bool auto_burn_pending_changes(void)
     return true;
 }
 
-static void service_deferred_burn(void)
+static bool service_deferred_burn(void)
 {
+    struct rbprep_node_record active;
+    uint32_t active_source_id = 0;
     bool success;
+    bool saved_playlist_playback = playlist_playback;
     int track_burns;
 
     if (burn_request == BURN_REQUEST_NONE)
-        return;
+        return true;
+    if (active_playlist_node >= 0 &&
+        read_node_record(active_playlist_node, &active))
+        active_source_id = active.source_id;
     refresh_pending_summary();
     track_burns = pending_snapshot_count;
     success = rbprep_burn_all();
+    playlist_playback = saved_playlist_playback;
     refresh_pending_summary();
     if (success) {
         uptime_tracks_burned += track_burns;
         burn_request = BURN_REQUEST_NONE;
+        refresh_active_playlist_context(active_source_id);
         rb->splash(HZ, "Burn all complete");
     } else {
         rb->splash(HZ * 2, "Automatic burn remains pending");
     }
     restore_black_canvas();
+    return success;
 }
 
 static bool burn_loaded_track_now(void)
@@ -5338,6 +5442,89 @@ static void service_play_statistics(void)
     }
 }
 
+static int waveform_index_progress(void)
+{
+    switch (wave_index.stage) {
+    case RBPREP_WAVE_INDEX_SCAN:
+        return 20 + (int)((uint64_t)wave_index.scan_position * 40 /
+                          MAX(1u, wave_index.source_points));
+    case RBPREP_WAVE_INDEX_OPEN_WRITE:
+        return 60;
+    case RBPREP_WAVE_INDEX_WRITE:
+        return 60 + (int)((uint64_t)wave_index.transfer_position * 18 /
+                          MAX((size_t)1, wave_index.payload_size));
+    case RBPREP_WAVE_INDEX_OPEN_VERIFY:
+        return 78;
+    case RBPREP_WAVE_INDEX_VERIFY:
+        return 78 + (int)((uint64_t)wave_index.transfer_position * 20 /
+                          MAX((size_t)1, wave_index.payload_size));
+    case RBPREP_WAVE_INDEX_PUBLISH:
+        return 99;
+    case RBPREP_WAVE_INDEX_IDLE:
+        return wave_index.valid ? 100 : 0;
+    default:
+        return 0;
+    }
+}
+
+static void draw_waveform_preparation(int progress, const char *stage)
+{
+    int width = LCD_WIDTH - 56;
+    int fill = width * MAX(0, MIN(100, progress)) / 100;
+    char percent[16];
+
+    rb->lcd_set_background(LCD_BLACK);
+    rb->lcd_clear_display();
+    draw_status_bar();
+    centered_text(0, LCD_WIDTH, 72, "PREPARING WAVEFORM", LCD_WHITE);
+    centered_text(0, LCD_WIDTH, 91, stage, LCD_RGBPACK(145, 165, 151));
+    rb->lcd_set_foreground(LCD_RGBPACK(22, 35, 27));
+    rb->lcd_fillrect(28, 118, width, 12);
+    rb->lcd_set_foreground(RBPREP_GREEN);
+    if (fill > 0)
+        rb->lcd_fillrect(28, 118, fill, 12);
+    rb->lcd_set_foreground(LCD_RGBPACK(95, 120, 103));
+    rb->lcd_drawrect(27, 117, width + 2, 14);
+    rb->snprintf(percent, sizeof(percent), "%d%%", progress);
+    centered_text(0, LCD_WIDTH, 143, percent, LCD_WHITE);
+    centered_text(0, LCD_WIDTH, 176,
+                  "AUDIO WAITS UNTIL THE DECK IS RESIDENT",
+                  LCD_RGBPACK(95, 120, 103));
+    rb->lcd_update();
+}
+
+static bool finish_waveform_index_preparation(void)
+{
+    int shown_progress = -1;
+    long draw_deadline = *rb->current_tick;
+
+    while (wave_index.stage != RBPREP_WAVE_INDEX_IDLE &&
+           wave_index.stage != RBPREP_WAVE_INDEX_FAILED) {
+        enum rbprep_wave_index_service_result result =
+            rbprep_wave_index_service_step(&wave_index);
+        int progress = waveform_index_progress();
+        long now = *rb->current_tick;
+
+        if (progress != shown_progress &&
+            !TIME_BEFORE(now, draw_deadline)) {
+            const char *stage = wave_index.stage == RBPREP_WAVE_INDEX_SCAN
+                              ? "BUILDING RESIDENT PEAKS"
+                              : wave_index.stage == RBPREP_WAVE_INDEX_WRITE ||
+                                wave_index.stage == RBPREP_WAVE_INDEX_OPEN_WRITE
+                              ? "SAVING DEVICE INDEX"
+                              : "VERIFYING DEVICE INDEX";
+
+            draw_waveform_preparation(progress, stage);
+            shown_progress = progress;
+            draw_deadline = now + MAX(1, HZ / 10);
+        }
+        if (result == RBPREP_WAVE_INDEX_SERVICE_FAILED)
+            break;
+        rb->yield();
+    }
+    return wave_index.valid;
+}
+
 static bool load_waveform(int track_id)
 {
     int fd;
@@ -5384,6 +5571,7 @@ static bool load_waveform(int track_id)
                     (off_t)declared_beats * 8;
     source_file_size = rb->filesize(fd);
     if (!declared_points || declared_points > RBPREP_POINTS ||
+        declared_beats > RBPREP_BEATS ||
         metadata_offset < (off_t)sizeof(header) ||
         source_file_size < required_size ||
         (uint64_t)source_file_size > 0xffffffffu) {
@@ -5400,6 +5588,16 @@ static bool load_waveform(int track_id)
         rb->close(fd);
         return false;
     }
+    draw_waveform_preparation(8, "LOADING RGB WAVEFORM");
+    /* Classic has enough plugin RAM for the complete source waveform.  Video
+       may decline this preload and will use its resident peak index instead. */
+    if (!rbprep_wave_cache_all(&wave_reader) &&
+        capabilities.device_class == RBPREP_DEVICE_CLASSIC) {
+        rb->close(fd);
+        clear_analysis();
+        return false;
+    }
+    draw_waveform_preparation(20, "LOADING DEVICE INDEX");
 
     source_fingerprint = rbprep_wave_index_fingerprint(
         header, sizeof(header), source_size);
@@ -5407,11 +5605,19 @@ static bool load_waveform(int track_id)
                  "/.rockbox/rbprep/wave-index/%06d.rbx", track_id);
     if (!rbprep_wave_index_open(&wave_index, index_filename, track_id,
                                 waveform_points, source_size,
-                                source_fingerprint, overview_waveform)) {
-        rbprep_wave_index_start(&wave_index, index_filename, track_id,
-                                waveform_points, source_size,
-                                source_fingerprint, filename, sizeof(header),
-                                overview_waveform);
+                                source_fingerprint, overview_waveform) &&
+        !rbprep_wave_index_start(&wave_index, index_filename, track_id,
+                                 waveform_points, source_size,
+                                 source_fingerprint, filename, sizeof(header),
+                                 overview_waveform)) {
+        rb->close(fd);
+        clear_analysis();
+        return false;
+    }
+    if (!finish_waveform_index_preparation()) {
+        rb->close(fd);
+        clear_analysis();
+        return false;
     }
     if (rb->lseek(fd, metadata_offset, SEEK_SET) < 0) {
         clear_analysis();
@@ -5422,21 +5628,42 @@ static bool load_waveform(int track_id)
     for (i = 0; i < cue_count; i++) {
         unsigned char cue[8];
         int slot;
-        if (!read_exact(fd, cue, sizeof(cue)))
-            break;
+        if (!read_exact(fd, cue, sizeof(cue))) {
+            rb->close(fd);
+            clear_analysis();
+            return false;
+        }
         slot = cue[5];
         if (slot > 0 && slot <= 16) {
             hotcues[slot - 1] = read_u32(cue);
             hotcue_colors[slot - 1] = cue[4] & 7;
         }
     }
-    beat_count = MIN(declared_beats, RBPREP_BEATS);
+    beat_count = declared_beats;
     if (beat_count > 0 &&
         !rbprep_grid_open(&grid_reader, filename, beat_count,
-                          beat_data_offset))
-        beat_count = 0;
+                          beat_data_offset)) {
+        rb->close(fd);
+        clear_analysis();
+        return false;
+    }
+    if (beat_count > 0) {
+        draw_waveform_preparation(98, "LOADING BEAT GRID");
+        rbprep_grid_cache_all(&grid_reader);
+        imported_grid_cached = rbprep_grid_fully_resident(&grid_reader);
+        /* Never replace a valid imported/flexible Rekordbox grid with a
+           synthetic constant-BPM grid merely because this target could not
+           cache it.  Reject the deck load while the previous track is still
+           recoverable instead of displaying musically incorrect markers. */
+        if (!imported_grid_cached) {
+            rb->close(fd);
+            clear_analysis();
+            return false;
+        }
+    }
     beat_search_hint = 0;
     rb->close(fd);
+    draw_waveform_preparation(100, "DECK READY");
     overview_dirty = true;
     return true;
 }
@@ -5465,29 +5692,128 @@ static void open_track_browser(int playlist_node)
     force_full_redraw = true;
 }
 
-/* Switching playlists while the decoder is still feeding PCM lets storage
-   and codec teardown race the analysis/index reads below.  On slow PATA flash
-   bridges that looks like a frozen waveform while the old song continues for
-   several seconds.  Pause first, then give Rockbox a short bounded chance to
-   publish the paused state before any track-load I/O begins. */
-static bool soft_pause_for_track_load(void)
+/* Keep the asynchronous pre/finish seek protocol balanced.  In particular,
+   preview debounce can leave Rockbox in ff/rw mode with PCM held until a later
+   service tick posts the finishing seek. */
+static void prepare_transport_seek(void)
+{
+    if (seek_prepared)
+        return;
+    rb->audio_pre_ff_rewind();
+    seek_prepared = true;
+}
+
+static void finish_transport_seek(int target)
+{
+    rb->audio_ff_rewind(clamp_playhead(target));
+    seek_prepared = false;
+}
+
+/* A load transition is not an editor seek.  Capture the user's logical play
+   state separately from success, finish any outstanding pre-ff request, and
+   wait until both playback state and the actual PCM mixer channel agree that
+   audio is paused.  Synchronous analysis must not begin on a timeout. */
+static bool quiesce_audio_for_track_load(bool *resume_after_prepare)
 {
     int status = rb->audio_status();
+    bool was_running = ((status & AUDIO_STATUS_PLAY) &&
+                        !(status & AUDIO_STATUS_PAUSE)) ||
+                       (seek_state != SEEK_IDLE && !seek_was_paused);
     long deadline;
+    bool settled = false;
 
-    if (!(status & AUDIO_STATUS_PLAY) || (status & AUDIO_STATUS_PAUSE))
-        return false;
-    update_play_clock();
+    if (resume_after_prepare)
+        *resume_after_prepare = was_running;
+
+    if (seek_state == SEEK_IDLE && was_running)
+        update_play_clock();
+    if (seek_state != SEEK_IDLE) {
+        prepare_transport_seek();
+        finish_transport_seek(playhead);
+    }
+
+    /* audio_pause() is also our synchronous queue barrier: a finishing seek
+       posted above is handled before it returns.  Rockbox may then complete a
+       configured fade-out asynchronously, so mixer state is checked below. */
     rb->audio_pause();
-    deadline = *rb->current_tick + MAX(1, HZ / 5);
+    seek_state = SEEK_IDLE;
+    seek_preview = false;
+    cue_audition_active = false;
+    cue_audition_latched = false;
+    deadline = *rb->current_tick + MAX(1, HZ);
     do {
         status = rb->audio_status();
-        if (!(status & AUDIO_STATUS_PLAY) || (status & AUDIO_STATUS_PAUSE))
+        if ((!(status & AUDIO_STATUS_PLAY) ||
+             (status & AUDIO_STATUS_PAUSE)) &&
+            rb->mixer_channel_status(PCM_MIXER_CHAN_PLAYBACK) !=
+                CHANNEL_PLAYING) {
+            settled = true;
             break;
+        }
         rb->yield();
     } while (TIME_BEFORE(*rb->current_tick, deadline));
+    if (!settled && was_running && (status & AUDIO_STATUS_PAUSE))
+        rb->audio_resume();
     reset_play_clock(playhead, *rb->current_tick);
-    return true;
+    return settled;
+}
+
+static void restore_failed_track_load(int old_track_id,
+                                      const char *old_path,
+                                      int old_position,
+                                      int old_resume_index,
+                                      bool old_had_audio,
+                                      bool old_was_paused,
+                                      bool playlist_replaced,
+                                      bool analysis_changed,
+                                      bool capture_was_active)
+{
+    bool transport_restored = !old_had_audio;
+    int status;
+
+    if (analysis_changed) {
+        if (old_track_id >= 0) {
+            if (load_waveform(old_track_id))
+                load_latest_edit(old_track_id);
+        } else {
+            clear_analysis();
+        }
+    }
+
+    status = rb->audio_status();
+    if (old_had_audio && playlist_replaced && old_path && old_path[0]) {
+        rb->audio_stop();
+        rb->yield();
+        if (rb->playlist_create(NULL, NULL) >= 0 &&
+            rb->playlist_insert_track(NULL, old_path, PLAYLIST_INSERT_LAST,
+                                      false, true) >= 0) {
+            rb->playlist_start(0, old_position, 0);
+            transport_restored = true;
+        }
+    } else if (old_had_audio && !(status & AUDIO_STATUS_PLAY)) {
+        rb->playlist_start(old_resume_index, old_position, 0);
+        transport_restored = true;
+    } else if (old_had_audio) {
+        transport_restored = true;
+    }
+
+    if (transport_restored && old_had_audio) {
+        status = rb->audio_status();
+        if (old_was_paused) {
+            if ((status & AUDIO_STATUS_PLAY) &&
+                !(status & AUDIO_STATUS_PAUSE))
+                rb->audio_pause();
+        } else if (status & AUDIO_STATUS_PAUSE) {
+            rb->audio_resume();
+        }
+    }
+    audio_was_running = transport_restored && old_had_audio;
+    playhead = old_position;
+    reset_play_clock(playhead, *rb->current_tick);
+    if (capture_was_active && !display_locked)
+        start_spectrum_capture();
+    overview_dirty = true;
+    force_full_redraw = true;
 }
 
 static bool play_track_index(int index, int row,
@@ -5496,11 +5822,21 @@ static bool play_track_index(int index, int row,
     struct rbprep_track_record track;
     struct mp3entry *id3;
     char path[MAX_PATH];
+    char old_path[MAX_PATH];
     const char *extension;
     bool already_loaded;
     bool force_reload = force_track_reload;
     bool resume_existing = false;
     bool capture_was_active = false;
+    bool old_had_audio;
+    bool old_was_paused;
+    bool playlist_replaced = false;
+    bool analysis_changed = false;
+    bool target_from_playlist;
+    int old_track_id = selected_track_id;
+    int old_position = clamp_playhead(playhead);
+    int old_resume_index = 0;
+    int old_status;
 
     if (!read_track_record(index, &track) ||
         !read_index_string(track.path_offset, path, sizeof(path)))
@@ -5521,8 +5857,34 @@ static bool play_track_index(int index, int row,
                      !rb->strcmp(id3->path, path);
     if (!force_reload && index == selected_track_index && id3 && id3->path &&
         !rb->strcmp(id3->path, path)) {
-        if (waveform_points <= 0)
-            load_waveform(track.id);
+        if (waveform_points <= 0) {
+            bool resume_after_prepare = false;
+
+            if (!quiesce_audio_for_track_load(&resume_after_prepare)) {
+                rb->splash(HZ * 2, "Audio pause timed out");
+                restore_black_canvas();
+                return false;
+            }
+
+            capture_was_active = spectrum_capture_active;
+            stop_spectrum_capture();
+            if (!load_waveform(track.id)) {
+                if (resume_after_prepare &&
+                    (rb->audio_status() & AUDIO_STATUS_PAUSE))
+                    rb->audio_resume();
+                if (capture_was_active && !display_locked)
+                    start_spectrum_capture();
+                rb->splash(HZ * 2, "Waveform preparation failed");
+                restore_black_canvas();
+                return false;
+            }
+            load_latest_edit(track.id);
+            if (resume_after_prepare &&
+                (rb->audio_status() & AUDIO_STATUS_PAUSE))
+                rb->audio_resume();
+            if (capture_was_active && !display_locked)
+                start_spectrum_capture();
+        }
         playhead = clamp_playhead(id3->elapsed);
         playing_track_row = row;
         deck_return_mode = return_mode;
@@ -5534,23 +5896,94 @@ static bool play_track_index(int index, int row,
         return true;
     }
 
-    stop_editor_audio();
-    resume_existing = soft_pause_for_track_load();
+    old_status = rb->audio_status();
+    old_had_audio = !!(old_status & AUDIO_STATUS_PLAY);
+    old_was_paused = !!(old_status & AUDIO_STATUS_PAUSE);
+    old_path[0] = '\0';
+    if (id3 && id3->path)
+        rb->strlcpy(old_path, id3->path, sizeof(old_path));
+    if (old_had_audio)
+        rb->playlist_get_resume_info(&old_resume_index);
+    target_from_playlist = row >= 0 && active_playlist_node >= 0;
+    if (!quiesce_audio_for_track_load(&resume_existing)) {
+        rb->splash(HZ * 2, "Audio pause timed out");
+        restore_black_canvas();
+        return false;
+    }
+    old_position = clamp_playhead(playhead);
     capture_was_active = spectrum_capture_active;
     stop_spectrum_capture();
     if (index != selected_track_index)
         save_rbprep_config();
     if (index != selected_track_index || force_reload) {
-        service_deferred_burn();
-        resume_existing = soft_pause_for_track_load() || resume_existing;
+        if (!service_deferred_burn()) {
+            restore_failed_track_load(old_track_id, old_path, old_position,
+                                      old_resume_index, old_had_audio,
+                                      old_was_paused, false, false,
+                                      capture_was_active);
+            return false;
+        }
+        {
+            bool resume_after_burn = false;
+
+            if (!quiesce_audio_for_track_load(&resume_after_burn)) {
+                restore_failed_track_load(old_track_id, old_path, old_position,
+                                          old_resume_index, old_had_audio,
+                                          old_was_paused, false, false,
+                                          capture_was_active);
+                rb->splash(HZ * 2, "Audio pause timed out");
+                restore_black_canvas();
+                return false;
+            }
+            resume_existing = resume_existing || resume_after_burn;
+        }
+        /* A playlist/database burn may rebuild the local index.  Continue by
+           stable Rekordbox track id rather than a now-stale numeric row. */
+        {
+            int refreshed_index = find_track_index_by_id(track.id);
+
+            if (refreshed_index < 0 ||
+                !read_track_record(refreshed_index, &track) ||
+                !read_index_string(track.path_offset, path, sizeof(path)) ||
+                !rb->file_exists(path)) {
+                restore_failed_track_load(old_track_id, old_path,
+                                          old_position, old_resume_index,
+                                          old_had_audio, old_was_paused,
+                                          false, false, capture_was_active);
+                rb->splash(HZ * 2, "Track changed during burn");
+                restore_black_canvas();
+                return false;
+            }
+            index = refreshed_index;
+            if (target_from_playlist) {
+                row = active_playlist_node >= 0
+                    ? find_track_row_in_playlist(active_playlist_node, index)
+                    : -1;
+                if (row < 0) {
+                    restore_failed_track_load(old_track_id, old_path,
+                                              old_position, old_resume_index,
+                                              old_had_audio, old_was_paused,
+                                              false, false,
+                                              capture_was_active);
+                    rb->splash(HZ * 2, "Track left playlist during burn");
+                    restore_black_canvas();
+                    return false;
+                }
+            }
+        }
     }
 
-    if (host_rpm_index != 0 || played_rpm_index != 0 ||
-        pitch_bend_x100 != 0 || tempo_x100 != PITCH_SPEED_100) {
-        host_rpm_index = played_rpm_index = 0;
-        pitch_bend_x100 = 0;
-        tempo_x100 = PITCH_SPEED_100;
-        apply_playback_rate();
+    already_loaded = !force_reload && old_had_audio && old_path[0] &&
+                     !rb->strcmp(old_path, path);
+    analysis_changed = true;
+    if (!load_waveform(track.id)) {
+        restore_failed_track_load(old_track_id, old_path, old_position,
+                                  old_resume_index, old_had_audio,
+                                  old_was_paused, false, analysis_changed,
+                                  capture_was_active);
+        rb->splash(HZ * 2, "Waveform preparation failed");
+        restore_black_canvas();
+        return false;
     }
     if (!already_loaded) {
         if (force_reload) {
@@ -5558,18 +5991,37 @@ static bool play_track_index(int index, int row,
             rb->yield();
             audio_was_running = false;
         }
-        if (rb->playlist_create(NULL, NULL) < 0 ||
-            rb->playlist_insert_track(NULL, path, PLAYLIST_INSERT_LAST,
-                                      false, true) < 0) {
-            if (resume_existing &&
-                (rb->audio_status() & AUDIO_STATUS_PAUSE))
-                rb->audio_resume();
-            if (capture_was_active && !display_locked)
-                start_spectrum_capture();
+        if (rb->playlist_create(NULL, NULL) < 0) {
+            restore_failed_track_load(old_track_id, old_path, old_position,
+                                      old_resume_index, old_had_audio,
+                                      old_was_paused, false, analysis_changed,
+                                      capture_was_active);
             rb->splash(HZ * 2, "Could not load track");
             restore_black_canvas();
             return false;
         }
+        playlist_replaced = true;
+        if (rb->playlist_insert_track(NULL, path, PLAYLIST_INSERT_LAST,
+                                      false, true) < 0) {
+            restore_failed_track_load(old_track_id, old_path, old_position,
+                                      old_resume_index, old_had_audio,
+                                      old_was_paused, playlist_replaced,
+                                      analysis_changed, capture_was_active);
+            rb->splash(HZ * 2, "Could not load track");
+            restore_black_canvas();
+            return false;
+        }
+    }
+
+    /* Do not alter the old deck's transport rate until every fallible part of
+       the replacement load has succeeded.  A failed preparation or playlist
+       mutation can then resume the previous deck exactly as it was. */
+    if (host_rpm_index != 0 || played_rpm_index != 0 ||
+        pitch_bend_x100 != 0 || tempo_x100 != PITCH_SPEED_100) {
+        host_rpm_index = played_rpm_index = 0;
+        pitch_bend_x100 = 0;
+        tempo_x100 = PITCH_SPEED_100;
+        apply_playback_rate();
     }
 
     selected_track_index = index;
@@ -5595,19 +6047,21 @@ static bool play_track_index(int index, int row,
                           sizeof(selected_comments));
     else
         selected_comments[0] = '\0';
-    grid_bpm_x100 = track.bpm_x100;
-    grid_source_bpm_x100 = grid_bpm_x100;
-    rating = track.rating;
-    color_index = normalize_track_color(track.color);
     track_year = track.year;
-    load_waveform(track.id);
     load_latest_edit(track.id);
     track_edit_dirty = false;
     id3 = rb->audio_current_track();
-    if (already_loaded && id3) {
-        if (id3->length > 0)
-            track_length = id3->length;
-        playhead = clamp_playhead(id3->elapsed);
+    if (already_loaded) {
+        if (id3) {
+            if (id3->length > 0)
+                track_length = id3->length;
+            playhead = clamp_playhead(id3->elapsed);
+        } else {
+            playhead = old_position;
+            rb->playlist_start(old_resume_index, playhead, 0);
+            if (!resume_existing)
+                rb->audio_pause();
+        }
         if (resume_existing &&
             (rb->audio_status() & AUDIO_STATUS_PAUSE))
             rb->audio_resume();
@@ -5619,7 +6073,7 @@ static bool play_track_index(int index, int row,
         start_spectrum_capture();
     reset_play_clock(playhead, *rb->current_tick);
     playing_track_row = row;
-    audio_was_running = true;
+    audio_was_running = !!(rb->audio_status() & AUDIO_STATUS_PLAY);
     deck_return_mode = return_mode;
     mode = MODE_DECK;
     if (macro_active >= 0 && tool_macros[macro_active].count > 0)
@@ -6786,7 +7240,8 @@ static void draw_beat_phase(void)
     char position[8];
     int bar = 1;
     int beat = 1;
-    int index = current_beat_index(playhead);
+    int index = imported_grid_resident()
+              ? current_beat_index(playhead) : -1;
     int i;
 
     if (index >= 0) {
@@ -6794,7 +7249,7 @@ static void draw_beat_phase(void)
 
         beat = adjusted_beat_number(index);
         bar = (index + first_beat - 1) / 4 + 1;
-    } else if (beat_count <= 0) {
+    } else if (!imported_grid_resident()) {
         int ordinal = (playhead - grid_phase_ms - grid_offset) /
                       beat_period_ms();
         if (ordinal >= 0) {
@@ -7946,14 +8401,24 @@ static void finish_confirmation(bool apply)
     confirm_action = CONFIRM_NONE;
     if (action == CONFIRM_TRACK_LOAD) {
         bool success;
+        bool resume_on_failure = false;
 
         if (!apply || confirm_choice == 2) {
             restore_black_canvas();
             return;
         }
         if (confirm_choice == 0) {
+            if (!quiesce_audio_for_track_load(&resume_on_failure)) {
+                track_edit_dirty = true;
+                rb->splash(HZ * 2, "Audio pause timed out");
+                restore_black_canvas();
+                return;
+            }
             if (!burn_loaded_track_now()) {
                 track_edit_dirty = true;
+                if (resume_on_failure &&
+                    (rb->audio_status() & AUDIO_STATUS_PAUSE))
+                    rb->audio_resume();
                 restore_black_canvas();
                 return;
             }
@@ -7966,8 +8431,13 @@ static void finish_confirmation(bool apply)
                                    deferred_track_row,
                                    deferred_track_return_mode);
         force_track_reload = false;
-        if (!success && confirm_choice == 1)
-            track_edit_dirty = true;
+        if (!success) {
+            if (confirm_choice == 1)
+                track_edit_dirty = true;
+            if (resume_on_failure &&
+                (rb->audio_status() & AUDIO_STATUS_PAUSE))
+                rb->audio_resume();
+        }
         restore_black_canvas();
         return;
     }
@@ -8336,32 +8806,21 @@ static bool update_play_clock(void)
     return true;
 }
 
-static void restore_jog_pitch(void)
-{
-    if (!jog_pitch_active)
-        return;
-    jog_pitch_active = false;
-    jog_pitch_x100 = 0;
-    apply_playback_rate();
-}
-
 static void stop_editor_audio(void)
 {
     bool resume;
 
     if (seek_state == SEEK_IDLE) {
-        restore_jog_pitch();
         return;
     }
     update_play_clock();
     resume = !seek_was_paused && !cue_audition_active;
+    finish_transport_seek(playhead);
+    /* Process the finishing seek before this finalizer returns. */
     rb->audio_pause();
-    rb->audio_ff_rewind(playhead);
-    rb->pcmbuf_fade(false, true);
     seek_state = SEEK_IDLE;
     cue_audition_active = false;
     cue_audition_latched = false;
-    restore_jog_pitch();
     overview_dirty = true;
     if (resume)
         rb->audio_resume();
@@ -8377,11 +8836,9 @@ static void jump_to_time(int target)
     target = clamp_playhead(target);
     if (seek_state != SEEK_IDLE)
         stop_editor_audio();
-    else
-        restore_jog_pitch();
     if (status & AUDIO_STATUS_PLAY) {
-        rb->audio_pre_ff_rewind();
-        rb->audio_ff_rewind(target);
+        prepare_transport_seek();
+        finish_transport_seek(target);
         if (was_running)
             rb->audio_resume();
     }
@@ -8397,20 +8854,38 @@ static void request_audio_seek(bool preview)
 {
     int status = rb->audio_status();
     bool original_pause;
+    bool continuing_silent = !preview && seek_state == SEEK_DEBOUNCE &&
+                             !seek_preview;
 
     if (!(status & AUDIO_STATUS_PLAY))
         return;
-    original_pause = seek_state == SEEK_IDLE
-                   ? !!(status & AUDIO_STATUS_PAUSE) : seek_was_paused;
+    if (continuing_silent) {
+        seek_target = playhead;
+        seek_deadline = *rb->current_tick + RBPREP_SEEK_SETTLE;
+        return;
+    }
+    if (seek_state != SEEK_IDLE)
+        stop_editor_audio();
+    status = rb->audio_status();
+    original_pause = !!(status & AUDIO_STATUS_PAUSE);
     seek_target = playhead;
     seek_preview = preview;
     seek_was_paused = original_pause;
-    if (seek_state != SEEK_IDLE)
-        return;
 
-    rb->audio_pre_ff_rewind();
+    if (preview) {
+        prepare_transport_seek();
+        seek_deadline = *rb->current_tick + RBPREP_SEEK_DEBOUNCE;
+    } else {
+        /* Continuous navigation is deliberately silent. Pause exactly once,
+           keep all wheel/inertia movement in RAM, and let the service routine
+           commit one decoder seek after the gesture settles. */
+        if (!original_pause) {
+            rb->pcmbuf_fade(true, false);
+            rb->audio_pause();
+        }
+        seek_deadline = *rb->current_tick + RBPREP_SEEK_SETTLE;
+    }
     seek_state = SEEK_DEBOUNCE;
-    seek_deadline = *rb->current_tick + RBPREP_SEEK_DEBOUNCE;
     reset_play_clock(playhead, *rb->current_tick);
 }
 
@@ -8429,7 +8904,22 @@ static bool service_audio_seek(void)
         return false;
 
     if (seek_state == SEEK_DEBOUNCE) {
-        rb->audio_ff_rewind(seek_target);
+        if (!seek_preview) {
+            prepare_transport_seek();
+            finish_transport_seek(seek_target);
+            seek_applied_target = seek_target;
+            seek_applied_tick = now;
+            playhead = seek_target;
+            seek_state = SEEK_IDLE;
+            if (!seek_was_paused) {
+                rb->pcmbuf_fade(true, true);
+                rb->audio_resume();
+            }
+            reset_play_clock(playhead, now);
+            overview_dirty = true;
+            return true;
+        }
+        finish_transport_seek(seek_target);
         seek_applied_target = seek_target;
         seek_applied_tick = now;
         seek_state = SEEK_SETTLE;
@@ -8453,7 +8943,7 @@ static bool service_audio_seek(void)
                 seek_deadline = now + RBPREP_PREVIEW_TICKS;
             }
         } else if (seek_target != seek_applied_target) {
-            rb->audio_ff_rewind(seek_target);
+            finish_transport_seek(seek_target);
             seek_applied_target = seek_target;
             seek_applied_tick = now;
             seek_deadline = now + RBPREP_SEEK_SETTLE;
@@ -8466,8 +8956,8 @@ static bool service_audio_seek(void)
         bool continue_scrub = seek_target != seek_applied_target;
         rb->pcmbuf_fade(true, false);
         rb->audio_pause();
-        rb->audio_pre_ff_rewind();
-        rb->audio_ff_rewind(seek_target);
+        prepare_transport_seek();
+        finish_transport_seek(seek_target);
         seek_applied_target = seek_target;
         playhead = seek_target;
         if (continue_scrub) {
@@ -8478,10 +8968,7 @@ static bool service_audio_seek(void)
             if (!seek_was_paused) {
                 rb->pcmbuf_fade(true, true);
                 rb->audio_resume();
-            } else {
-                rb->pcmbuf_fade(false, true);
             }
-            restore_jog_pitch();
             reset_play_clock(playhead, now);
         }
     }
@@ -8511,8 +8998,8 @@ static void start_cue_audition(void)
     seek_applied_target = cue_audition_position;
     seek_preview = true;
     seek_was_paused = true;
-    rb->audio_pre_ff_rewind();
-    rb->audio_ff_rewind(cue_audition_position);
+    prepare_transport_seek();
+    finish_transport_seek(cue_audition_position);
     seek_applied_tick = now;
     seek_state = SEEK_SETTLE;
     seek_deadline = now + RBPREP_CUE_SETTLE;
@@ -8537,9 +9024,8 @@ static void finish_cue_audition(void)
     }
     rb->pcmbuf_fade(true, false);
     rb->audio_pause();
-    rb->audio_pre_ff_rewind();
-    rb->audio_ff_rewind(cue_audition_position);
-    rb->pcmbuf_fade(false, true);
+    prepare_transport_seek();
+    finish_transport_seek(cue_audition_position);
     playhead = cue_audition_position;
     seek_state = SEEK_IDLE;
     cue_audition_active = false;
@@ -8558,47 +9044,10 @@ static void latch_cue_audition(void)
 static void seek_by(int delta, bool audition)
 {
     playhead = clamp_playhead(playhead + delta);
-    if (audition)
-        request_audio_seek(true);
+    request_audio_seek(audition);
 }
 
 #ifdef HAVE_WHEEL_POSITION
-static void update_paused_jog_pitch(void)
-{
-    int status = rb->audio_status();
-    bool paused_origin = (status & AUDIO_STATUS_PAUSE) ||
-                         (seek_state != SEEK_IDLE && seek_was_paused);
-    int velocity_ms_per_second;
-    int pitch;
-
-    if (!paused_origin)
-        return;
-    velocity_ms_per_second = ABS(seek_wheel_velocity_fp) / 256;
-    if (velocity_ms_per_second <= 0)
-        return;
-
-    /* Timeline velocity is already expressed as milliseconds traversed per
-       real second: 1000 ms/s is natural speed. A physical deck changes pitch
-       with platter speed, so explicitly bypass timestretch/keylock for this
-       temporary audition and stay within Rockbox's supported 50%-200% band.
-       Reverse wheel travel is heard as successive forward grains whose start
-       positions move backwards, matching a jog wheel without reverse decode. */
-    pitch = (long long)velocity_ms_per_second * PITCH_SPEED_100 / 1000;
-    pitch = MAX(50 * PITCH_SPEED_PRECISION,
-                MIN(200 * PITCH_SPEED_PRECISION, pitch));
-    pitch = (pitch + PITCH_SPEED_PRECISION / 2) /
-            PITCH_SPEED_PRECISION * PITCH_SPEED_PRECISION;
-    if (jog_pitch_active &&
-        (TIME_BEFORE(*rb->current_tick, jog_pitch_deadline) ||
-         ABS(pitch - jog_pitch_x100) < PITCH_SPEED_PRECISION))
-        return;
-    rb->dsp_timestretch_enable(false);
-    rb->sound_set_pitch(pitch);
-    jog_pitch_x100 = pitch;
-    jog_pitch_active = true;
-    jog_pitch_deadline = *rb->current_tick + MAX(1, HZ / 10);
-}
-
 static bool seek_wheel_physics_enabled(void)
 {
     return platter_wheel_mode && !display_locked && !confirm_active &&
@@ -8684,8 +9133,7 @@ static bool service_seek_wheel_physics(void)
         delta = seek_wheel_delta_fp / 256;
         seek_wheel_delta_fp -= delta * 256;
         if (delta) {
-            update_paused_jog_pitch();
-            seek_by(delta, true);
+            seek_by(delta, false);
             changed = playhead != before;
             if (!changed)
                 seek_wheel_velocity_fp = 0;
@@ -8716,7 +9164,7 @@ static void beat_jump(int direction)
     int index = current_beat_index(playhead);
     int target;
 
-    if (beat_count > 0 && index >= 0) {
+    if (imported_grid_resident() && index >= 0) {
         index = MAX(0, MIN(beat_count - 1, index + direction));
         target = adjusted_beat_time(index);
     } else {
@@ -8724,7 +9172,7 @@ static void beat_jump(int direction)
         int snapped = quantized_time(playhead);
         target = snapped + direction * period;
     }
-    seek_by(clamp_playhead(target) - playhead, true);
+    seek_by(clamp_playhead(target) - playhead, false);
 }
 
 static void toggle_playback(void)
@@ -8738,7 +9186,6 @@ static void toggle_playback(void)
     if (seek_state == SEEK_PREVIEW) {
         playhead = synchronized_audio_playhead();
         seek_state = SEEK_IDLE;
-        rb->pcmbuf_fade(false, true);
         reset_play_clock(playhead, *rb->current_tick);
         return;
     }
@@ -9236,10 +9683,17 @@ static void short_select(void)
             choose_collection_sort(filter_selection - 2);
         }
     } else if (mode == MODE_USB) {
-        apply_usb_choice(usb_selection);
-        rb->splash(HZ, usb_selection == 2 ? "USB DAC armed" :
-                       usb_selection == 1 ? "Data transfer armed" :
-                                            "USB power only");
+        int choice = usb_selection;
+
+        if (choice != 0 && !persist_usb_arm_state()) {
+            apply_usb_choice(0);
+            rb->splash(HZ * 2, "USB arm failed; power only");
+        } else {
+            apply_usb_choice(choice);
+            rb->splash(HZ, choice == 2 ? "USB DAC armed" :
+                           choice == 1 ? "Data transfer armed" :
+                                         "USB power only");
+        }
         restore_black_canvas();
     } else if (mode == MODE_SETTINGS) {
         if (settings_selection == 0) {
@@ -9557,6 +10011,10 @@ static void short_select(void)
             visualizer_mode = 2;
         else if (tool == TOOL_VIS_TURNTABLE)
             visualizer_mode = 3;
+        if (visualizer_mode == 0)
+            stop_spectrum_capture();
+        else
+            start_spectrum_capture();
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     } else if (mode == MODE_MACRO) {
@@ -9710,12 +10168,12 @@ static void adjust_active_tool(int direction)
     if (macro_wheel_locked) {
         /* A fixed workflow value locks the tool parameter, not navigation.
            Repurpose the wheel as the deck's precise scrub control. */
-        seek_by(direction * scrub_step_ms(), true);
+        seek_by(direction * scrub_step_ms(), false);
         return;
     }
     if (tool == TOOL_SEEK || tool == TOOL_CUE_MOVE ||
         tool == TOOL_GRID_ORIGIN)
-        seek_by(direction * scrub_step_ms(), true);
+        seek_by(direction * scrub_step_ms(), false);
     else if (tool == TOOL_SCRUB_STEP) {
         scrub_step_index = (scrub_step_index +
             (direction > 0 ? 1 : ARRAYLEN(scrub_steps) - 1)) %
@@ -9765,6 +10223,10 @@ static void adjust_active_tool(int direction)
         visualizer_mode = tool == TOOL_WAVEFORM_STYLE ? 0 :
                           tool == TOOL_VIS_BOOMBOX ? 1 :
                           tool == TOOL_VIS_EQ ? 2 : 3;
+        if (visualizer_mode == 0)
+            stop_spectrum_capture();
+        else
+            start_spectrum_capture();
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     }
@@ -9829,14 +10291,14 @@ static void adjust_active_tool_coarse(int direction)
         if (quantize)
             beat_jump(direction);
         else
-            seek_by(direction * 1000, true);
+            seek_by(direction * 1000, false);
         return;
     }
     if (tool == TOOL_SEEK && quantize)
         beat_jump(direction);
     else if (tool == TOOL_SEEK || tool == TOOL_CUE_MOVE ||
              tool == TOOL_GRID_ORIGIN)
-        seek_by(direction * 1000, true);
+        seek_by(direction * 1000, false);
     else if (tool == TOOL_GAIN) {
         int i;
         for (i = 0; i < 5; i++)
@@ -10672,10 +11134,10 @@ static void draw_rekordpod_boot_splash(void)
     }
 }
 
-static void write_usb_status_snapshot(void)
+static bool write_usb_status_snapshot(void)
 {
     unsigned char data[48];
-    int fd;
+    unsigned char verify[48];
 
     if (!recent_tracks_ready)
         refresh_recent_track_count();
@@ -10694,17 +11156,126 @@ static void write_usb_status_snapshot(void)
     write_u32(data + 40, theme_body);
     write_u32(data + 44, theme_wheel);
 
-    fd = rb->open(RBPREP_USB_STATUS,
-                  O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) {
-        rb->write(fd, data, sizeof(data));
-        rb->close(fd);
+    rbprep_store_ensure_state_dir(rb);
+    return rbprep_store_write_verified(rb, RBPREP_USB_STATUS,
+                                       data, sizeof(data),
+                                       verify, sizeof(verify));
+}
+
+static bool persist_usb_arm_state(void)
+{
+    if (!flush_deferred_edit())
+        return false;
+    if (macro_dirty && !save_tool_macros())
+        return false;
+    if (!save_rbprep_config())
+        return false;
+    return write_usb_status_snapshot();
+}
+
+static void capture_usb_library_context(void)
+{
+    struct rbprep_node_record node;
+
+    usb_library_context_captured = library_fd >= 0;
+    usb_active_playlist_source_id = 0;
+    usb_tree_parent_source_id = 0;
+    if (!usb_library_context_captured)
+        return;
+    if (active_playlist_node >= 0 &&
+        read_node_record(active_playlist_node, &node))
+        usb_active_playlist_source_id = node.source_id;
+    if (tree_parent != RBPREP_ROOT_NODE &&
+        read_node_record(tree_parent, &node))
+        usb_tree_parent_source_id = node.source_id;
+}
+
+static bool refresh_selected_metadata_after_usb(void)
+{
+    struct rbprep_track_record track;
+    char path[MAX_PATH];
+    const char *extension;
+
+    if (!read_track_record(selected_track_index, &track) ||
+        !read_index_string(track.path_offset, path, sizeof(path)))
+        return false;
+    extension = rb->strrchr(path, '.');
+    rb->strlcpy(selected_extension, extension ? extension : "",
+                sizeof(selected_extension));
+    if (!read_index_string(track.title_offset, selected_title,
+                           sizeof(selected_title)) ||
+        !read_index_string(track.artist_offset, selected_artist,
+                           sizeof(selected_artist)) ||
+        !read_index_string(track.genre_offset, selected_genre,
+                           sizeof(selected_genre)))
+        return false;
+    if (!track.key_offset ||
+        !read_index_string(track.key_offset, selected_key,
+                           sizeof(selected_key)))
+        selected_key[0] = '\0';
+    if (!track.comments_offset ||
+        !read_index_string(track.comments_offset, selected_comments,
+                           sizeof(selected_comments)))
+        selected_comments[0] = '\0';
+    track_year = track.year;
+    return true;
+}
+
+static void restore_usb_library_context(bool library_ready)
+{
+    int parent = -1;
+
+    /* Search rows and shuffle permutations contain physical RBI row numbers;
+       never reuse them after the host may have replaced the index. */
+    if (search_result_fd >= 0) {
+        rb->close(search_result_fd);
+        search_result_fd = -1;
+    }
+    search_active = false;
+    collection_shuffle_active = false;
+    search_result_count = 0;
+    active_playlist_node = -1;
+    selected_track_index = -1;
+    playing_track_row = -1;
+    track_selection = track_top = 0;
+
+    if (!library_ready) {
+        tree_parent = RBPREP_ROOT_NODE;
+        tree_child_count = 0;
+        tree_selection = tree_top = 0;
+        track_row_count = 0;
+        invalidate_playlist_cache();
+        return;
+    }
+
+    if (selected_track_id >= 0)
+        selected_track_index = find_track_index_by_id(selected_track_id);
+    if (usb_library_context_captured && usb_tree_parent_source_id)
+        parent = find_node_index_by_source_id(usb_tree_parent_source_id);
+    refresh_tree_children(parent >= 0 ? (uint32_t)parent
+                                      : RBPREP_ROOT_NODE);
+    tree_selection = tree_top = 0;
+
+    if (usb_library_context_captured && usb_active_playlist_source_id)
+        refresh_active_playlist_context(usb_active_playlist_source_id);
+    else {
+        int row = find_track_row_in_collection(selected_track_index);
+
+        track_row_count = library_track_count;
+        if (row >= 0) {
+            playing_track_row = row;
+            track_selection = row;
+            track_top = MAX(0, MIN(row,
+                        MAX(0, track_row_count - RBPREP_LIST_ROWS)));
+        }
     }
 }
 
 static void prepare_rekordpod_for_usb(void *parameter)
 {
     (void)parameter;
+
+    capture_usb_library_context();
 
     /* USB DAC owns the clickwheel while connected. Start from a quiet,
        deterministic gain without permanently replacing the user's normal
@@ -10717,16 +11288,20 @@ static void prepare_rekordpod_for_usb(void *parameter)
     }
 
     stop_editor_audio();
-    flush_deferred_edit();
-    if (macro_dirty)
-        save_tool_macros();
-    save_rbprep_config();
-    write_usb_status_snapshot();
+    usb_persistence_warning = !persist_usb_arm_state();
+    usb_unsaved_edit_valid = usb_persistence_warning && track_edit_dirty &&
+                             pack_current_edit_snapshot(usb_unsaved_edit);
     stop_spectrum_capture();
     restore_playback_rate();
     rbprep_wave_close(&wave_reader);
     rbprep_grid_close(&grid_reader);
     rbprep_wave_index_close(&wave_index);
+#ifdef HAVE_ADJUSTABLE_CPU_FREQ
+    if (deck_cpu_boosted) {
+        rb->cpu_boost(false);
+        deck_cpu_boosted = false;
+    }
+#endif
     set_storage_performance_mode(false);
     if (library_fd >= 0) {
         rb->close(library_fd);
@@ -10745,6 +11320,7 @@ static void prepare_rekordpod_for_usb(void *parameter)
 static void resume_rekordpod_after_usb(void)
 {
     struct mp3entry *id3;
+    bool library_ready;
 
     /* The stock USB screen blocks until disconnect. Resume this plugin in
        place afterwards: restarting through PLUGIN_GOTO_PLUGIN is dependent
@@ -10753,19 +11329,55 @@ static void resume_rekordpod_after_usb(void)
     restore_dac_gain();
     apply_usb_choice(0);
     recent_tracks_ready = false;
-    open_library_index();
-    load_genre_rollup();
+    library_ready = open_library_index();
     load_smart_query_flags();
-    if (search_active) {
-        search_result_fd = rb->open(RBPREP_SEARCH_RESULTS, O_RDONLY);
-        if (search_result_fd < 0) {
-            search_active = false;
-            search_result_count = 0;
-        }
+    restore_usb_library_context(library_ready);
+    load_genre_rollup();
+    if (!library_ready) {
+        rb->splash(HZ * 2, "Library index unavailable");
+        restore_black_canvas();
     }
-    if (selected_track_id >= 0) {
-        load_waveform(selected_track_id);
-        load_latest_edit(selected_track_id);
+    if (library_ready && selected_track_id >= 0 &&
+        (selected_track_index < 0 ||
+         !refresh_selected_metadata_after_usb())) {
+        selected_track_id = -1;
+        selected_title[0] = selected_artist[0] = selected_genre[0] = '\0';
+        selected_key[0] = selected_comments[0] = selected_extension[0] = '\0';
+        clear_analysis();
+        rb->splash(HZ * 2, "Loaded track left the library");
+        restore_black_canvas();
+    } else if (selected_track_id >= 0) {
+        bool resume_after_prepare = false;
+
+        if (!quiesce_audio_for_track_load(&resume_after_prepare)) {
+            clear_analysis();
+            rb->splash(HZ * 2, "Audio pause timed out");
+        } else {
+            bool waveform_loaded = load_waveform(selected_track_id);
+
+            if (waveform_loaded) {
+                load_latest_edit(selected_track_id);
+                if (usb_unsaved_edit_valid &&
+                    (int)read_u32(usb_unsaved_edit + 8) ==
+                    selected_track_id) {
+                    apply_edit_record(usb_unsaved_edit);
+                    track_edit_dirty = true;
+                }
+            }
+            if (resume_after_prepare &&
+                (rb->audio_status() & AUDIO_STATUS_PAUSE))
+                rb->audio_resume();
+            if (!waveform_loaded) {
+                rb->splash(HZ * 2, "Waveform preparation failed");
+                clear_analysis();
+                if (usb_unsaved_edit_valid &&
+                    (int)read_u32(usb_unsaved_edit + 8) ==
+                    selected_track_id) {
+                    apply_edit_record(usb_unsaved_edit);
+                    track_edit_dirty = true;
+                }
+            }
+        }
     }
     /* Never replace an unsaved in-memory workflow after a failed media
        write. A successful pre-USB save clears macro_dirty; otherwise keep
@@ -10779,6 +11391,7 @@ static void resume_rekordpod_after_usb(void)
     load_macro_links();
     refresh_pending_summary();
     set_storage_performance_mode(!display_locked);
+    update_deck_cpu_boost();
     storage_keepalive_deadline = *rb->current_tick + HZ * 30;
     apply_playback_rate();
     if (!display_locked) {
@@ -10795,9 +11408,16 @@ static void resume_rekordpod_after_usb(void)
         playhead = clamp_playhead(id3->elapsed);
     reset_play_clock(playhead, *rb->current_tick);
     usb_selection = usb_armed_selection = 0;
+    usb_library_context_captured = false;
+    usb_unsaved_edit_valid = false;
     overview_dirty = true;
     force_full_redraw = true;
     restore_black_canvas();
+    if (usb_persistence_warning) {
+        rb->splash(HZ * 2, "State save needs retry");
+        usb_persistence_warning = false;
+        restore_black_canvas();
+    }
     rb->button_clear_queue();
 }
 
@@ -10810,6 +11430,17 @@ static bool handle_usb_system_event(int button)
     return true;
 }
 
+static int next_frame_interval(int rate, int *remainder)
+{
+    int ticks;
+
+    rate = MAX(1, rate);
+    *remainder += HZ;
+    ticks = *remainder / rate;
+    *remainder %= rate;
+    return MAX(1, ticks);
+}
+
 enum plugin_status plugin_start(const void *parameter)
 {
     int button;
@@ -10819,6 +11450,8 @@ enum plugin_status plugin_start(const void *parameter)
     bool autoboot_launch = parameter &&
         !rb->strcmp((const char *)parameter, "autoboot");
     long frame_deadline;
+    int frame_rate = 0;
+    int frame_remainder = 0;
     void *beat_workspace;
     void *index_workspace;
 
@@ -10906,9 +11539,7 @@ enum plugin_status plugin_start(const void *parameter)
     cue_audition_latched = false;
     overview_playhead_white = true;
     seek_state = SEEK_IDLE;
-    jog_pitch_active = false;
-    jog_pitch_x100 = 0;
-    jog_pitch_deadline = *rb->current_tick;
+    seek_prepared = false;
 #ifdef HAVE_WHEEL_POSITION
     seek_wheel_touch_position = -1;
     seek_wheel_velocity_fp = 0;
@@ -11006,7 +11637,6 @@ enum plugin_status plugin_start(const void *parameter)
     overview_deadline = *rb->current_tick;
     hud_scroll_deadline = *rb->current_tick;
     status_deadline = *rb->current_tick;
-    wave_index_service_deadline = *rb->current_tick;
     frame_deadline = *rb->current_tick;
     storage_keepalive_deadline = *rb->current_tick + HZ * 30;
 
@@ -11016,6 +11646,8 @@ enum plugin_status plugin_start(const void *parameter)
         struct mp3entry *id3 = rb->audio_current_track();
         if (service_display_lock())
             redraw = true;
+        update_deck_cpu_boost();
+        update_spectrum_capture_state();
         service_storage_keepalive();
         if (selected_track_id >= 0 && id3 && id3->length > 0) {
             track_length = id3->length;
@@ -11055,38 +11687,29 @@ enum plugin_status plugin_start(const void *parameter)
               (!TIME_BEFORE(*rb->current_tick, main_name_scroll_deadline) ||
                main_wheel_motion_active())) ||
              mode >= MODE_DECK || redraw)) {
-            draw_screen();
-            redraw = false;
-            frame_deadline = *rb->current_tick +
-                             (mode >= MODE_DECK
-                              ? MAX(1, HZ / MAX(1, capabilities.deck_fps))
-                                                : RBPREP_MENU_FRAME_TICKS);
-        }
-        if (!display_locked && selected_track_id >= 0 &&
-            seek_state == SEEK_IDLE && rb->button_status() == BUTTON_NONE &&
-            wave_index.stage != RBPREP_WAVE_INDEX_IDLE &&
-            wave_index.stage != RBPREP_WAVE_INDEX_FAILED) {
-            int status = rb->audio_status();
-            bool transport_active = (status & AUDIO_STATUS_PLAY) &&
-                                    !(status & AUDIO_STATUS_PAUSE);
-            long now = *rb->current_tick;
+            long frame_start = *rb->current_tick;
+            int wanted_rate = mode >= MODE_DECK
+                            ? MAX(1, capabilities.deck_fps)
+                            : HZ / RBPREP_MENU_FRAME_TICKS;
+            int interval;
 
-            /* The renderer never reads RBW data. Index construction is the
-               sole background reader; pace it while audio is running so a
-               slow HDD/PATA bridge gets ample time to refill the codec
-               between small slices. Paused decks may finish at full speed. */
-            if (!transport_active ||
-                !TIME_BEFORE(now, wave_index_service_deadline)) {
-                bool complete = rbprep_wave_index_service(&wave_index);
-
-                wave_index_service_deadline = now +
-                    (transport_active ? RBPREP_INDEX_PLAY_TICKS : 1);
-                if (complete) {
-                    waveform_columns_valid = false;
-                    overview_dirty = true;
-                    redraw = true;
-                }
+            if (wanted_rate != frame_rate) {
+                frame_rate = wanted_rate;
+                frame_remainder = 0;
             }
+            interval = next_frame_interval(frame_rate, &frame_remainder);
+            draw_screen();
+            {
+                unsigned long duration = *rb->current_tick - frame_start;
+
+                maximum_frame_ticks = MAX(maximum_frame_ticks, duration);
+                if (duration > (unsigned long)interval)
+                    late_frame_count++;
+            }
+            redraw = false;
+            frame_deadline += interval;
+            if (TIME_BEFORE(frame_deadline, *rb->current_tick + 1))
+                frame_deadline = *rb->current_tick + 1;
         }
         button = rb->button_get_w_tmo(display_locked ? MAX(1, HZ / 20) : 1);
         if (button != BUTTON_NONE)

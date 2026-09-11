@@ -16,6 +16,15 @@ static bool read_exact(const struct plugin_api *api, int fd,
     return true;
 }
 
+static void invalidate_pages(struct rbprep_wave_reader *reader)
+{
+    int page;
+
+    reader->fully_cached = false;
+    for (page = 0; page < reader->page_count; page++)
+        reader->pages[page].valid = false;
+}
+
 void rbprep_wave_init(struct rbprep_wave_reader *reader,
                       const struct plugin_api *api, void *workspace,
                       size_t workspace_bytes, size_t io_slice_bytes)
@@ -45,15 +54,12 @@ void rbprep_wave_init(struct rbprep_wave_reader *reader,
 
 void rbprep_wave_close(struct rbprep_wave_reader *reader)
 {
-    int page;
-
     if (reader->fd >= 0)
         reader->api->close(reader->fd);
     reader->fd = -1;
     reader->point_count = 0;
     reader->stamp = 0;
-    for (page = 0; page < reader->page_count; page++)
-        reader->pages[page].valid = false;
+    invalidate_pages(reader);
 }
 
 bool rbprep_wave_open(struct rbprep_wave_reader *reader, const char *path,
@@ -72,11 +78,24 @@ bool rbprep_wave_open(struct rbprep_wave_reader *reader, const char *path,
     return true;
 }
 
-static struct rbprep_wave_page *find_page(struct rbprep_wave_reader *reader,
-                                           uint32_t index)
+static struct rbprep_wave_page *find_cached_page(
+    struct rbprep_wave_reader *reader, uint32_t index)
 {
-    struct rbprep_wave_page *victim = NULL;
+    uint32_t points_per_page = reader->page_bytes /
+                               RBPREP_WAVE_SAMPLE_BYTES;
     int page;
+
+    if (reader->fully_cached && points_per_page > 0) {
+        page = index / points_per_page;
+        if (page < reader->page_count && reader->pages[page].valid &&
+            index >= reader->pages[page].first &&
+            index - reader->pages[page].first <
+                reader->pages[page].count) {
+            reader->pages[page].stamp = ++reader->stamp;
+            reader->cache_hits++;
+            return &reader->pages[page];
+        }
+    }
 
     for (page = 0; page < reader->page_count; page++) {
         struct rbprep_wave_page *candidate = &reader->pages[page];
@@ -87,8 +106,22 @@ static struct rbprep_wave_page *find_page(struct rbprep_wave_reader *reader,
             reader->cache_hits++;
             return candidate;
         }
-        if (!victim || !candidate->valid ||
-            (victim->valid && candidate->stamp < victim->stamp))
+    }
+    return NULL;
+}
+
+static struct rbprep_wave_page *find_victim(
+    struct rbprep_wave_reader *reader)
+{
+    struct rbprep_wave_page *victim = NULL;
+    int page;
+
+    for (page = 0; page < reader->page_count; page++) {
+        struct rbprep_wave_page *candidate = &reader->pages[page];
+
+        if (!candidate->valid)
+            return candidate;
+        if (!victim || candidate->stamp < victim->stamp)
             victim = candidate;
     }
     return victim;
@@ -104,6 +137,7 @@ static bool load_page(struct rbprep_wave_reader *reader,
     off_t offset = reader->data_offset +
                    (off_t)first * RBPREP_WAVE_SAMPLE_BYTES;
 
+    reader->fully_cached = false;
     page->valid = false;
     if (reader->api->lseek(reader->fd, offset, SEEK_SET) < 0 ||
         !read_exact(reader->api, reader->fd, page->data,
@@ -117,25 +151,130 @@ static bool load_page(struct rbprep_wave_reader *reader,
     return true;
 }
 
-bool rbprep_wave_sample_at(struct rbprep_wave_reader *reader, uint32_t index,
-                           struct rbprep_wave_sample *sample)
+static void copy_sample(const struct rbprep_wave_page *page, uint32_t index,
+                        struct rbprep_wave_sample *sample)
 {
-    struct rbprep_wave_page *page;
-    const unsigned char *source;
+    const unsigned char *source = page->data +
+        (index - page->first) * RBPREP_WAVE_SAMPLE_BYTES;
 
-    if (reader->fd < 0 || index >= reader->point_count)
-        return false;
-    page = find_page(reader, index);
-    if (!page || !(page->valid && index >= page->first &&
-                   index - page->first < page->count)) {
-        if (!page || !load_page(reader, page, index))
-            return false;
-    }
-    source = page->data + (index - page->first) * RBPREP_WAVE_SAMPLE_BYTES;
     sample->amplitude = source[0];
     sample->red = source[1];
     sample->green = source[2];
     sample->blue = source[3];
+}
+
+bool rbprep_wave_cache_all(struct rbprep_wave_reader *reader)
+{
+    uint32_t points_per_page;
+    uint32_t first;
+    int page;
+
+    if (reader->fd < 0 || !reader->point_count || !reader->page_bytes)
+        return false;
+    if (reader->fully_cached)
+        return true;
+    if (rbprep_wave_resident_points(reader) < reader->point_count)
+        return false;
+
+    invalidate_pages(reader);
+    if (reader->api->lseek(reader->fd, reader->data_offset, SEEK_SET) < 0)
+        return false;
+
+    points_per_page = reader->page_bytes / RBPREP_WAVE_SAMPLE_BYTES;
+    first = 0;
+    page = 0;
+    while (first < reader->point_count && page < reader->page_count) {
+        struct rbprep_wave_page *target = &reader->pages[page];
+        uint32_t count = MIN(points_per_page,
+                             reader->point_count - first);
+
+        if (!read_exact(reader->api, reader->fd, target->data,
+                        count * RBPREP_WAVE_SAMPLE_BYTES)) {
+            invalidate_pages(reader);
+            return false;
+        }
+        target->first = first;
+        target->count = count;
+        target->stamp = ++reader->stamp;
+        target->valid = true;
+        reader->cache_misses++;
+        first += count;
+        page++;
+    }
+    if (first != reader->point_count) {
+        invalidate_pages(reader);
+        return false;
+    }
+    reader->fully_cached = true;
+    return true;
+}
+
+bool rbprep_wave_range_cached(const struct rbprep_wave_reader *reader,
+                              uint32_t first, uint32_t count)
+{
+    uint32_t cursor;
+    uint32_t end;
+
+    if (reader->fd < 0 || first > reader->point_count ||
+        count > reader->point_count - first)
+        return false;
+    if (!count || reader->fully_cached)
+        return true;
+
+    cursor = first;
+    end = first + count;
+    while (cursor < end) {
+        bool found = false;
+        int page;
+
+        for (page = 0; page < reader->page_count; page++) {
+            const struct rbprep_wave_page *candidate =
+                &reader->pages[page];
+
+            if (candidate->valid && cursor >= candidate->first &&
+                cursor - candidate->first < candidate->count) {
+                uint32_t page_end = candidate->first + candidate->count;
+
+                cursor = MIN(end, page_end);
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+bool rbprep_wave_sample_cached(struct rbprep_wave_reader *reader,
+                               uint32_t index,
+                               struct rbprep_wave_sample *sample)
+{
+    struct rbprep_wave_page *page;
+
+    if (reader->fd < 0 || index >= reader->point_count)
+        return false;
+    page = find_cached_page(reader, index);
+    if (!page)
+        return false;
+
+    copy_sample(page, index, sample);
+    return true;
+}
+
+bool rbprep_wave_sample_at(struct rbprep_wave_reader *reader, uint32_t index,
+                           struct rbprep_wave_sample *sample)
+{
+    struct rbprep_wave_page *page;
+
+    if (reader->fd < 0 || index >= reader->point_count)
+        return false;
+    if (rbprep_wave_sample_cached(reader, index, sample))
+        return true;
+    page = find_victim(reader);
+    if (!page || !load_page(reader, page, index))
+        return false;
+    copy_sample(page, index, sample);
     return true;
 }
 

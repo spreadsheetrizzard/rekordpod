@@ -20,16 +20,19 @@ void rbprep_caps_detect(struct rbprep_caps *caps,
 
 #if defined(IPOD_6G) || CONFIG_CPU == S5L8702
     caps->device_class = RBPREP_DEVICE_CLASSIC;
+    /* The largest RBW waveform is 131072 four-byte samples.  Keep the
+       complete raw waveform resident so deck drawing never has to read it
+       from storage after playback starts. */
     caps->waveform_cache_bytes = bounded_fraction(
-        available, 192u * KIBIBYTE, 64u * KIBIBYTE);
-    caps->beat_cache_bytes = 8u * KIBIBYTE;
+        available, 512u * KIBIBYTE, 64u * KIBIBYTE);
+    /* The maximum 16384-entry beat grid uses eight bytes per entry. */
+    caps->beat_cache_bytes = 128u * KIBIBYTE;
     /* A five-level, two-point-base peak pyramid for the maximum 131072-point
        analysis occupies about 343 KiB. It is resident while drawing, which
        restores high-definition 64x/128x views without live storage reads. */
     caps->waveform_index_bytes = 384u * KIBIBYTE;
-    /* Keep synchronous high-zoom cache fills below a single visible frame.
-       The larger workspace remains an LRU window; only each I/O slice is
-       reduced for flash/HDD adapters with poor long-read latency. */
+    /* Fill the resident cache in bounded chunks before playback rather than
+       issuing a single large read on slow flash/HDD adapters. */
     caps->io_slice_bytes = 8u * KIBIBYTE;
     caps->deck_fps = 30;
     caps->visualizer_fps = 20;
@@ -40,10 +43,17 @@ void rbprep_caps_detect(struct rbprep_caps *caps,
 #endif
 #else
     caps->device_class = RBPREP_DEVICE_VIDEO;
+    /* Preserve the complete coarse RBX pyramid first, then the raw waveform
+       window. Use all remaining plugin workspace (up to the declared 16384
+       beats) for an imported grid instead of silently limiting most tracks to
+       512 beats. */
+    caps->waveform_index_bytes = bounded_fraction(
+        available, 48u * KIBIBYTE, 0);
     caps->waveform_cache_bytes = bounded_fraction(
-        available, 32u * KIBIBYTE, 48u * KIBIBYTE);
-    caps->beat_cache_bytes = 4u * KIBIBYTE;
-    caps->waveform_index_bytes = 48u * KIBIBYTE;
+        available, 32u * KIBIBYTE, caps->waveform_index_bytes);
+    caps->beat_cache_bytes = bounded_fraction(
+        available, 128u * KIBIBYTE,
+        caps->waveform_index_bytes + caps->waveform_cache_bytes);
     caps->io_slice_bytes = 4u * KIBIBYTE;
     caps->deck_fps = 20;
     caps->visualizer_fps = 12;
