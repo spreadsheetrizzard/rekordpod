@@ -5,7 +5,18 @@
 #include "rbprep_wave.h"
 
 #define RBPREP_WAVE_INDEX_OVERVIEW 320
+
+/* The Classic has enough RAM to keep a substantially finer peak pyramid.
+   Its two-point base level gives 64x/128x zoom near-source detail without
+   touching the RBW file from the animation path. Keep the smaller four-level
+   index on the Video so the plugin remains inside its tighter memory budget. */
+#if defined(IPOD_6G) || CONFIG_CPU == S5L8702
+#define RBPREP_WAVE_INDEX_FINE 1
+#define RBPREP_WAVE_INDEX_LEVELS 5
+#else
+#define RBPREP_WAVE_INDEX_FINE 0
 #define RBPREP_WAVE_INDEX_LEVELS 4
+#endif
 
 enum rbprep_wave_index_stage {
     RBPREP_WAVE_INDEX_IDLE,

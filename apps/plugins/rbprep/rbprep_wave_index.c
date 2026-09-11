@@ -1,11 +1,19 @@
 #include "rbprep_wave_index.h"
 
 #define RBX_HEADER_SIZE 64
+#if RBPREP_WAVE_INDEX_FINE
+#define RBX_VERSION 2
+#else
 #define RBX_VERSION 1
+#endif
 #define RBX_DIR "/.rockbox/rbprep/wave-index"
 
 static const uint16_t level_blocks[RBPREP_WAVE_INDEX_LEVELS] = {
+#if RBPREP_WAVE_INDEX_FINE
+    2, 8, 32, 128, 512
+#else
     16, 64, 256, 1024
+#endif
 };
 
 static uint16_t read_u16(const unsigned char *data)
@@ -464,9 +472,10 @@ bool rbprep_wave_index_range_peak(const struct rbprep_wave_index *index,
             break;
     }
     /* During active playback the UI never touches the raw RBW stream. For a
-       zoom level finer than the smallest summary bucket, repeat that 16-point
-       bucket across adjacent pixels. Paused/scrubbed views may replace it
-       with exact raw detail without competing with Rockbox's codec reads. */
+       zoom level finer than the smallest summary bucket, repeat that bucket
+       across adjacent pixels. Classic uses two-point buckets, so 64x/128x
+       retain near-source detail; Video intentionally keeps 16-point buckets.
+       Paused views may still replace either with exact cached RBW detail. */
     if (level < 0)
         level = 0;
     first = begin / level_blocks[level];

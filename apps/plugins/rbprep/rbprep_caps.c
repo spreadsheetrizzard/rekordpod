@@ -23,7 +23,10 @@ void rbprep_caps_detect(struct rbprep_caps *caps,
     caps->waveform_cache_bytes = bounded_fraction(
         available, 192u * KIBIBYTE, 64u * KIBIBYTE);
     caps->beat_cache_bytes = 8u * KIBIBYTE;
-    caps->waveform_index_bytes = 48u * KIBIBYTE;
+    /* A five-level, two-point-base peak pyramid for the maximum 131072-point
+       analysis occupies about 343 KiB. It is resident while drawing, which
+       restores high-definition 64x/128x views without live storage reads. */
+    caps->waveform_index_bytes = 384u * KIBIBYTE;
     /* Keep synchronous high-zoom cache fills below a single visible frame.
        The larger workspace remains an LRU window; only each I/O slice is
        reduced for flash/HDD adapters with poor long-read latency. */

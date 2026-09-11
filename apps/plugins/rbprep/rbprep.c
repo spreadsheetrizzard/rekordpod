@@ -55,6 +55,7 @@
 #define RBPREP_MENU_FRAME_TICKS MAX(1, HZ / 25)
 #define RBPREP_HUD_SCROLL_TICKS MAX(1, HZ / 10)
 #define RBPREP_STATUS_TICKS MAX(1, HZ)
+#define RBPREP_INDEX_PLAY_TICKS MAX(1, HZ / 4)
 #define RBPREP_CONFIG_VERSION 4
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
 #define RBPREP_DEVICE_NAME_FILE "/.rockbox/rbprep/device-name.txt"
@@ -286,6 +287,7 @@ static bool overview_dirty = true;
 static long overview_deadline;
 static long hud_scroll_deadline;
 static long status_deadline;
+static long wave_index_service_deadline;
 static int title_scroll_px;
 static int metadata_scroll_px;
 static bool hud_scroll_active;
@@ -3736,6 +3738,121 @@ static void draw_turntable_headshell(int style, int stylus_x, int stylus_y)
     rb->lcd_drawpixel(stylus_x - 1, stylus_y + 4);
 }
 
+static void fill_axis_quad(int x0, int y0, int x1, int y1,
+                           int half_width, int color)
+{
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int major = MAX(ABS(dx), ABS(dy));
+    int minor = MIN(ABS(dx), ABS(dy));
+    int length = MAX(1, major + minor / 2);
+    int px = -dy * half_width / length;
+    int py = dx * half_width / length;
+
+    rb->lcd_set_foreground(color);
+    xlcd_filltriangle(x0 + px, y0 + py, x1 + px, y1 + py,
+                      x1 - px, y1 - py);
+    xlcd_filltriangle(x0 + px, y0 + py, x1 - px, y1 - py,
+                      x0 - px, y0 - py);
+}
+
+static void draw_phase_module(int cx, int cy, int angle)
+{
+    int tx = -wheel_sine[angle];
+    int ty = wheel_cosine[angle];
+    int rx = wheel_cosine[angle];
+    int ry = wheel_sine[angle];
+    int outer_x0 = cx - tx * 7 / 256;
+    int outer_y0 = cy - ty * 7 / 256;
+    int outer_x1 = cx + tx * 7 / 256;
+    int outer_y1 = cy + ty * 7 / 256;
+    int inner_x0 = cx - tx * 6 / 256;
+    int inner_y0 = cy - ty * 6 / 256;
+    int inner_x1 = cx + tx * 6 / 256;
+    int inner_y1 = cy + ty * 6 / 256;
+    int led_x0 = cx - tx * 4 / 256;
+    int led_y0 = cy - ty * 4 / 256;
+    int led_x1 = cx + tx * 4 / 256;
+    int led_y1 = cy + ty * 4 / 256;
+
+    /* Phase remote: white perimeter, solid black shell, and the familiar
+       white inner LED strip. It remains tangent to the spinning groove. */
+    fill_axis_quad(outer_x0, outer_y0, outer_x1, outer_y1, 3, LCD_WHITE);
+    fill_axis_quad(inner_x0, inner_y0, inner_x1, inner_y1, 2, LCD_BLACK);
+    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_drawline(led_x0, led_y0, led_x1, led_y1);
+    rb->lcd_drawline(led_x0 + rx / 256, led_y0 + ry / 256,
+                     led_x1 + rx / 256, led_y1 + ry / 256);
+}
+
+static void draw_turntable_pitch_fader(void)
+{
+    int fader_x = 198;
+    int fader_top = RBPREP_WAVE_TOP + 51;
+    int fader_bottom = RBPREP_WAVE_BOTTOM - 18;
+    int fader_center = (fader_top + fader_bottom) / 2;
+    int fader_travel = MAX(1, (fader_bottom - fader_top) / 2 - 2);
+    int pitch_slider_y;
+    int tick;
+
+    text(fader_x + 7, fader_top - 13, "+", LCD_RGBPACK(105, 118, 110));
+    text(fader_x + 7, fader_bottom - 5, "-", LCD_RGBPACK(105, 118, 110));
+    rb->lcd_set_foreground(LCD_RGBPACK(32, 38, 34));
+    rb->lcd_fillrect(fader_x - 4, fader_top - 2, 9,
+                     fader_bottom - fader_top + 5);
+    rb->lcd_set_foreground(LCD_RGBPACK(100, 111, 104));
+    rb->lcd_vline(fader_x, fader_top, fader_bottom);
+    for (tick = fader_top; tick <= fader_bottom; tick += 8)
+        rb->lcd_hline(fader_x - 3, fader_x + 3, tick);
+    rb->lcd_hline(fader_x - 6, fader_x + 6, fader_center);
+    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_hline(fader_x - 7, fader_x + 7, fader_center);
+    pitch_slider_y = fader_center -
+                     pitch_bend_x100 * fader_travel / 1600;
+    rb->lcd_set_foreground(RBPREP_GREEN);
+    rb->lcd_fillrect(fader_x - 7, pitch_slider_y - 2, 15, 5);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_hline(fader_x - 5, fader_x + 5, pitch_slider_y);
+}
+
+static void draw_turntable_counterweight(int pivot_x, int pivot_y,
+                                         int front_dx, int front_dy)
+{
+    int major = MAX(ABS(front_dx), ABS(front_dy));
+    int minor = MIN(ABS(front_dx), ABS(front_dy));
+    int length = MAX(1, major + minor / 2);
+    int ux = front_dx * 256 / length;
+    int uy = front_dy * 256 / length;
+    int stub_x = pivot_x - ux * 27 / 256;
+    int stub_y = pivot_y - uy * 27 / 256;
+    int weight_x0 = pivot_x - ux * 13 / 256;
+    int weight_y0 = pivot_y - uy * 13 / 256;
+    int weight_x1 = pivot_x - ux * 27 / 256;
+    int weight_y1 = pivot_y - uy * 27 / 256;
+    int band_x = pivot_x - ux * 20 / 256;
+    int band_y = pivot_y - uy * 20 / 256;
+    int px = -uy * 5 / 256;
+    int py = ux * 5 / 256;
+
+    /* The rear stub and weight share the arm's live axis. Parking or moving
+       the stylus therefore rotates the counterweight as one rigid assembly. */
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_drawline(pivot_x, pivot_y, stub_x, stub_y);
+    rb->lcd_drawline(pivot_x + 1, pivot_y, stub_x + 1, stub_y);
+    rb->lcd_set_foreground(LCD_RGBPACK(184, 191, 187));
+    rb->lcd_drawline(pivot_x, pivot_y - 1, stub_x, stub_y - 1);
+    fill_axis_quad(weight_x0, weight_y0, weight_x1, weight_y1, 7,
+                   LCD_BLACK);
+    fill_axis_quad(weight_x0, weight_y0, weight_x1, weight_y1, 5,
+                   LCD_RGBPACK(94, 102, 97));
+    rb->lcd_set_foreground(LCD_RGBPACK(196, 202, 198));
+    rb->lcd_drawline(band_x - px, band_y - py,
+                     band_x + px, band_y + py);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_drawline(weight_x1 - px, weight_y1 - py,
+                     weight_x1 + px, weight_y1 + py);
+}
+
 static void draw_turntable(void)
 {
     static const int target_rpm_x100[] = { 3333, 4500, 7800 };
@@ -3755,7 +3872,6 @@ static void draw_turntable(void)
     int arm_mid1_y;
     int arm_mid2_x;
     int arm_mid2_y;
-    int pitch_slider_y;
     int previous_x = cx;
     int previous_y = cy;
     char line[48];
@@ -3871,39 +3987,17 @@ static void draw_turntable(void)
         int remote_angle = (phase + 10) & 63;
         int remote_x = cx + wheel_cosine[remote_angle] * 29 / 256;
         int remote_y = cy + wheel_sine[remote_angle] * 29 / 256;
-        int tangent_x = -wheel_sine[remote_angle] * 6 / 256;
-        int tangent_y = wheel_cosine[remote_angle] * 6 / 256;
-        int radial_x = wheel_cosine[remote_angle] * 2 / 256;
-        int radial_y = wheel_sine[remote_angle] * 2 / 256;
 
-        rb->lcd_set_foreground(LCD_BLACK);
-        rb->lcd_drawline(remote_x - tangent_x - radial_x,
-                         remote_y - tangent_y - radial_y,
-                         remote_x + tangent_x - radial_x,
-                         remote_y + tangent_y - radial_y);
-        rb->lcd_drawline(remote_x - tangent_x,
-                         remote_y - tangent_y,
-                         remote_x + tangent_x,
-                         remote_y + tangent_y);
-        rb->lcd_drawline(remote_x - tangent_x + radial_x,
-                         remote_y - tangent_y + radial_y,
-                         remote_x + tangent_x + radial_x,
-                         remote_y + tangent_y + radial_y);
-        rb->lcd_set_foreground(LCD_WHITE);
-        rb->lcd_drawline(remote_x - tangent_x,
-                         remote_y - tangent_y,
-                         remote_x + tangent_x,
-                         remote_y + tangent_y);
-        rb->lcd_set_foreground(RBPREP_GREEN);
-        rb->lcd_drawpixel(remote_x, remote_y);
-        rb->lcd_set_foreground(LCD_RGBPACK(255, 55, 45));
-        rb->lcd_drawpixel(remote_x + tangent_x,
-                          remote_y + tangent_y);
+        draw_phase_module(remote_x, remote_y, remote_angle);
     }
     rb->lcd_set_foreground(LCD_BLACK);
     xlcd_fillcircle(cx, cy, 2);
     rb->lcd_set_foreground(LCD_RGBPACK(225, 230, 226));
     rb->lcd_drawpixel(cx, cy);
+
+    /* Controls belong to the chassis, beneath the mechanical arm assembly.
+       Drawing the fader first lets the parked arm cross it naturally. */
+    draw_turntable_pitch_fader();
 
     /* A real tonearm moves inward over the full side.  The stylus follows a
        fixed pickup angle while its groove radius falls from 56 to 34 pixels. */
@@ -3936,6 +4030,9 @@ static void draw_turntable(void)
             arm_mid2_x -= 5;
         }
     }
+    draw_turntable_counterweight(192, RBPREP_WAVE_TOP + 30,
+                                 arm_mid1_x - 192,
+                                 arm_mid1_y - (RBPREP_WAVE_TOP + 30));
     /* A three-pixel brushed-metal tube reads much more like the curved arm
        on a real deck than a single, computer-perfect line. */
     rb->lcd_set_foreground(LCD_RGBPACK(67, 73, 69));
@@ -3979,35 +4076,6 @@ static void draw_turntable(void)
     xlcd_fillcircle(192, RBPREP_WAVE_TOP + 30, 10);
     rb->lcd_set_foreground(LCD_BLACK);
     xlcd_fillcircle(192, RBPREP_WAVE_TOP + 30, 4);
-    /* Rear arm stub and a shaded, banded cylindrical counterweight. */
-    rb->lcd_set_foreground(LCD_BLACK);
-    rb->lcd_drawline(197, RBPREP_WAVE_TOP + 23,
-                     207, RBPREP_WAVE_TOP + 13);
-    rb->lcd_drawline(198, RBPREP_WAVE_TOP + 24,
-                     208, RBPREP_WAVE_TOP + 14);
-    rb->lcd_set_foreground(LCD_RGBPACK(168, 176, 171));
-    rb->lcd_drawline(198, RBPREP_WAVE_TOP + 23,
-                     208, RBPREP_WAVE_TOP + 13);
-    rb->lcd_set_foreground(LCD_BLACK);
-    xlcd_fillcircle(209, RBPREP_WAVE_TOP + 11, 6);
-    xlcd_fillcircle(213, RBPREP_WAVE_TOP + 7, 5);
-    rb->lcd_drawline(204, RBPREP_WAVE_TOP + 14,
-                     215, RBPREP_WAVE_TOP + 3);
-    rb->lcd_drawline(206, RBPREP_WAVE_TOP + 16,
-                     217, RBPREP_WAVE_TOP + 5);
-    rb->lcd_set_foreground(LCD_RGBPACK(92, 99, 95));
-    xlcd_fillcircle(209, RBPREP_WAVE_TOP + 11, 4);
-    xlcd_fillcircle(213, RBPREP_WAVE_TOP + 7, 3);
-    rb->lcd_drawline(206, RBPREP_WAVE_TOP + 14,
-                     215, RBPREP_WAVE_TOP + 5);
-    rb->lcd_drawline(207, RBPREP_WAVE_TOP + 15,
-                     216, RBPREP_WAVE_TOP + 6);
-    rb->lcd_set_foreground(LCD_RGBPACK(185, 192, 188));
-    rb->lcd_drawline(206, RBPREP_WAVE_TOP + 11,
-                     212, RBPREP_WAVE_TOP + 5);
-    rb->lcd_set_foreground(LCD_BLACK);
-    rb->lcd_drawline(211, RBPREP_WAVE_TOP + 12,
-                     216, RBPREP_WAVE_TOP + 7);
 
     /* Angled target lamp housing and beam point directly at the red strobe
        section instead of floating vertically beside the platter. */
@@ -4060,36 +4128,6 @@ static void draw_turntable(void)
         rb->lcd_fillrect(x, RBPREP_WAVE_BOTTOM - 12, 16, 7);
         text(x + 1, RBPREP_WAVE_BOTTOM - 12, rpm_styles[point],
              selected ? LCD_BLACK : LCD_RGBPACK(145, 158, 149));
-    }
-
-    /* Put the pitch fader immediately beside and below the tonearm base, as on
-       a real SL-1200.  The zero detent remains geometrically exact. */
-    {
-        int fader_x = 198;
-        int fader_top = RBPREP_WAVE_TOP + 51;
-        int fader_bottom = RBPREP_WAVE_BOTTOM - 18;
-        int fader_center = (fader_top + fader_bottom) / 2;
-        int fader_travel = MAX(1, (fader_bottom - fader_top) / 2 - 2);
-        int tick;
-
-        text(fader_x + 7, fader_top - 13, "+", LCD_RGBPACK(105, 118, 110));
-        text(fader_x + 7, fader_bottom - 5, "-", LCD_RGBPACK(105, 118, 110));
-        rb->lcd_set_foreground(LCD_RGBPACK(32, 38, 34));
-        rb->lcd_fillrect(fader_x - 4, fader_top - 2, 9,
-                         fader_bottom - fader_top + 5);
-        rb->lcd_set_foreground(LCD_RGBPACK(100, 111, 104));
-        rb->lcd_vline(fader_x, fader_top, fader_bottom);
-        for (tick = fader_top; tick <= fader_bottom; tick += 8)
-            rb->lcd_hline(fader_x - 3, fader_x + 3, tick);
-        rb->lcd_hline(fader_x - 6, fader_x + 6, fader_center);
-        rb->lcd_set_foreground(LCD_WHITE);
-        rb->lcd_hline(fader_x - 7, fader_x + 7, fader_center);
-        pitch_slider_y = fader_center -
-                         pitch_bend_x100 * fader_travel / 1600;
-        rb->lcd_set_foreground(RBPREP_GREEN);
-        rb->lcd_fillrect(fader_x - 7, pitch_slider_y - 2, 15, 5);
-        rb->lcd_set_foreground(LCD_BLACK);
-        rb->lcd_hline(fader_x - 5, fader_x + 5, pitch_slider_y);
     }
 
     /* Metrics live in a discrete instrument box instead of floating around
@@ -10737,6 +10775,7 @@ enum plugin_status plugin_start(const void *parameter)
     overview_deadline = *rb->current_tick;
     hud_scroll_deadline = *rb->current_tick;
     status_deadline = *rb->current_tick;
+    wave_index_service_deadline = *rb->current_tick;
     frame_deadline = *rb->current_tick;
     storage_keepalive_deadline = *rb->current_tick + HZ * 30;
 
@@ -10794,13 +10833,29 @@ enum plugin_status plugin_start(const void *parameter)
         }
         if (!display_locked && selected_track_id >= 0 &&
             seek_state == SEEK_IDLE && rb->button_status() == BUTTON_NONE &&
-            (!((rb->audio_status() & AUDIO_STATUS_PLAY) &&
-               !(rb->audio_status() & AUDIO_STATUS_PAUSE)) ||
-             !wave_index.valid) &&
-            rbprep_wave_index_service(&wave_index)) {
-            waveform_columns_valid = false;
-            overview_dirty = true;
-            redraw = true;
+            wave_index.stage != RBPREP_WAVE_INDEX_IDLE &&
+            wave_index.stage != RBPREP_WAVE_INDEX_FAILED) {
+            int status = rb->audio_status();
+            bool transport_active = (status & AUDIO_STATUS_PLAY) &&
+                                    !(status & AUDIO_STATUS_PAUSE);
+            long now = *rb->current_tick;
+
+            /* The renderer never reads RBW data. Index construction is the
+               sole background reader; pace it while audio is running so a
+               slow HDD/PATA bridge gets ample time to refill the codec
+               between small slices. Paused decks may finish at full speed. */
+            if (!transport_active ||
+                !TIME_BEFORE(now, wave_index_service_deadline)) {
+                bool complete = rbprep_wave_index_service(&wave_index);
+
+                wave_index_service_deadline = now +
+                    (transport_active ? RBPREP_INDEX_PLAY_TICKS : 1);
+                if (complete) {
+                    waveform_columns_valid = false;
+                    overview_dirty = true;
+                    redraw = true;
+                }
+            }
         }
         button = rb->button_get_w_tmo(display_locked ? MAX(1, HZ / 20) : 1);
         if (button != BUTTON_NONE)
