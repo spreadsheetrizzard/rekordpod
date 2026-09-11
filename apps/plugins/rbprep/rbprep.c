@@ -88,6 +88,8 @@
 #define RBPREP_GREEN_DIM theme_accent_dim
 #define RBPREP_MENU_TEXT LCD_RGBPACK(188, 205, 193)
 #define RBPREP_TOOL_PAGE_MAX 4
+#define RBPREP_HIGH_RES_WINDOW_WIDTH 112
+#define RBPREP_WHEEL_ARM_UNITS 3
 #define RBPREP_MACRO_COUNT 2
 #define RBPREP_MACRO_STEPS 48
 #define RBPREP_MACRO_LEGACY_STEPS 24
@@ -508,7 +510,9 @@ static long seek_applied_tick;
 static int seek_wheel_touch_position;
 static int seek_wheel_velocity_fp;
 static int seek_wheel_delta_fp;
+static int seek_wheel_arm_delta;
 static bool seek_wheel_gesture_tracked;
+static bool seek_wheel_blocked_until_release;
 static long seek_wheel_motion_tick;
 #endif
 static int play_clock_anchor;
@@ -3291,11 +3295,27 @@ static void rebuild_waveform_columns(int first, int span)
     bool active_raw_fallback = transport_active && !wave_index.valid &&
                  capabilities.device_class == RBPREP_DEVICE_CLASSIC &&
                  wave_reader.fully_cached;
+    /* At the close 32x-128x scales, replace only the center 112 columns with
+       exact peaks from the Classic's fully resident RBW cache.  The outer
+       columns stay on the resident multi-resolution index.  This restores a
+       moving inspection window without any deck-time file access or the CPU
+       cost of rescanning the entire viewport every frame. */
+    bool high_res_window = transport_active && wave_index.valid &&
+                 capabilities.device_class == RBPREP_DEVICE_CLASSIC &&
+                 wave_reader.fully_cached && zoom >= 32 &&
+                 samples_per_column < 16 && cached_end > cached_begin &&
+                 rbprep_wave_range_cached(&wave_reader, cached_begin,
+                                          cached_end - cached_begin);
     bool exact = (!transport_active || active_raw_fallback) &&
                  samples_per_column < 16 &&
                  cached_end > cached_begin &&
                  rbprep_wave_range_cached(&wave_reader, cached_begin,
                                           cached_end - cached_begin);
+    bool exact_profile = exact || high_res_window;
+    int high_res_width = MIN(RBPREP_DECK_WIDTH,
+                             RBPREP_HIGH_RES_WINDOW_WIDTH);
+    int high_res_left = (RBPREP_DECK_WIDTH - high_res_width) / 2;
+    int high_res_right = high_res_left + high_res_width;
     int source = first;
     int source_step = span / RBPREP_DECK_WIDTH;
     int source_remainder = span % RBPREP_DECK_WIDTH;
@@ -3303,7 +3323,8 @@ static void rebuild_waveform_columns(int first, int span)
     int x;
 
     if (waveform_columns_valid && first == waveform_column_first &&
-        span == waveform_column_span && exact == waveform_columns_exact)
+        span == waveform_column_span &&
+        exact_profile == waveform_columns_exact)
         return;
 
     for (x = 0; x < RBPREP_DECK_WIDTH; x++) {
@@ -3311,6 +3332,8 @@ static void rebuild_waveform_columns(int first, int span)
         int end;
         struct rbprep_wave_sample peak;
         int index;
+        bool exact_column = exact ||
+            (high_res_window && x >= high_res_left && x < high_res_right);
 
         /* Bresenham-style source stepping exactly partitions the viewport with
            one division per frame instead of two 64-bit divisions per column. */
@@ -3330,7 +3353,7 @@ static void rebuild_waveform_columns(int first, int span)
             end = begin + 1;
         end = MIN(end, waveform_points);
 
-        if (exact) {
+        if (exact_column) {
             if (!rbprep_wave_sample_cached(&wave_reader, begin, &peak))
                 continue;
             for (index = begin + 1; index < end; index++) {
@@ -3357,7 +3380,7 @@ static void rebuild_waveform_columns(int first, int span)
     }
     waveform_column_first = first;
     waveform_column_span = span;
-    waveform_columns_exact = exact;
+    waveform_columns_exact = exact_profile;
     waveform_columns_valid = true;
 }
 
@@ -9063,8 +9086,11 @@ static bool seek_wheel_event_owned(void)
 static bool service_seek_wheel_physics(void)
 {
     const int maximum_velocity = 120000 * 256;
+    const int cardinal_buttons = BUTTON_LEFT | BUTTON_RIGHT |
+                                 BUTTON_MENU | BUTTON_PLAY;
     long now = *rb->current_tick;
     long elapsed = now - seek_wheel_motion_tick;
+    int button_state = rb->button_status();
     int position = rb->wheel_status();
     int movement_fp = 0;
     bool changed = false;
@@ -9073,7 +9099,26 @@ static bool service_seek_wheel_physics(void)
         seek_wheel_touch_position = -1;
         seek_wheel_velocity_fp = 0;
         seek_wheel_delta_fp = 0;
+        seek_wheel_arm_delta = 0;
         seek_wheel_gesture_tracked = false;
+        seek_wheel_blocked_until_release = false;
+        seek_wheel_motion_tick = now;
+        return false;
+    }
+    /* A cardinal click necessarily touches the capacitive ring.  Do not let
+       that contact arm the platter, and keep it blocked until the finger has
+       actually left the wheel; otherwise the click's release can become the
+       first sample of an unintended scrub gesture. */
+    if ((button_state & cardinal_buttons) && !seek_wheel_gesture_tracked)
+        seek_wheel_blocked_until_release = true;
+    if (seek_wheel_blocked_until_release) {
+        seek_wheel_touch_position = -1;
+        seek_wheel_velocity_fp = 0;
+        seek_wheel_delta_fp = 0;
+        seek_wheel_arm_delta = 0;
+        seek_wheel_gesture_tracked = false;
+        if (position < 0 && !(button_state & cardinal_buttons))
+            seek_wheel_blocked_until_release = false;
         seek_wheel_motion_tick = now;
         return false;
     }
@@ -9088,8 +9133,20 @@ static bool service_seek_wheel_physics(void)
                 delta -= 96;
             else if (delta < -48)
                 delta += 96;
+            if (!seek_wheel_gesture_tracked) {
+                seek_wheel_arm_delta += delta;
+                if (ABS(seek_wheel_arm_delta) < RBPREP_WHEEL_ARM_UNITS) {
+                    delta = 0;
+                } else {
+                    delta = seek_wheel_arm_delta;
+                    seek_wheel_arm_delta = 0;
+                    seek_wheel_gesture_tracked = true;
+                }
+            }
             /* Four capacitive position units are one legacy scroll detent.
-               Keep fractional milliseconds until they add up to a real seek. */
+               A short movement dead zone filters stationary finger jitter;
+               keep fractional milliseconds after arming until they add up to
+               a real seek. */
             movement_fp = delta * scrub_step_ms() * 256 / 4;
             if (delta) {
                 int instantaneous = (long long)movement_fp * HZ / elapsed;
@@ -9098,7 +9155,6 @@ static bool service_seek_wheel_physics(void)
                                     MIN(maximum_velocity, instantaneous));
                 seek_wheel_velocity_fp =
                     (seek_wheel_velocity_fp + instantaneous * 2) / 3;
-                seek_wheel_gesture_tracked = true;
             } else {
                 int damping = MIN(128,
                     (int)(elapsed * 700 / MAX(1, HZ)));
@@ -9111,6 +9167,7 @@ static bool service_seek_wheel_physics(void)
         seek_wheel_touch_position = position;
     } else {
         seek_wheel_touch_position = -1;
+        seek_wheel_arm_delta = 0;
         if (ABS(seek_wheel_velocity_fp) >= 20 * 256) {
             int damping = MIN(224,
                 (int)(elapsed * 700 / MAX(1, HZ)));
@@ -9729,7 +9786,9 @@ static void short_select(void)
             seek_wheel_touch_position = -1;
             seek_wheel_velocity_fp = 0;
             seek_wheel_delta_fp = 0;
+            seek_wheel_arm_delta = 0;
             seek_wheel_gesture_tracked = false;
+            seek_wheel_blocked_until_release = false;
 #endif
         }
         rebuild_waveform_height_lut();
@@ -11544,7 +11603,9 @@ enum plugin_status plugin_start(const void *parameter)
     seek_wheel_touch_position = -1;
     seek_wheel_velocity_fp = 0;
     seek_wheel_delta_fp = 0;
+    seek_wheel_arm_delta = 0;
     seek_wheel_gesture_tracked = false;
+    seek_wheel_blocked_until_release = false;
     seek_wheel_motion_tick = *rb->current_tick;
 #endif
     suppress_menu = suppress_play = false;
