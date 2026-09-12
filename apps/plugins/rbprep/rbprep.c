@@ -75,6 +75,12 @@
 #define RBPREP_SMART_QUERY_FILE "/.rockbox/rbprep/smart-playlists.rbq"
 #define RBPREP_PLAYLIST_JOURNAL "/.rockbox/rbprep/playlist-adds.rba"
 #define RBPREP_EDIT_JOURNAL "/.rockbox/rbprep/edits.rbe"
+#define RBPREP_EDIT_JOURNAL_REPAIR RBPREP_EDIT_JOURNAL ".rbprep-repair"
+#define RBPREP_EDIT_JOURNAL_BAD RBPREP_EDIT_JOURNAL ".rbprep-corrupt"
+#define RBPREP_PLAYLIST_JOURNAL_REPAIR \
+    RBPREP_PLAYLIST_JOURNAL ".rbprep-repair"
+#define RBPREP_PLAYLIST_JOURNAL_BAD \
+    RBPREP_PLAYLIST_JOURNAL ".rbprep-corrupt"
 #define RBPREP_BURN_STATE "/.rockbox/rbprep/local-burn.rbs"
 #define RBPREP_SEARCH_RESULTS "/.rockbox/rbprep/state/search.results"
 /* Fixed-size, little-endian RBE1 snapshots make interrupted appends harmless
@@ -192,7 +198,7 @@ enum rbprep_tool {
     TOOL_RELOAD_TRACK = 38,
     TOOL_VIS_CANYON = 39,
     TOOL_VIS_ORBIT = 40,
-    TOOL_VIS_REACTOR = 41,
+    TOOL_VIS_PHRASE = 41,
     TOOL_VIS_HARMONIC = 42,
     TOOL_META_KEY = 43,
     TOOL_KEY_NOTATION = 44,
@@ -349,6 +355,8 @@ static int main_wheel_phase_fp;
 static int main_wheel_velocity_fp;
 static int main_wheel_touch_position;
 static long main_wheel_motion_tick;
+static int main_blade_shift_fp;
+static long main_blade_motion_tick;
 static long main_name_scroll_deadline;
 static char device_usb_name[32] = "REKORDPOD";
 static int scrub_step_index = 4;
@@ -841,7 +849,7 @@ static const char * const tool_names[TOOL_COUNT] = {
     "LOOP ACTIVE", "RATING", "TRACK COLOR", "YEAR", "GENRE",
     "BURN TRACK", "BURN ALL", "PREV TRACK", "NEXT TRACK",
     "RESTART", "RELOAD", "SPECTRAL CANYON", "STEREO ORBIT",
-    "BEAT REACTOR", "HARMONIC CONSTELLATION", "KEY EDITOR",
+    "PHRASE MAP", "HARMONIC CONSTELLATION", "KEY EDITOR",
     "KEY NOTATION"
 };
 
@@ -890,7 +898,7 @@ static const uint16_t macro_tool_storage_ids[TOOL_COUNT] = {
     [TOOL_RELOAD_TRACK]      = 0x0126,
     [TOOL_VIS_CANYON]        = 0x0127,
     [TOOL_VIS_ORBIT]         = 0x0128,
-    [TOOL_VIS_REACTOR]       = 0x0129,
+    [TOOL_VIS_PHRASE]        = 0x0129,
     [TOOL_VIS_HARMONIC]      = 0x012a,
     [TOOL_META_KEY]          = 0x012b,
     [TOOL_KEY_NOTATION]      = 0x012c,
@@ -899,7 +907,7 @@ static const uint16_t macro_tool_storage_ids[TOOL_COUNT] = {
 static char *waveform_styles[] = { "full", "half" };
 static char *visualizer_styles[] = {
     "rgb waveform", "boombox bass", "20-band EQ", "Oscillo-Turntable",
-    "spectral canyon", "stereo orbit", "beat reactor",
+    "spectral canyon", "stereo orbit", "phrase map",
     "harmonic constellation"
 };
 static char *rpm_styles[] = { "33", "45", "78" };
@@ -1134,7 +1142,7 @@ static const struct rbprep_tool_page tool_pages[] = {
       { TOOL_WAVEFORM_STYLE, TOOL_VIS_BOOMBOX, TOOL_VIS_EQ,
         TOOL_VIS_TURNTABLE } },
     { MODE_VISUALIZER_TWO, "REACTR", 4,
-      { TOOL_VIS_CANYON, TOOL_VIS_ORBIT, TOOL_VIS_REACTOR,
+      { TOOL_VIS_CANYON, TOOL_VIS_ORBIT, TOOL_VIS_PHRASE,
         TOOL_VIS_HARMONIC } },
     { MODE_MACRO, "MACROS", 2,
       { TOOL_MACRO_ONE, TOOL_MACRO_TWO } }
@@ -4118,83 +4126,120 @@ static void draw_stereo_orbit(void)
                   line, LCD_WHITE);
 }
 
-static void draw_reactor_octagon(int cx, int cy, int radius, int color)
+static void draw_phrase_map(void)
 {
-    int previous_x = cx + wheel_cosine[4] * radius / 256;
-    int previous_y = cy + wheel_sine[4] * radius / 256;
-    int point;
-
-    rb->lcd_set_foreground(color);
-    for (point = 1; point <= 8; point++) {
-        int angle = (4 + point * 8) & 63;
-        int x = cx + wheel_cosine[angle] * radius / 256;
-        int y = cy + wheel_sine[angle] * radius / 256;
-
-        rb->lcd_drawline(previous_x, previous_y, x, y);
-        previous_x = x;
-        previous_y = y;
-    }
-}
-
-static void draw_beat_reactor(void)
-{
+    const int cells = 32;
+    const int left = 5;
+    const int cell_width = 9;
+    const int top = RBPREP_WAVE_TOP + 25;
+    const int bottom = RBPREP_WAVE_BOTTOM - 28;
+    int period = beat_period_ms();
+    int base = grid_phase_ms + grid_offset;
+    int current;
     int beat_number;
-    int beat_phase = visual_beat_phase(&beat_number);
-    int mid_push = (spectrum_levels[6] + spectrum_levels[7] -
-                    spectrum_levels[10] - spectrum_levels[11]) / 64;
-    int cx = RBPREP_DECK_WIDTH / 2 + mid_push;
-    int cy = RBPREP_WAVE_TOP + 73;
-    int aperture = 6 + spectrum_bass / 24 + spectrum_bass_hit / 48;
-    int treble = 0;
-    int ring;
-    int point;
+    int first;
+    int phase = visual_beat_phase(&beat_number);
+    int first_beat = 1;
+    int bar = 1;
+    int cell;
+    char line[48];
+    bool imported = imported_grid_resident();
 
-    text(5, RBPREP_WAVE_TOP + 3, "BEAT REACTOR",
-         LCD_RGBPACK(230, 120, 255));
-    for (point = 15; point < RBPREP_SPECTRUM_BANDS; point++)
-        treble += spectrum_levels[point];
-    treble /= 5;
-
-    /* Perspective ribs remain static while beat gates travel through them. */
-    rb->lcd_set_foreground(LCD_RGBPACK(22, 45, 37));
-    for (point = 0; point < 8; point++) {
-        int angle = 4 + point * 8;
-        rb->lcd_drawline(cx + wheel_cosine[angle] * aperture / 256,
-                         cy + wheel_sine[angle] * aperture / 256,
-                         cx + wheel_cosine[angle] * 72 / 256,
-                         cy + wheel_sine[angle] * 72 / 256);
+    if (imported) {
+        current = current_beat_index(playhead);
+        if (current < 0)
+            current = 0;
+        first_beat = adjusted_beat_number(0);
+        beat_number = adjusted_beat_number(current);
+        bar = (current + first_beat - 1) / 4 + 1;
+        first = current - beat_number + 1 - 12;
+    } else {
+        current = MAX(0, (playhead - base) / MAX(1, period));
+        beat_number = (current & 3) + 1;
+        bar = current / 4 + 1;
+        first = current - beat_number + 1 - 12;
     }
 
-    for (ring = 7; ring >= 0; ring--) {
-        int travel = (beat_phase + ring * 32) & 255;
-        int radius = aperture + travel * (72 - aperture) / 255;
-        int gate_beat = ((beat_number - 1 + ring / 2) & 3) + 1;
-        int color = gate_beat == 1 ? LCD_WHITE
-                  : ring & 1 ? LCD_RGBPACK(40, 220, 255)
-                             : RBPREP_GREEN;
+    text(5, RBPREP_WAVE_TOP + 3, "PHRASE MAP  /  8 BARS",
+         LCD_RGBPACK(120, 255, 218));
+    rb->lcd_set_foreground(LCD_RGBPACK(5, 15, 11));
+    rb->lcd_fillrect(left - 2, top - 3, cells * cell_width + 3,
+                     bottom - top + 7);
 
-        draw_reactor_octagon(cx, cy, radius, color);
+    for (cell = 0; cell < cells; cell++) {
+        int beat = first + cell;
+        int start_time;
+        int end_time;
+        int sample_begin;
+        int sample_end;
+        int sample;
+        int peak = 0;
+        int peak_sample = 0;
+        int x = left + cell * cell_width;
+        int height;
+        int color;
+        bool valid = !imported || (beat >= 0 && beat < beat_count);
+        bool downbeat;
+
+        if (!valid) {
+            rb->lcd_set_foreground(LCD_RGBPACK(13, 22, 17));
+            rb->lcd_fillrect(x, bottom - 3, cell_width - 2, 4);
+            continue;
+        }
+        if (imported) {
+            start_time = adjusted_beat_time(beat);
+            end_time = beat + 1 < beat_count
+                     ? adjusted_beat_time(beat + 1)
+                     : start_time + period;
+            downbeat = adjusted_beat_number(beat) == 1;
+        } else {
+            start_time = base + beat * period;
+            end_time = start_time + period;
+            downbeat = (beat & 3) == 0;
+        }
+        if (end_time <= 0 || start_time >= track_length) {
+            rb->lcd_set_foreground(LCD_RGBPACK(13, 22, 17));
+            rb->lcd_fillrect(x, bottom - 3, cell_width - 2, 4);
+            continue;
+        }
+        sample_begin = MAX(0, MIN(RBPREP_OVERVIEW_WIDTH - 1,
+            (long long)start_time * RBPREP_OVERVIEW_WIDTH /
+            MAX(1, track_length)));
+        sample_end = MAX(sample_begin + 1,
+            MIN(RBPREP_OVERVIEW_WIDTH,
+                (long long)end_time * RBPREP_OVERVIEW_WIDTH /
+                MAX(1, track_length)));
+        for (sample = sample_begin; sample < sample_end; sample++) {
+            if (overview_waveform[sample][0] > peak) {
+                peak = overview_waveform[sample][0];
+                peak_sample = sample;
+            }
+        }
+        height = 5 + peak * (bottom - top - 8) / 255;
+        color = peak > 0
+              ? LCD_RGBPACK(overview_waveform[peak_sample][1],
+                            overview_waveform[peak_sample][2],
+                            overview_waveform[peak_sample][3])
+              : LCD_RGBPACK(24, 45, 34);
+        rb->lcd_set_foreground(color);
+        rb->lcd_fillrect(x, bottom - height, cell_width - 2, height);
+        rb->lcd_set_foreground(downbeat ? LCD_WHITE
+                                       : LCD_RGBPACK(42, 72, 57));
+        rb->lcd_vline(x, top - (downbeat ? 3 : 0), bottom + 2);
+        if (beat == current) {
+            int cursor = x + phase * (cell_width - 3) / 255;
+
+            rb->lcd_set_foreground(LCD_WHITE);
+            rb->lcd_drawrect(x - 1, top - 3, cell_width,
+                             bottom - top + 6);
+            rb->lcd_vline(cursor, top, bottom);
+        }
     }
 
-    /* Treble produces deterministic sparks; their positions are derived from
-       beat phase, so animation never depends on a random-number generator. */
-    for (point = 0; point < treble / 32; point++) {
-        int angle = (beat_phase / 4 + point * 11) & 63;
-        int radius = 28 + (point * 17 + beat_phase / 3) % 43;
-        int x = cx + wheel_cosine[angle] * radius / 256;
-        int y = cy + wheel_sine[angle] * radius / 256;
-
-        rb->lcd_set_foreground(point & 1 ? LCD_WHITE
-                                         : LCD_RGBPACK(255, 90, 225));
-        rb->lcd_drawpixel(x, y);
-        if (treble > 190)
-            rb->lcd_drawpixel(x + 1, y);
-    }
-    rb->lcd_set_foreground(LCD_BLACK);
-    xlcd_fillcircle(cx, cy, aperture - 1);
-    rb->lcd_set_foreground(spectrum_bass_hit > 80
-                          ? LCD_WHITE : RBPREP_GREEN);
-    xlcd_drawcircle(cx, cy, aperture);
+    rb->snprintf(line, sizeof(line), "BAR %d.%d   -3 < NOW > +4",
+                 MIN(999, bar), beat_number);
+    centered_text(0, RBPREP_DECK_WIDTH, RBPREP_WAVE_BOTTOM - 18,
+                  line, LCD_WHITE);
 }
 
 static int track_key_pitch_class(void)
@@ -4207,8 +4252,8 @@ static int track_key_pitch_class(void)
 static void draw_harmonic_constellation(void)
 {
     static const char *note_names[RBPREP_CHROMA_BANDS] = {
-        "C", "C#", "D", "D#", "E", "F",
-        "F#", "G", "G#", "A", "A#", "B"
+        "C", "Db", "D", "Eb", "E", "F",
+        "F#", "G", "Ab", "A", "Bb", "B"
     };
     static const unsigned char note_angles[RBPREP_CHROMA_BANDS] = {
         48, 53, 59, 0, 5, 11, 16, 21, 27, 32, 37, 43
@@ -4816,12 +4861,11 @@ static void draw_waveform(void)
     int x;
     int mid = (RBPREP_SIGNAL_TOP + RBPREP_SIGNAL_BOTTOM) / 2;
 
-    if (visualizer_mode >= 1)
+    if (visualizer_mode >= 1 && visualizer_mode != 6)
         update_spectrum_levels(visualizer_mode == 1,
                                visualizer_mode == 1 ||
                                visualizer_mode == 2 ||
-                               visualizer_mode == 4 ||
-                               visualizer_mode == 6,
+                               visualizer_mode == 4,
                                visualizer_mode == 7);
     if (visualizer_mode == 1) {
         draw_boombox();
@@ -4839,7 +4883,7 @@ static void draw_waveform(void)
         draw_stereo_orbit();
         return;
     } else if (visualizer_mode == 6) {
-        draw_beat_reactor();
+        draw_phrase_map();
         return;
     } else if (visualizer_mode == 7) {
         draw_harmonic_constellation();
@@ -5180,28 +5224,6 @@ static bool record_edit_change(void)
     return true;
 }
 
-static bool repair_edit_journal_tail(void)
-{
-    int fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDWR);
-    off_t size;
-    off_t complete;
-    bool ok = true;
-
-    if (fd < 0)
-        return true;
-    size = rb->filesize(fd);
-    if (size < 0) {
-        ok = false;
-    } else {
-        complete = size - size % RBPREP_EDIT_RECORD_SIZE;
-        if (complete != size && rb->ftruncate(fd, complete) < 0)
-            ok = false;
-    }
-    if (rb->close(fd) < 0)
-        ok = false;
-    return ok;
-}
-
 static bool repair_playlist_journal_tail(void)
 {
     unsigned char buffer[128];
@@ -5358,6 +5380,194 @@ static bool parse_playlist_journal_line(
     rb->strlcpy(entry->name, field[5], sizeof(entry->name));
     return entry->playlist_id &&
            (entry->operation != PLAYLIST_OP_ADD || entry->track_id);
+}
+
+static bool normalize_edit_journal_records(void)
+{
+    unsigned char record[RBPREP_EDIT_RECORD_SIZE];
+    uint32_t edit_offset;
+    uint32_t playlist_offset;
+    uint32_t new_edit_offset = 0;
+    off_t position = 0;
+    ssize_t got = 0;
+    int input;
+    int output;
+    bool changed = false;
+    bool ok = true;
+
+    read_burn_offsets(&edit_offset, &playlist_offset);
+    input = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
+    if (input < 0)
+        return true;
+    rb->remove(RBPREP_EDIT_JOURNAL_REPAIR);
+    output = rb->open(RBPREP_EDIT_JOURNAL_REPAIR,
+                      O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (output < 0) {
+        rb->close(input);
+        return false;
+    }
+    while ((got = rb->read(input, record, sizeof(record))) ==
+           (ssize_t)sizeof(record)) {
+        if (valid_edit_record(record)) {
+            if (position < (off_t)edit_offset)
+                new_edit_offset += sizeof(record);
+            if (!write_exact(output, record, sizeof(record))) {
+                ok = false;
+                break;
+            }
+        } else {
+            /* A full-size torn record cannot be interpreted safely. Keep the
+               original journal as a quarantine copy, but do not let one dead
+               slot permanently block every later valid edit. */
+            changed = true;
+        }
+        position += sizeof(record);
+    }
+    if (got < 0)
+        ok = false;
+    else if (got != 0)
+        changed = true;
+    if (rb->close(input) < 0)
+        ok = false;
+    if (rb->close(output) < 0)
+        ok = false;
+    if (!ok) {
+        rb->remove(RBPREP_EDIT_JOURNAL_REPAIR);
+        return false;
+    }
+    if (!changed) {
+        rb->remove(RBPREP_EDIT_JOURNAL_REPAIR);
+        return true;
+    }
+
+    rb->remove(RBPREP_EDIT_JOURNAL_BAD);
+    if (rb->rename(RBPREP_EDIT_JOURNAL,
+                   RBPREP_EDIT_JOURNAL_BAD) < 0) {
+        rb->remove(RBPREP_EDIT_JOURNAL_REPAIR);
+        return false;
+    }
+    if (rb->rename(RBPREP_EDIT_JOURNAL_REPAIR,
+                   RBPREP_EDIT_JOURNAL) < 0) {
+        rb->rename(RBPREP_EDIT_JOURNAL_BAD,
+                   RBPREP_EDIT_JOURNAL);
+        return false;
+    }
+    if (!write_burn_offsets(new_edit_offset, playlist_offset)) {
+        rb->remove(RBPREP_EDIT_JOURNAL);
+        rb->rename(RBPREP_EDIT_JOURNAL_BAD,
+                   RBPREP_EDIT_JOURNAL);
+        return false;
+    }
+    return true;
+}
+
+static bool normalize_playlist_journal_records(void)
+{
+    char line[192];
+    char parsed[192];
+    uint32_t edit_offset;
+    uint32_t playlist_offset;
+    uint32_t new_playlist_offset = 0;
+    off_t position = 0;
+    off_t line_start = 0;
+    int length = 0;
+    int input;
+    int output;
+    int got = 0;
+    bool overflow = false;
+    bool changed = false;
+    bool ok = true;
+
+    read_burn_offsets(&edit_offset, &playlist_offset);
+    input = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
+    if (input < 0)
+        return true;
+    rb->remove(RBPREP_PLAYLIST_JOURNAL_REPAIR);
+    output = rb->open(RBPREP_PLAYLIST_JOURNAL_REPAIR,
+                      O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (output < 0) {
+        rb->close(input);
+        return false;
+    }
+    while ((got = rb->read(input, parsed, 1)) == 1) {
+        unsigned char value = parsed[0];
+
+        position++;
+        if (value == '\n') {
+            struct rbprep_pending_playlist entry;
+            bool valid = !overflow;
+
+            line[length] = '\0';
+            if (valid && length > 0) {
+                rb->strlcpy(parsed, line, sizeof(parsed));
+                valid = parse_playlist_journal_line(parsed, &entry);
+            }
+            if (valid) {
+                if (line_start < (off_t)playlist_offset)
+                    new_playlist_offset += length + 1;
+                if ((length > 0 && !write_exact(output, line, length)) ||
+                    !write_exact(output, "\n", 1)) {
+                    ok = false;
+                    break;
+                }
+            } else {
+                changed = true;
+            }
+            length = 0;
+            overflow = false;
+            line_start = position;
+        } else if (value == '\r') {
+            /* Accept a host-created CRLF journal without treating the CR as
+               part of a playlist name. */
+            changed = true;
+        } else if (length + 1 < (int)sizeof(line)) {
+            line[length++] = value;
+        } else {
+            overflow = true;
+        }
+    }
+    if (got < 0)
+        ok = false;
+    if (length > 0 || overflow)
+        changed = true;
+    if (rb->close(input) < 0)
+        ok = false;
+    if (rb->close(output) < 0)
+        ok = false;
+    if (!ok) {
+        rb->remove(RBPREP_PLAYLIST_JOURNAL_REPAIR);
+        return false;
+    }
+    if (!changed) {
+        rb->remove(RBPREP_PLAYLIST_JOURNAL_REPAIR);
+        return true;
+    }
+
+    rb->remove(RBPREP_PLAYLIST_JOURNAL_BAD);
+    if (rb->rename(RBPREP_PLAYLIST_JOURNAL,
+                   RBPREP_PLAYLIST_JOURNAL_BAD) < 0) {
+        rb->remove(RBPREP_PLAYLIST_JOURNAL_REPAIR);
+        return false;
+    }
+    if (rb->rename(RBPREP_PLAYLIST_JOURNAL_REPAIR,
+                   RBPREP_PLAYLIST_JOURNAL) < 0) {
+        rb->rename(RBPREP_PLAYLIST_JOURNAL_BAD,
+                   RBPREP_PLAYLIST_JOURNAL);
+        return false;
+    }
+    if (!write_burn_offsets(edit_offset, new_playlist_offset)) {
+        rb->remove(RBPREP_PLAYLIST_JOURNAL);
+        rb->rename(RBPREP_PLAYLIST_JOURNAL_BAD,
+                   RBPREP_PLAYLIST_JOURNAL);
+        return false;
+    }
+    return true;
+}
+
+static bool repair_pending_journals(void)
+{
+    return normalize_edit_journal_records() &&
+           normalize_playlist_journal_records();
 }
 
 static void remove_pending_playlist_at(int slot)
@@ -5582,8 +5792,7 @@ static void refresh_pending_summary(void)
 {
     uint32_t edit_offset;
     uint32_t playlist_offset;
-    bool journals_repaired = repair_edit_journal_tail() &&
-                             repair_playlist_journal_tail();
+    bool journals_repaired = repair_pending_journals();
 
     read_burn_offsets(&edit_offset, &playlist_offset);
     refresh_pending_summary_from_offsets(edit_offset, playlist_offset,
@@ -7417,12 +7626,13 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
         xlcd_drawcircle(cx, cy, 4);
         rb->lcd_drawline(cx, y, cx, y + 8);
         rb->lcd_drawline(cx - 3, cy - 2, cx + 3, cy + 2);
-    } else if (tool == TOOL_VIS_REACTOR) {
-        rb->lcd_drawline(cx, y, x, cy);
-        rb->lcd_drawline(x, cy, cx, y + 8);
-        rb->lcd_drawline(cx, y + 8, x + 8, cy);
-        rb->lcd_drawline(x + 8, cy, cx, y);
-        xlcd_drawcircle(cx, cy, 1);
+    } else if (tool == TOOL_VIS_PHRASE) {
+        rb->lcd_vline(x, y + 1, y + 8);
+        rb->lcd_vline(x + 2, y + 4, y + 8);
+        rb->lcd_vline(x + 4, y + 2, y + 8);
+        rb->lcd_vline(x + 6, y + 5, y + 8);
+        rb->lcd_vline(x + 8, y, y + 8);
+        rb->lcd_hline(x, x + 8, y + 8);
     } else if (tool == TOOL_VIS_HARMONIC) {
         xlcd_drawcircle(cx, cy, 4);
         rb->lcd_fillrect(cx - 1, y, 2, 2);
@@ -8180,8 +8390,8 @@ static void draw_tool_status(void)
         rb->snprintf(line, sizeof(line), "SPECTRAL CANYON");
     else if (tool == TOOL_VIS_ORBIT)
         rb->snprintf(line, sizeof(line), "STEREO ORBIT");
-    else if (tool == TOOL_VIS_REACTOR)
-        rb->snprintf(line, sizeof(line), "BEAT REACTOR");
+    else if (tool == TOOL_VIS_PHRASE)
+        rb->snprintf(line, sizeof(line), "PHRASE MAP  8 BARS");
     else if (tool == TOOL_VIS_HARMONIC)
         rb->snprintf(line, sizeof(line), "HARMONIC CONSTELLATION");
     else if (tool == TOOL_MACRO_ONE || tool == TOOL_MACRO_TWO) {
@@ -8486,6 +8696,8 @@ static void wrap_main_wheel_phase(void)
 
 static bool main_wheel_motion_active(void)
 {
+    if (ABS(main_blade_shift_fp) >= 64)
+        return true;
 #ifdef HAVE_WHEEL_POSITION
     return platter_wheel_mode &&
            (rb->wheel_status() >= 0 || main_wheel_touch_position >= 0 ||
@@ -8493,6 +8705,23 @@ static bool main_wheel_motion_active(void)
 #else
     return false;
 #endif
+}
+
+static void update_main_blade_motion(void)
+{
+    long now = *rb->current_tick;
+    long elapsed = now - main_blade_motion_tick;
+    int decay;
+
+    if (elapsed <= 0)
+        return;
+    elapsed = MIN(elapsed, MAX(1, HZ / 4));
+    decay = MAX(1, (int)((long long)elapsed * 280 * 256 / MAX(1, HZ)));
+    if (main_blade_shift_fp > 0)
+        main_blade_shift_fp = MAX(0, main_blade_shift_fp - decay);
+    else if (main_blade_shift_fp < 0)
+        main_blade_shift_fp = MIN(0, main_blade_shift_fp + decay);
+    main_blade_motion_tick = now;
 }
 
 static void update_main_wheel_motion(void)
@@ -8552,33 +8781,33 @@ static void update_main_wheel_motion(void)
 
 static void draw_main_menu_fx(void)
 {
-    int cx = 246;
-    int cy = 130;
+    int cx = LCD_WIDTH / 2;
+    int cy = 158;
     int phase;
     int point;
 
     update_main_wheel_motion();
     phase = (main_wheel_phase_fp >> 8) & 63;
 
-    /* One complete CDJ jog wheel occupies the right half—no backing panel,
-       scanner or decorative footer competes with the menu. */
+    /* A centered platter anchors the carousel. Its motion remains a trace of
+       real wheel energy rather than a synthetic selection-position dial. */
     rb->lcd_set_foreground(LCD_BLACK);
-    xlcd_fillcircle(cx, cy, 70);
+    xlcd_fillcircle(cx, cy, 63);
     rb->lcd_set_foreground(RBPREP_GREEN_DIM);
-    xlcd_drawcircle(cx, cy, 69);
+    xlcd_drawcircle(cx, cy, 62);
     rb->lcd_set_foreground(theme_wheel_outline);
-    xlcd_drawcircle(cx, cy, 66);
+    xlcd_drawcircle(cx, cy, 59);
     rb->lcd_set_foreground(theme_wheel);
-    xlcd_fillcircle(cx, cy, 61);
+    xlcd_fillcircle(cx, cy, 55);
     rb->lcd_set_foreground(LCD_RGBPACK(40, 48, 43));
-    xlcd_drawcircle(cx, cy, 58);
-    xlcd_drawcircle(cx, cy, 53);
+    xlcd_drawcircle(cx, cy, 52);
+    xlcd_drawcircle(cx, cy, 47);
     rb->lcd_set_foreground(RBPREP_GREEN_DIM);
-    xlcd_drawcircle(cx, cy, 42);
+    xlcd_drawcircle(cx, cy, 38);
     for (point = 0; point < 16; point++) {
         int angle = (point * 4 + phase) & 63;
-        int x = cx + wheel_cosine[angle] * 63 / 256;
-        int y = cy + wheel_sine[angle] * 63 / 256;
+        int x = cx + wheel_cosine[angle] * 57 / 256;
+        int y = cy + wheel_sine[angle] * 57 / 256;
 
         rb->lcd_set_foreground(point % 4 == 0 ? LCD_WHITE
                                               : RBPREP_GREEN);
@@ -8591,8 +8820,8 @@ static void draw_main_menu_fx(void)
     if (platter_wheel_mode && rb->wheel_status() >= 0) {
         /* Align the hardware wheel origin with the drawing table. */
         int touch_angle = (rb->wheel_status() * 64 / 96 + 48) & 63;
-        int touch_x = cx + wheel_cosine[touch_angle] * 55 / 256;
-        int touch_y = cy + wheel_sine[touch_angle] * 55 / 256;
+        int touch_x = cx + wheel_cosine[touch_angle] * 50 / 256;
+        int touch_y = cy + wheel_sine[touch_angle] * 50 / 256;
 
         rb->lcd_set_foreground(LCD_BLACK);
         xlcd_fillcircle(touch_x, touch_y, 3);
@@ -8605,18 +8834,18 @@ static void draw_main_menu_fx(void)
     point = phase;
     rb->lcd_set_foreground(LCD_WHITE);
     rb->lcd_drawline(cx, cy,
-        cx + wheel_cosine[point] * 49 / 256,
-        cy + wheel_sine[point] * 49 / 256);
+        cx + wheel_cosine[point] * 44 / 256,
+        cy + wheel_sine[point] * 44 / 256);
     rb->lcd_set_foreground(LCD_RGBPACK(5, 14, 10));
-    xlcd_fillcircle(cx, cy, 22);
+    xlcd_fillcircle(cx, cy, 20);
     rb->lcd_set_foreground(RBPREP_GREEN);
-    xlcd_drawcircle(cx, cy, 22);
+    xlcd_drawcircle(cx, cy, 20);
     rb->lcd_set_foreground(LCD_RGBPACK(35, 205, 255));
-    xlcd_drawcircle(cx, cy, 16);
+    xlcd_drawcircle(cx, cy, 14);
     {
-        char marquee[7];
+        char marquee[9];
         int length = rb->strlen(device_usb_name);
-        int visible = 5;
+        int visible = 7;
         int start = 0;
         int index;
 
@@ -8635,30 +8864,51 @@ static void draw_main_menu_fx(void)
                 marquee[index] = device_usb_name[source - length - 3];
         }
         marquee[visible] = '\0';
-        centered_text(cx - 18, 36, cy - 5, marquee, LCD_WHITE);
+        centered_text(cx - 24, 48, cy - 5, marquee, LCD_WHITE);
     }
     rb->lcd_set_foreground(LCD_WHITE);
     xlcd_fillcircle(cx, cy + 9, 2);
     main_name_scroll_deadline = *rb->current_tick + MAX(1, HZ / 5);
 }
 
-static void draw_main_selection(int y, int height)
+static void draw_main_blade(int item, int relative, const char *top_label,
+                            const char *bottom_label)
 {
-    const int left = 7;
-    const int right = 174;
-    int radius = height / 2;
-    int center_y = y + radius;
-    int fill = hsb_rgb(accent_hue,
-                       MIN(100, accent_saturation + 10),
-                       MAX(12, accent_brightness * 34 / 100));
+    const int width = 118;
+    const int step = 57;
+    int distance = ABS(relative);
+    bool selected = relative == 0;
+    int x = (LCD_WIDTH - width) / 2 + relative * step +
+            main_blade_shift_fp / 256;
+    int y = 39 + MIN(3, distance) * 4;
+    int height = 55 - MIN(3, distance) * 4;
+    int fill = selected
+             ? hsb_rgb(accent_hue, MIN(100, accent_saturation + 10),
+                       MAX(13, accent_brightness * 35 / 100))
+             : LCD_RGBPACK(MAX(4, 14 - distance * 3),
+                           MAX(10, 35 - distance * 6),
+                           MAX(7, 23 - distance * 4));
+    int border = selected ? theme_accent
+                          : LCD_RGBPACK(47, 75, 58);
+    char fitted[28];
 
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(x + 3, y + 3, width, height);
     rb->lcd_set_foreground(fill);
-    xlcd_fillcircle(left + radius, center_y, radius);
-    xlcd_fillcircle(right - radius, center_y, radius);
-    rb->lcd_fillrect(left + radius, y,
-                     right - left - radius * 2 + 1, height + 1);
-    rb->lcd_set_foreground(theme_accent);
-    rb->lcd_hline(left + radius, right - radius, y + 1);
+    rb->lcd_fillrect(x, y, width, height);
+    rb->lcd_set_foreground(border);
+    rb->lcd_drawrect(x, y, width, height);
+    rb->lcd_hline(x + 2, x + width - 3, y + 2);
+    draw_main_glyph(x + width / 2, y + 14, item, selected);
+    fit_text(fitted, sizeof(fitted), top_label, width - 8);
+    centered_text(x + 4, width - 8, y + 26, fitted,
+                  selected ? LCD_WHITE : LCD_RGBPACK(155, 178, 163));
+    if (bottom_label && bottom_label[0]) {
+        fit_text(fitted, sizeof(fitted), bottom_label, width - 8);
+        centered_text(x + 4, width - 8, y + 38, fitted,
+                      selected ? LCD_RGBPACK(180, 255, 213)
+                               : LCD_RGBPACK(90, 115, 98));
+    }
 }
 
 static void navigate_main_menu(int direction)
@@ -8674,7 +8924,13 @@ static void navigate_main_menu(int direction)
         main_wheel_phase_fp += direction > 0 ? 4 * 256 : -4 * 256;
         wrap_main_wheel_phase();
     }
-    selection = next;
+    if (next != selection) {
+        main_blade_shift_fp += direction > 0 ? 57 * 256 : -57 * 256;
+        main_blade_shift_fp = MAX(-114 * 256,
+                                  MIN(114 * 256, main_blade_shift_fp));
+        main_blade_motion_tick = *rb->current_tick;
+        selection = next;
+    }
 }
 
 static void draw_main_menu(void)
@@ -8684,13 +8940,21 @@ static void draw_main_menu(void)
         "USB MODE", "REKORDPOD SETTINGS", "INDEX STATUS",
         "EXIT TO ROCKBOX"
     };
+    static const char *blade_top[] = {
+        "COLLECTION", "SHUFFLE", "PLAYLISTS", "PREP DECK",
+        "USB MODE", "REKORDPOD", "INDEX STATUS", "EXIT TO"
+    };
+    static const char *blade_bottom[] = {
+        "", "COLLECTION", "", "", "", "SETTINGS", "", "ROCKBOX"
+    };
     char line[80];
     int line_width;
     int panel_width;
-    int i;
+    int distance;
 
-    draw_blade_shell("RBPREP  /  PERFORMANCE LIBRARY",
+    draw_blade_shell("REKORDPOD  /  PERFORMANCE LIBRARY",
                      RBPREP_GREEN);
+    update_main_blade_motion();
     draw_main_menu_fx();
     if (library_fd >= 0)
         rb->snprintf(line, sizeof(line), "%lu TRACKS / INDEX ONLINE",
@@ -8704,14 +8968,22 @@ static void draw_main_menu(void)
     text(7, 21, line, library_fd >= 0
          ? LCD_RGBPACK(105, 178, 139) : LCD_RGBPACK(255, 90, 70));
 
-    for (i = 0; i < (int)ARRAYLEN(items); i++) {
-        int y = 42 + i * 23;
-        bool selected = i == selection;
-        if (selected)
-            draw_main_selection(y - 2, 20);
-        draw_main_glyph(20, y + 7, i, selected);
-        text(42, y + 3, items[i], selected ? LCD_WHITE : RBPREP_MENU_TEXT);
+    for (distance = 3; distance > 0; distance--) {
+        int left = selection - distance;
+        int right = selection + distance;
+
+        if (left >= 0)
+            draw_main_blade(left, -distance, blade_top[left],
+                            blade_bottom[left]);
+        if (right < (int)ARRAYLEN(items))
+            draw_main_blade(right, distance, blade_top[right],
+                            blade_bottom[right]);
     }
+    draw_main_blade(selection, 0, blade_top[selection],
+                    blade_bottom[selection]);
+    rb->snprintf(line, sizeof(line), "%02d / %02d",
+                 selection + 1, (int)ARRAYLEN(items));
+    text(266, 22, line, LCD_RGBPACK(105, 125, 112));
     text(7, 229, "WHEEL  NAVIGATE       SELECT  OPEN",
          LCD_RGBPACK(105, 125, 112));
 }
@@ -10747,7 +11019,7 @@ static void short_select(void)
             visualizer_mode = 4;
         else if (tool == TOOL_VIS_ORBIT)
             visualizer_mode = 5;
-        else if (tool == TOOL_VIS_REACTOR)
+        else if (tool == TOOL_VIS_PHRASE)
             visualizer_mode = 6;
         else if (tool == TOOL_VIS_HARMONIC)
             visualizer_mode = 7;
@@ -10971,14 +11243,14 @@ static void adjust_active_tool(int direction)
     else if (tool == TOOL_WAVEFORM_STYLE || tool == TOOL_VIS_BOOMBOX ||
              tool == TOOL_VIS_EQ || tool == TOOL_VIS_TURNTABLE ||
              tool == TOOL_VIS_CANYON || tool == TOOL_VIS_ORBIT ||
-             tool == TOOL_VIS_REACTOR || tool == TOOL_VIS_HARMONIC) {
+             tool == TOOL_VIS_PHRASE || tool == TOOL_VIS_HARMONIC) {
         visualizer_mode = tool == TOOL_WAVEFORM_STYLE ? 0 :
                           tool == TOOL_VIS_BOOMBOX ? 1 :
                           tool == TOOL_VIS_EQ ? 2 :
                           tool == TOOL_VIS_TURNTABLE ? 3 :
                           tool == TOOL_VIS_CANYON ? 4 :
                           tool == TOOL_VIS_ORBIT ? 5 :
-                          tool == TOOL_VIS_REACTOR ? 6 : 7;
+                          tool == TOOL_VIS_PHRASE ? 6 : 7;
         if (visualizer_mode == 0)
             stop_spectrum_capture();
         else
@@ -12223,6 +12495,8 @@ enum plugin_status plugin_start(const void *parameter)
     main_wheel_velocity_fp = 0;
     main_wheel_touch_position = -1;
     main_wheel_motion_tick = *rb->current_tick;
+    main_blade_shift_fp = 0;
+    main_blade_motion_tick = *rb->current_tick;
     main_name_scroll_deadline = *rb->current_tick;
     playhead = 0;
     zoom = 1;
