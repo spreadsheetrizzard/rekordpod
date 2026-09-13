@@ -1762,6 +1762,116 @@ static int burn_hotcue_count(const unsigned char *snapshot)
     return count;
 }
 
+static bool burn_copy_bytes(int input, int output, off_t count)
+{
+    while (count > 0) {
+        int amount = count > (off_t)sizeof(rbprep_burn_page)
+                   ? (int)sizeof(rbprep_burn_page) : (int)count;
+
+        if (rb->read(input, rbprep_burn_page, amount) != amount ||
+            rb->write(output, rbprep_burn_page, amount) != amount)
+            return false;
+        count -= amount;
+    }
+    return true;
+}
+
+static bool burn_rewrite_track_cues(uint32_t track_id,
+                                    const unsigned char *snapshot)
+{
+    char path[MAX_PATH];
+    char temporary[MAX_PATH];
+    char previous[MAX_PATH];
+    unsigned char header[40];
+    unsigned char cue[8];
+    off_t source_size;
+    off_t waveform_size;
+    off_t old_beat_offset;
+    off_t required_size;
+    off_t expected_size = 0;
+    int old_cue_count;
+    int beat_count;
+    int new_cue_count;
+    int input = -1;
+    int output = -1;
+    int slot;
+    bool ok = false;
+
+    rb->snprintf(path, sizeof(path), "%s/%06lu.rbw", RBPREP_TRACK_DIR,
+                 (unsigned long)track_id);
+    rb->snprintf(temporary, sizeof(temporary), "%s.rbprep-new", path);
+    rb->snprintf(previous, sizeof(previous), "%s.rbprep-prev", path);
+    if (!rb->file_exists(path) && rb->file_exists(previous))
+        rb->rename(previous, path);
+    if (!rb->file_exists(path))
+        return true;
+
+    input = rb->open(path, O_RDONLY);
+    if (input < 0 || rb->read(input, header, sizeof(header)) !=
+                     (ssize_t)sizeof(header) ||
+        rb->memcmp(header, "RBW3", 4) || read_u16(header + 4) != 40)
+        goto done;
+    source_size = rb->filesize(input);
+    old_cue_count = read_u16(header + 12);
+    beat_count = read_u16(header + 14);
+    waveform_size = (off_t)read_u32(header + 8) * 4;
+    old_beat_offset = (off_t)sizeof(header) + waveform_size +
+                      (off_t)old_cue_count * 8;
+    required_size = old_beat_offset + (off_t)beat_count * 8;
+    new_cue_count = burn_hotcue_count(snapshot);
+    expected_size = source_size +
+                    (off_t)(new_cue_count - old_cue_count) * 8;
+    if (source_size < required_size || waveform_size < 0 ||
+        old_beat_offset < (off_t)sizeof(header) ||
+        expected_size < (off_t)sizeof(header))
+        goto done;
+
+    write_u16(header + 12, new_cue_count);
+    rb->remove(temporary);
+    output = rb->open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (output < 0 ||
+        rb->write(output, header, sizeof(header)) !=
+        (ssize_t)sizeof(header) ||
+        rb->lseek(input, sizeof(header), SEEK_SET) < 0 ||
+        !burn_copy_bytes(input, output, waveform_size))
+        goto done;
+
+    for (slot = 0; slot < 16; slot++) {
+        int32_t time = read_u32(snapshot + 40 + slot * 4);
+
+        if (time < 0)
+            continue;
+        write_u32(cue, time);
+        cue[4] = snapshot[104 + slot] & 7;
+        cue[5] = slot + 1;
+        write_u16(cue + 6, 0);
+        if (rb->write(output, cue, sizeof(cue)) != (ssize_t)sizeof(cue))
+            goto done;
+    }
+    if (rb->lseek(input, old_beat_offset, SEEK_SET) < 0 ||
+        !burn_copy_bytes(input, output, source_size - old_beat_offset))
+        goto done;
+    ok = true;
+
+done:
+    if (input >= 0 && rb->close(input) < 0)
+        ok = false;
+    if (output >= 0 && rb->close(output) < 0)
+        ok = false;
+    if (ok) {
+        int verify = rb->open(temporary, O_RDONLY);
+
+        ok = verify >= 0 && rb->filesize(verify) == expected_size;
+        if (verify >= 0)
+            rb->close(verify);
+    }
+    if (!ok) {
+        rb->remove(temporary);
+        return false;
+    }
+    return burn_swap_keep_previous(path, temporary, previous);
+}
+
 static int burn_build_pcob(unsigned char *out, int capacity,
                            const unsigned char *snapshot)
 {
@@ -1864,10 +1974,15 @@ static bool burn_rewrite_analysis(const char *path,
     int header_length;
     int source_at;
     int output_at;
+    bool saw_pcob = false;
+    bool saw_pco2 = false;
+    bool extended;
 
     rb->snprintf(backup, sizeof(backup), "%s.rbprep-bak", path);
     rb->snprintf(temporary, sizeof(temporary), "%s.rbprep-new", path);
     rb->snprintf(previous, sizeof(previous), "%s.rbprep-prev", path);
+    extended = rb->strrchr(path, '.') &&
+               !rb->strcasecmp(rb->strrchr(path, '.'), ".EXT");
     if (!rb->file_exists(path) && rb->file_exists(previous))
         rb->rename(previous, path);
     if (!rb->file_exists(path))
@@ -1939,6 +2054,7 @@ static bool burn_rewrite_analysis(const char *path,
         } else if (!rb->memcmp(source + source_at, "PCOB", 4) &&
                    tag_length >= 24 &&
                    burn_be32(source + source_at + 12) == 1) {
+            saw_pcob = true;
             replacement = burn_build_pcob(output + output_at,
                                            output_capacity - output_at,
                                            snapshot);
@@ -1947,6 +2063,7 @@ static bool burn_rewrite_analysis(const char *path,
         } else if (!rb->memcmp(source + source_at, "PCO2", 4) &&
                    tag_length >= 20 &&
                    burn_be32(source + source_at + 12) == 1) {
+            saw_pco2 = true;
             replacement = burn_build_pco2(output + output_at,
                                            output_capacity - output_at,
                                            snapshot);
@@ -1959,6 +2076,28 @@ static bool burn_rewrite_analysis(const char *path,
         }
         output_at += replacement;
         source_at += tag_length;
+    }
+    /* Some Rekordbox exports omit an empty hotcue bank entirely. Replacing
+       only tags that already exist made first-cue burns look successful but
+       left nothing for Rekordbox/CDJs to discover. Materialize the missing
+       type-1 bank; EXT receives its colour companion as well. */
+    if (!saw_pcob) {
+        int addition = burn_build_pcob(output + output_at,
+                                       output_capacity - output_at,
+                                       snapshot);
+
+        if (addition < 0)
+            return false;
+        output_at += addition;
+    }
+    if (extended && !saw_pco2) {
+        int addition = burn_build_pco2(output + output_at,
+                                       output_capacity - output_at,
+                                       snapshot);
+
+        if (addition < 0)
+            return false;
+        output_at += addition;
     }
     burn_put_be32(output + 8, output_at);
     rb->remove(temporary);
@@ -1990,16 +2129,18 @@ static bool burn_analysis_for_track(const struct rbprep_pdb_track *track,
     char path[MAX_PATH];
     int source_bpm;
 
-    if (!track->analysis_path[0])
-        return true;
-    rb->strlcpy(path, track->analysis_path, sizeof(path));
     source_bpm = burn_source_bpm(track_id, track->source_bpm_x100);
-    if (!burn_rewrite_analysis(path, snapshot, source_bpm,
-                               memory, memory_size))
-        return false;
-    burn_analysis_variant(path, ".EXT");
-    return burn_rewrite_analysis(path, snapshot, source_bpm,
-                                 memory, memory_size);
+    if (track->analysis_path[0]) {
+        rb->strlcpy(path, track->analysis_path, sizeof(path));
+        if (!burn_rewrite_analysis(path, snapshot, source_bpm,
+                                   memory, memory_size))
+            return false;
+        burn_analysis_variant(path, ".EXT");
+        if (!burn_rewrite_analysis(path, snapshot, source_bpm,
+                                   memory, memory_size))
+            return false;
+    }
+    return burn_rewrite_track_cues(track_id, snapshot);
 }
 
 static void burn_finish_analysis_files(struct rbprep_pdb *pdb,
@@ -2017,13 +2158,25 @@ static void burn_finish_analysis_files(struct rbprep_pdb *pdb,
     while (rb->read(fd, record, sizeof(record)) == sizeof(record)) {
         off_t after = rb->lseek(fd, 0, SEEK_CUR);
         struct rbprep_pdb_track track;
+        uint32_t track_id;
         char path[MAX_PATH];
         char previous[MAX_PATH];
-        if (!valid_edit_record(record) ||
-            (target_track >= 0 &&
-             read_u32(record + 8) != (uint32_t)target_track) ||
-            !burn_record_is_latest(fd, read_u32(record + 8), after) ||
-            !pdb_find_track(pdb, read_u32(record + 8), &track) ||
+        if (!valid_edit_record(record))
+            continue;
+        track_id = read_u32(record + 8);
+        if ((target_track >= 0 && track_id != (uint32_t)target_track) ||
+            !burn_record_is_latest(fd, track_id, after))
+            continue;
+
+        rb->snprintf(path, sizeof(path), "%s/%06lu.rbw",
+                     RBPREP_TRACK_DIR, (unsigned long)track_id);
+        rb->snprintf(previous, sizeof(previous), "%s.rbprep-prev", path);
+        if (restore)
+            burn_restore_previous(path, previous);
+        else
+            rb->remove(previous);
+
+        if (!pdb_find_track(pdb, track_id, &track) ||
             !track.analysis_path[0])
             continue;
         rb->strlcpy(path, track.analysis_path, sizeof(path));

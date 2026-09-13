@@ -4942,28 +4942,28 @@ static void fill_axis_quad(int x0, int y0, int x1, int y1,
 
 static void draw_phase_module(int cx, int cy, int angle)
 {
-    int tx = -wheel_sine[angle];
-    int ty = wheel_cosine[angle];
-    int rx = wheel_cosine[angle];
-    int ry = wheel_sine[angle];
-    int outer_x0 = cx - tx * 10 / 256;
-    int outer_y0 = cy - ty * 10 / 256;
-    int outer_x1 = cx + tx * 10 / 256;
-    int outer_y1 = cy + ty * 10 / 256;
-    int inner_x0 = cx - tx * 9 / 256;
-    int inner_y0 = cy - ty * 9 / 256;
-    int inner_x1 = cx + tx * 9 / 256;
-    int inner_y1 = cy + ty * 9 / 256;
-    int ring_x = cx - tx * 5 / 256;
-    int ring_y = cy - ty * 5 / 256;
-    int led_x0 = cx + tx * 2 / 256;
-    int led_y0 = cy + ty * 2 / 256;
-    int led_x1 = cx + tx * 7 / 256;
-    int led_y1 = cy + ty * 7 / 256;
+    int tx = wheel_cosine[angle];
+    int ty = wheel_sine[angle];
+    int rx = -wheel_sine[angle];
+    int ry = wheel_cosine[angle];
+    int outer_x0 = cx - tx * 4 / 256;
+    int outer_y0 = cy - ty * 4 / 256;
+    int outer_x1 = cx + tx * 22 / 256;
+    int outer_y1 = cy + ty * 22 / 256;
+    int inner_x0 = cx - tx * 3 / 256;
+    int inner_y0 = cy - ty * 3 / 256;
+    int inner_x1 = cx + tx * 21 / 256;
+    int inner_y1 = cy + ty * 21 / 256;
+    int ring_x = cx;
+    int ring_y = cy;
+    int led_x0 = cx + tx * 8 / 256;
+    int led_y0 = cy + ty * 8 / 256;
+    int led_x1 = cx + tx * 18 / 256;
+    int led_y1 = cy + ty * 18 / 256;
 
-    /* Phase remote: the recognisable slim black wireless unit, with a metal
-       pickup ring near its crown and a luminous strip down its lower face.
-       The body stays tangent to the groove as the complete unit orbits. */
+    /* The spindle passes through the Phase pickup ring. The remote is one
+       rigid radial hand: its centre never wanders and its body rotates at
+       the exact platter phase instead of floating tangentially in a groove. */
     fill_axis_quad(outer_x0, outer_y0, outer_x1, outer_y1, 4, LCD_WHITE);
     fill_axis_quad(inner_x0, inner_y0, inner_x1, inner_y1, 3, LCD_BLACK);
     rb->lcd_set_foreground(LCD_RGBPACK(145, 153, 148));
@@ -5177,14 +5177,11 @@ static void draw_turntable(void)
                                cue_palette[hotcue_colors[slot] & 7]);
     }
 
-    /* Phase rides the record instead of impersonating a spindle cap. Its
-       long axis remains tangent to the groove and rotates with the platter. */
+    /* The Phase spindle receiver is the platter's clock hand. */
     if (turntable_headshell_style == 4) {
         int remote_angle = (phase + 10) & 63;
-        int remote_x = cx + wheel_cosine[remote_angle] * 29 / 256;
-        int remote_y = cy + wheel_sine[remote_angle] * 29 / 256;
 
-        draw_phase_module(remote_x, remote_y, remote_angle);
+        draw_phase_module(cx, cy, remote_angle);
     }
     rb->lcd_set_foreground(LCD_BLACK);
     xlcd_fillcircle(cx, cy, 2);
@@ -7750,6 +7747,10 @@ static bool play_track_index(int index, int row,
     mode = MODE_DECK;
     if (macro_active >= 0 && tool_macros[macro_active].count > 0)
         apply_macro_step(&tool_macros[macro_active].steps[0]);
+    /* A new song always starts with hotcue 1 in focus, including when a
+       remembered workflow reselects a cue-oriented tool during loading. */
+    if (old_track_id < 0 || track.id != (uint32_t)old_track_id)
+        set_cue_focus_slot(0);
     force_full_redraw = true;
     activity_ticker_ping(1000);
     return true;
@@ -9295,15 +9296,22 @@ static void draw_tool_orbs(void)
         int color = !enabled ? LCD_RGBPACK(8, 10, 9) : i == selected
                   ? (tool_menu_active ? LCD_WHITE : RBPREP_GREEN)
                   : LCD_RGBPACK(48, 70, 56);
+        int icon_color = !enabled ? LCD_RGBPACK(25, 29, 26) :
+                         i == selected ? LCD_BLACK
+                                       : LCD_RGBPACK(195, 215, 201);
+
+        /* The portal owns SEEK only temporarily. Blink the glyph, not the
+           orb or page, so the HUD remains stable while making that state
+           unmistakable. */
+        if (seek_portal_active && i == selected && tool == TOOL_SEEK &&
+            ((*rb->current_tick / MAX(1, HZ / 4)) & 1))
+            icon_color = color;
         rb->lcd_set_foreground(color);
         if (enabled)
             xlcd_fillcircle(cx, 73, i == selected ? 7 : 6);
         else
             xlcd_drawcircle(cx, 73, i == selected ? 7 : 6);
-        draw_tool_icon(cx, 73, tool,
-                       !enabled ? LCD_RGBPACK(25, 29, 26) :
-                       i == selected ? LCD_BLACK
-                                     : LCD_RGBPACK(195, 215, 201));
+        draw_tool_icon(cx, 73, tool, icon_color);
     }
 
     if (mode == MODE_CUES) {
@@ -9328,7 +9336,9 @@ static void draw_tool_status(void)
     int status_x = 123;
 
     if (tool == TOOL_SEEK)
-        rb->snprintf(line, sizeof(line), "SEEK  %dms/tick", scrub_step_ms());
+        rb->snprintf(line, sizeof(line), seek_portal_active
+                     ? "TEMP SEEK  %dms/tick  DBL SELECT:RETURN"
+                     : "SEEK  %dms/tick", scrub_step_ms());
     else if (tool == TOOL_IPOD_SEEK)
         rb->snprintf(line, sizeof(line), "IPOD SEEK  WHEEL:GAIN  < >:SEEK");
     else if (tool == TOOL_SCRUB_STEP)
@@ -13762,7 +13772,10 @@ static void handle_escape_once(void)
         return;
     }
     if (seek_portal_active) {
-        toggle_seek_portal();
+        /* MENU is deliberately inert inside the double-SELECT portal. Only
+           another double SELECT may restore the exact previous tool/macro
+           position, preventing an accidental escape into page navigation. */
+        force_full_redraw = true;
         return;
     }
     if (mode == MODE_MACRO_PICKER) {
@@ -14806,6 +14819,10 @@ enum plugin_status plugin_start(const void *parameter)
             pressed = BUTTON_NONE;
             if (menu_hold_fired) {
                 menu_hold_fired = false;
+            } else if (seek_portal_active) {
+                /* Short MENU is consumed too; double SELECT is the portal's
+                   only exit so the saved tool context cannot be bypassed. */
+                force_full_redraw = true;
             } else if (mode == MODE_MACRO_VALUE) {
                 if (macro_tool_supports_fixed_value(macro_value_tool))
                     macro_value_choose = !macro_value_choose;
