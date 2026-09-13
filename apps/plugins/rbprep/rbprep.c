@@ -100,6 +100,8 @@
 #define RBPREP_CHROMA_BANDS 12
 #define RBPREP_SPECTRUM_HISTORY 16
 #define RBPREP_PCM_FRAMES 1024
+#define RBPREP_PHRASE_CELLS 32
+#define RBPREP_PHRASE_BARS 8
 #define RBPREP_GREEN theme_accent
 #define RBPREP_GREEN_DIM theme_accent_dim
 #define RBPREP_MENU_TEXT LCD_RGBPACK(188, 205, 193)
@@ -326,6 +328,26 @@ struct rbprep_pending_playlist {
     char name[64];
 };
 
+struct rbprep_phrase_cache {
+    int first_beat;
+    int track_id;
+    int track_length;
+    int beat_count;
+    int grid_phase_ms;
+    int grid_offset;
+    int grid_bpm_x100;
+    int grid_beat_shift;
+    int cell_start[RBPREP_PHRASE_CELLS];
+    int cell_end[RBPREP_PHRASE_CELLS];
+    int cell_color[RBPREP_PHRASE_CELLS];
+    unsigned char cell_height[RBPREP_PHRASE_CELLS];
+    unsigned char cell_valid[RBPREP_PHRASE_CELLS];
+    unsigned char cell_downbeat[RBPREP_PHRASE_CELLS];
+    unsigned char section_high[RBPREP_PHRASE_BARS];
+    bool imported;
+    bool valid;
+};
+
 static enum rbprep_mode mode;
 static struct rbprep_caps capabilities;
 static struct rbprep_wave_reader wave_reader;
@@ -344,6 +366,7 @@ static int waveform_points;
 static int beat_count;
 static int beat_search_hint;
 static bool imported_grid_cached;
+static struct rbprep_phrase_cache phrase_map_cache;
 static int zoom = 1;
 static int grid_offset;
 static int grid_phase_ms = 26;
@@ -786,6 +809,7 @@ static char selected_key[24];
 static char selected_comments[96];
 static char selected_extension[12];
 static int usb_armed_selection;
+static bool usb_arm_state_persisted;
 static bool usb_event_registered;
 static bool usb_extract_event_registered;
 static uint32_t usb_active_playlist_source_id;
@@ -798,6 +822,7 @@ static unsigned char usb_unsaved_edit[RBPREP_EDIT_RECORD_SIZE];
 static void stop_editor_audio(void);
 static void reset_play_clock(int anchor, long tick);
 static bool update_play_clock(void);
+static int live_playhead_now(void);
 static void jump_to_time(int target);
 static bool flush_deferred_edit(void);
 static void start_spectrum_capture(void);
@@ -1574,12 +1599,21 @@ static const struct mixer_buffer_cbs spectrum_buffer_cbs = {
     .sampr_changed = spectrum_sample_rate_changed,
 };
 
+static bool visualizer_uses_pcm(void)
+{
+    /* Phrase Map is driven entirely by the imported waveform and beat grid.
+       Keeping the mixer hook alive for it wastes audio-thread time and can
+       starve the map renderer when this saved visualizer is restored at
+       startup. */
+    return visualizer_mode > 0 && visualizer_mode != 6;
+}
+
 static void start_spectrum_capture(void)
 {
     /* The callback runs in Rockbox's mixer path.  The RGB waveform is already
        driven by imported analysis and must not spend audio-thread time copying
        PCM that it never consumes. */
-    if (spectrum_capture_active || visualizer_mode == 0 || display_locked ||
+    if (spectrum_capture_active || !visualizer_uses_pcm() || display_locked ||
         mode < MODE_DECK)
         return;
     pcm_capture_index = 0;
@@ -1612,7 +1646,7 @@ static void stop_spectrum_capture(void)
 
 static void update_spectrum_capture_state(void)
 {
-    if (!display_locked && mode >= MODE_DECK && visualizer_mode != 0)
+    if (!display_locked && mode >= MODE_DECK && visualizer_uses_pcm())
         start_spectrum_capture();
     else
         stop_spectrum_capture();
@@ -4644,57 +4678,35 @@ static void draw_stereo_orbit(void)
                   line, LCD_WHITE);
 }
 
-static void draw_phrase_map(void)
+static bool phrase_map_cache_matches(int first, bool imported)
 {
-    const int cells = 32;
-    const int bars = 8;
-    const int left = 5;
-    const int cell_width = 9;
-    const int top = RBPREP_WAVE_TOP + 24;
-    const int bottom = RBPREP_WAVE_BOTTOM - 49;
-    const int section_high_y = RBPREP_WAVE_BOTTOM - 30;
-    const int section_low_y = RBPREP_WAVE_BOTTOM - 22;
-    int cell_start[32];
-    int cell_end[32];
-    unsigned char cell_valid[32];
-    unsigned short bar_energy[8];
-    unsigned char bar_samples[8];
-    unsigned char section_high[8];
-    int period = beat_period_ms();
-    int base = grid_phase_ms + grid_offset;
-    int current;
-    int beat_number;
-    int first;
-    int cell;
-    int slot;
+    return phrase_map_cache.valid &&
+           phrase_map_cache.first_beat == first &&
+           phrase_map_cache.track_id == selected_track_id &&
+           phrase_map_cache.track_length == track_length &&
+           phrase_map_cache.beat_count == beat_count &&
+           phrase_map_cache.grid_phase_ms == grid_phase_ms &&
+           phrase_map_cache.grid_offset == grid_offset &&
+           phrase_map_cache.grid_bpm_x100 == grid_bpm_x100 &&
+           phrase_map_cache.grid_beat_shift == grid_beat_shift &&
+           phrase_map_cache.imported == imported;
+}
+
+static void rebuild_phrase_map_cache(int first, bool imported, int period,
+                                     int base, int top, int bottom)
+{
+    unsigned short bar_energy[RBPREP_PHRASE_BARS];
+    unsigned char bar_samples[RBPREP_PHRASE_BARS];
     int energy_total = 0;
     int energy_bars = 0;
     int energy_mean;
     int threshold;
-    bool imported = imported_grid_resident();
+    int cell;
 
-    rb->memset(cell_valid, 0, sizeof(cell_valid));
+    rb->memset(&phrase_map_cache, 0, sizeof(phrase_map_cache));
     rb->memset(bar_energy, 0, sizeof(bar_energy));
     rb->memset(bar_samples, 0, sizeof(bar_samples));
-    if (imported) {
-        current = current_beat_index(playhead);
-        if (current < 0)
-            current = 0;
-        beat_number = adjusted_beat_number(current);
-        first = current - beat_number + 1 - 12;
-    } else {
-        current = MAX(0, (playhead - base) / MAX(1, period));
-        beat_number = (current & 3) + 1;
-        first = current - beat_number + 1 - 12;
-    }
-
-    text(5, RBPREP_WAVE_TOP + 3, "PHRASE MAP  /  8 BARS",
-         LCD_RGBPACK(120, 255, 218));
-    rb->lcd_set_foreground(LCD_RGBPACK(5, 15, 11));
-    rb->lcd_fillrect(left - 2, top - 3, cells * cell_width + 3,
-                     bottom - top + 7);
-
-    for (cell = 0; cell < cells; cell++) {
+    for (cell = 0; cell < RBPREP_PHRASE_CELLS; cell++) {
         int beat = first + cell;
         int start_time;
         int end_time;
@@ -4703,37 +4715,28 @@ static void draw_phrase_map(void)
         int sample;
         int peak = 0;
         int peak_sample = 0;
-        int x = left + cell * cell_width;
-        int height;
-        int color;
         int bar_index = cell / 4;
         bool valid = !imported || (beat >= 0 && beat < beat_count);
-        bool downbeat;
 
-        if (!valid) {
-            rb->lcd_set_foreground(LCD_RGBPACK(13, 22, 17));
-            rb->lcd_fillrect(x, bottom - 3, cell_width - 2, 4);
+        if (!valid)
             continue;
-        }
         if (imported) {
             start_time = adjusted_beat_time(beat);
             end_time = beat + 1 < beat_count
                      ? adjusted_beat_time(beat + 1)
                      : start_time + period;
-            downbeat = adjusted_beat_number(beat) == 1;
+            phrase_map_cache.cell_downbeat[cell] =
+                adjusted_beat_number(beat) == 1;
         } else {
             start_time = base + beat * period;
             end_time = start_time + period;
-            downbeat = (beat & 3) == 0;
+            phrase_map_cache.cell_downbeat[cell] = (beat & 3) == 0;
         }
-        if (end_time <= 0 || start_time >= track_length) {
-            rb->lcd_set_foreground(LCD_RGBPACK(13, 22, 17));
-            rb->lcd_fillrect(x, bottom - 3, cell_width - 2, 4);
+        if (end_time <= 0 || start_time >= track_length)
             continue;
-        }
-        cell_start[cell] = start_time;
-        cell_end[cell] = end_time;
-        cell_valid[cell] = 1;
+        phrase_map_cache.cell_start[cell] = start_time;
+        phrase_map_cache.cell_end[cell] = end_time;
+        phrase_map_cache.cell_valid[cell] = 1;
         sample_begin = MAX(0, MIN(RBPREP_OVERVIEW_WIDTH - 1,
             (long long)start_time * RBPREP_OVERVIEW_WIDTH /
             MAX(1, track_length)));
@@ -4747,34 +4750,18 @@ static void draw_phrase_map(void)
                 peak_sample = sample;
             }
         }
-        height = 5 + peak * (bottom - top - 8) / 255;
-        color = peak > 0
-              ? LCD_RGBPACK(overview_waveform[peak_sample][1],
-                            overview_waveform[peak_sample][2],
-                            overview_waveform[peak_sample][3])
-              : LCD_RGBPACK(24, 45, 34);
-        rb->lcd_set_foreground(color);
-        rb->lcd_fillrect(x, bottom - height, cell_width - 2, height);
-        rb->lcd_set_foreground(downbeat ? LCD_WHITE
-                                       : LCD_RGBPACK(42, 72, 57));
-        rb->lcd_vline(x, top - (downbeat ? 3 : 0), bottom + 2);
+        phrase_map_cache.cell_height[cell] =
+            5 + peak * (bottom - top - 8) / 255;
+        phrase_map_cache.cell_color[cell] = peak > 0
+            ? LCD_RGBPACK(overview_waveform[peak_sample][1],
+                          overview_waveform[peak_sample][2],
+                          overview_waveform[peak_sample][3])
+            : LCD_RGBPACK(24, 45, 34);
         bar_energy[bar_index] += peak;
         bar_samples[bar_index]++;
-        if (beat == current) {
-            int cursor = x + (long long)(playhead - start_time) *
-                         (cell_width - 3) /
-                         MAX(1, end_time - start_time);
-
-            rb->lcd_set_foreground(LCD_WHITE);
-            cursor = MAX(x, MIN(x + cell_width - 3, cursor));
-            rb->lcd_vline(cursor, top, bottom);
-        }
     }
 
-    /* Phrase sections are deliberately inferred from dynamics already in
-       memory.  A small hysteresis keeps adjacent bars together instead of
-       turning every transient into a new section. */
-    for (cell = 0; cell < bars; cell++) {
+    for (cell = 0; cell < RBPREP_PHRASE_BARS; cell++) {
         if (bar_samples[cell]) {
             bar_energy[cell] /= bar_samples[cell];
             energy_total += bar_energy[cell];
@@ -4783,53 +4770,150 @@ static void draw_phrase_map(void)
     }
     energy_mean = energy_bars ? energy_total / energy_bars : 0;
     threshold = MAX(10, energy_mean / 8);
-    for (cell = 0; cell < bars; cell++) {
+    for (cell = 0; cell < RBPREP_PHRASE_BARS; cell++) {
         int energy = bar_energy[cell];
 
         if (!bar_samples[cell])
-            section_high[cell] = cell ? section_high[cell - 1] : 0;
+            phrase_map_cache.section_high[cell] = cell
+                ? phrase_map_cache.section_high[cell - 1] : 0;
         else if (energy >= energy_mean + threshold)
-            section_high[cell] = 1;
+            phrase_map_cache.section_high[cell] = 1;
         else if (energy <= MAX(0, energy_mean - threshold))
-            section_high[cell] = 0;
+            phrase_map_cache.section_high[cell] = 0;
         else
-            section_high[cell] = cell ? section_high[cell - 1]
-                                      : energy >= energy_mean;
+            phrase_map_cache.section_high[cell] = cell
+                ? phrase_map_cache.section_high[cell - 1]
+                : energy >= energy_mean;
     }
-    for (cell = 1; cell + 1 < bars; cell++)
-        if (section_high[cell - 1] == section_high[cell + 1] &&
-            section_high[cell] != section_high[cell - 1])
-            section_high[cell] = section_high[cell - 1];
-    for (cell = 0; cell < bars; cell++) {
+    for (cell = 1; cell + 1 < RBPREP_PHRASE_BARS; cell++) {
+        if (phrase_map_cache.section_high[cell - 1] ==
+                phrase_map_cache.section_high[cell + 1] &&
+            phrase_map_cache.section_high[cell] !=
+                phrase_map_cache.section_high[cell - 1])
+            phrase_map_cache.section_high[cell] =
+                phrase_map_cache.section_high[cell - 1];
+    }
+
+    phrase_map_cache.first_beat = first;
+    phrase_map_cache.track_id = selected_track_id;
+    phrase_map_cache.track_length = track_length;
+    phrase_map_cache.beat_count = beat_count;
+    phrase_map_cache.grid_phase_ms = grid_phase_ms;
+    phrase_map_cache.grid_offset = grid_offset;
+    phrase_map_cache.grid_bpm_x100 = grid_bpm_x100;
+    phrase_map_cache.grid_beat_shift = grid_beat_shift;
+    phrase_map_cache.imported = imported;
+    phrase_map_cache.valid = true;
+}
+
+static void draw_phrase_map(void)
+{
+    const int left = 5;
+    const int cell_width = 9;
+    const int top = RBPREP_WAVE_TOP + 24;
+    const int bottom = RBPREP_WAVE_BOTTOM - 49;
+    const int section_high_y = RBPREP_WAVE_BOTTOM - 30;
+    const int section_low_y = RBPREP_WAVE_BOTTOM - 22;
+    int frame_playhead = live_playhead_now();
+    int period = beat_period_ms();
+    int base = grid_phase_ms + grid_offset;
+    int current;
+    int beat_number;
+    int first;
+    int cell;
+    int slot;
+    bool imported = imported_grid_resident();
+
+    if (imported) {
+        current = current_beat_index(frame_playhead);
+        if (current < 0)
+            current = 0;
+        beat_number = adjusted_beat_number(current);
+        first = current - beat_number + 1 - 12;
+    } else {
+        current = MAX(0, (frame_playhead - base) / MAX(1, period));
+        beat_number = (current & 3) + 1;
+        first = current - beat_number + 1 - 12;
+    }
+    if (!phrase_map_cache_matches(first, imported))
+        rebuild_phrase_map_cache(first, imported, period, base, top, bottom);
+
+    text(5, RBPREP_WAVE_TOP + 3, "PHRASE MAP  /  8 BARS",
+         LCD_RGBPACK(120, 255, 218));
+    rb->lcd_set_foreground(LCD_RGBPACK(5, 15, 11));
+    rb->lcd_fillrect(left - 2, top - 3,
+                     RBPREP_PHRASE_CELLS * cell_width + 3,
+                     bottom - top + 7);
+
+    for (cell = 0; cell < RBPREP_PHRASE_CELLS; cell++) {
+        int x = left + cell * cell_width;
+
+        if (!phrase_map_cache.cell_valid[cell]) {
+            rb->lcd_set_foreground(LCD_RGBPACK(13, 22, 17));
+            rb->lcd_fillrect(x, bottom - 3, cell_width - 2, 4);
+            continue;
+        }
+        rb->lcd_set_foreground(phrase_map_cache.cell_color[cell]);
+        rb->lcd_fillrect(x,
+            bottom - phrase_map_cache.cell_height[cell], cell_width - 2,
+            phrase_map_cache.cell_height[cell]);
+        rb->lcd_set_foreground(phrase_map_cache.cell_downbeat[cell]
+                               ? LCD_WHITE : LCD_RGBPACK(42, 72, 57));
+        rb->lcd_vline(x,
+            top - (phrase_map_cache.cell_downbeat[cell] ? 3 : 0),
+            bottom + 2);
+    }
+
+    cell = current - first;
+    if (cell >= 0 && cell < RBPREP_PHRASE_CELLS &&
+        phrase_map_cache.cell_valid[cell]) {
+        int x = left + cell * cell_width;
+        int start_time = phrase_map_cache.cell_start[cell];
+        int end_time = phrase_map_cache.cell_end[cell];
+        int cursor = x + (long long)(frame_playhead - start_time) *
+                     (cell_width - 3) / MAX(1, end_time - start_time);
+
+        rb->lcd_set_foreground(LCD_WHITE);
+        cursor = MAX(x, MIN(x + cell_width - 3, cursor));
+        rb->lcd_vline(cursor, top, bottom);
+    }
+
+    for (cell = 0; cell < RBPREP_PHRASE_BARS; cell++) {
         int x1 = left + cell * 4 * cell_width;
         int x2 = x1 + 4 * cell_width - 3;
-        int y = section_high[cell] ? section_high_y : section_low_y;
+        int y = phrase_map_cache.section_high[cell]
+              ? section_high_y : section_low_y;
 
-        rb->lcd_set_foreground(section_high[cell] ? RBPREP_GREEN
-                                                   : theme_accent_dim);
+        rb->lcd_set_foreground(phrase_map_cache.section_high[cell]
+                               ? RBPREP_GREEN : theme_accent_dim);
         rb->lcd_hline(x1, x2, y);
         rb->lcd_hline(x1, x2, y + 1);
-        if (cell && section_high[cell] != section_high[cell - 1]) {
-            int previous_y = section_high[cell - 1]
+        if (cell && phrase_map_cache.section_high[cell] !=
+                    phrase_map_cache.section_high[cell - 1]) {
+            int previous_y = phrase_map_cache.section_high[cell - 1]
                            ? section_high_y : section_low_y;
 
             rb->lcd_vline(x1, MIN(y, previous_y), MAX(y, previous_y) + 1);
         }
     }
 
-    /* Hot cues sit above their exact time inside the same beat cells. */
+    /* Cue values can change independently of the cached waveform geometry. */
     for (slot = 0; slot < 16; slot++) {
         if (hotcues[slot] < 0)
             continue;
-        for (cell = 0; cell < cells; cell++) {
+        for (cell = 0; cell < RBPREP_PHRASE_CELLS; cell++) {
             int x;
 
-            if (!cell_valid[cell] || hotcues[slot] < cell_start[cell] ||
-                hotcues[slot] >= cell_end[cell])
+            if (!phrase_map_cache.cell_valid[cell] ||
+                hotcues[slot] < phrase_map_cache.cell_start[cell] ||
+                hotcues[slot] >= phrase_map_cache.cell_end[cell])
                 continue;
             x = left + cell * cell_width +
-                (long long)(hotcues[slot] - cell_start[cell]) *
-                (cell_width - 2) / MAX(1, cell_end[cell] - cell_start[cell]);
+                (long long)(hotcues[slot] -
+                            phrase_map_cache.cell_start[cell]) *
+                (cell_width - 2) /
+                MAX(1, phrase_map_cache.cell_end[cell] -
+                       phrase_map_cache.cell_start[cell]);
             draw_micro_cue_marker(x, top - 2, slot,
                                   cue_palette[hotcue_colors[slot] & 7]);
             break;
@@ -5678,6 +5762,7 @@ static void clear_analysis(void)
     beat_count = 0;
     beat_search_hint = 0;
     imported_grid_cached = false;
+    phrase_map_cache.valid = false;
     grid_offset = 0;
     grid_phase_ms = 0;
     grid_beat_shift = 0;
@@ -10033,21 +10118,34 @@ static void apply_usb_choice(int choice)
     usb_armed_selection = usb_selection;
 #ifdef USB_ENABLE_HID
     rb->global_settings->usb_hid = false;
-    rb->usb_set_hid(false);
 #endif
 #ifdef USB_ENABLE_AUDIO
     rb->global_settings->usb_audio = capabilities.usb_audio &&
                                      usb_selection == 2 ? 1 : 0;
-    rb->usb_set_audio(rb->global_settings->usb_audio);
 #endif
 #if !defined(SIMULATOR) && !defined(USB_NONE) && \
     (defined(HAVE_USB_ADB) || defined(HAVE_USB_POWER))
     rb->global_settings->usb_mode = usb_selection == 1
                                   ? USB_MODE_MASS_STORAGE
                                   : USB_MODE_CHARGE;
+#endif
+    /* These are Rekordpod session controls, not persistent Rockbox
+       preferences. settings_save() queues a later filesystem write; when a
+       cable is already attached that write can race the immediate USB
+       unmount/flush. Apply the live callbacks only after every Rekordpod file
+       has been closed and verified by the caller. */
+#ifdef USB_ENABLE_HID
+    rb->usb_set_hid(false);
+#endif
+#ifdef USB_ENABLE_AUDIO
+    rb->usb_set_audio(rb->global_settings->usb_audio);
+#endif
+#if !defined(SIMULATOR) && !defined(USB_NONE) && \
+    (defined(HAVE_USB_ADB) || defined(HAVE_USB_POWER))
     rb->usb_set_mode(rb->global_settings->usb_mode);
 #endif
-    rb->settings_save();
+    if (usb_selection == 0)
+        usb_arm_state_persisted = false;
     activity_ticker_ping(1000);
 }
 
@@ -12870,6 +12968,7 @@ static void short_select(void)
             apply_usb_choice(0);
             rb->splash(HZ * 2, "USB arm failed; power only");
         } else {
+            usb_arm_state_persisted = choice != 0;
             apply_usb_choice(choice);
             rb->splash(HZ, choice == 2 ? "USB audio is ready" :
                            choice == 1 ? "File transfer is ready" :
@@ -13233,10 +13332,7 @@ static void short_select(void)
             visualizer_mode = 6;
         else if (tool == TOOL_VIS_HARMONIC)
             visualizer_mode = 7;
-        if (visualizer_mode == 0)
-            stop_spectrum_capture();
-        else
-            start_spectrum_capture();
+        update_spectrum_capture_state();
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     } else if (mode == MODE_MACRO) {
@@ -13473,10 +13569,7 @@ static void adjust_active_tool(int direction)
                           tool == TOOL_VIS_CANYON ? 4 :
                           tool == TOOL_VIS_ORBIT ? 5 :
                           tool == TOOL_VIS_PHRASE ? 6 : 7;
-        if (visualizer_mode == 0)
-            stop_spectrum_capture();
-        else
-            start_spectrum_capture();
+        update_spectrum_capture_state();
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     }
@@ -14567,7 +14660,12 @@ static void prepare_rekordpod_for_usb(void *parameter)
     }
 
     stop_editor_audio();
-    usb_persistence_warning = !persist_usb_arm_state();
+    /* Arming Data Transfer/DAC already persisted and verified this state
+       before usb_set_mode() was allowed to reconfigure an attached cable.
+       Do not dirty the filesystem again inside Rockbox's USB flush callback. */
+    usb_persistence_warning = !usb_arm_state_persisted &&
+                              !persist_usb_arm_state();
+    usb_arm_state_persisted = false;
     usb_unsaved_edit_valid = usb_persistence_warning && track_edit_dirty &&
                              pack_current_edit_snapshot(usb_unsaved_edit);
     stop_spectrum_capture();
@@ -14688,6 +14786,7 @@ static void resume_rekordpod_after_usb(void)
         playhead = clamp_playhead(id3->elapsed);
     reset_play_clock(playhead, *rb->current_tick);
     usb_selection = usb_armed_selection = 0;
+    usb_arm_state_persisted = false;
     usb_library_context_captured = false;
     usb_unsaved_edit_valid = false;
     overview_dirty = true;
@@ -14896,6 +14995,7 @@ enum plugin_status plugin_start(const void *parameter)
     play_stat_counted = false;
     track_edit_dirty = false;
     usb_selection = 0;
+    usb_arm_state_persisted = false;
     dac_saved_volume = rb->global_status->volume;
     dac_gain_override = false;
     host_rpm_index = played_rpm_index = 0;
