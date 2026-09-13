@@ -28,6 +28,12 @@
 #define RBPREP_NODE_RECORD_V1 20
 #define RBPREP_ROOT_NODE 0xffffffffu
 #define RBPREP_LIST_ROWS 9
+#define RBPREP_PLAYLIST_CAROUSEL_ROWS 5
+#define RBPREP_PLAYLIST_CACHE_ROWS 16
+#define RBPREP_TRACK_CACHE_ROWS 18
+#define RBPREP_LIBRARY_SCAN_BYTES 4096
+#define RBPREP_PLAYLIST_ORDER_MAX 8192
+#define RBPREP_PLAYLIST_ORDER_DIR "/.rockbox/rbprep/state/orders"
 #define RBPREP_TREE_NODES 2048
 #define RBPREP_STATUS_HEIGHT 8
 #define RBPREP_DECK_X 0
@@ -99,7 +105,8 @@
 #define RBPREP_SELECT_DOUBLE_TICKS MAX(1, HZ * 3 / 10)
 #define RBPREP_SETTINGS_LAST 13
 #define RBPREP_MAIN_DISSOLVE_STEPS 16
-#define RBPREP_MAIN_TRANSITION_FRAME_TICKS MAX(1, HZ / 30)
+#define RBPREP_CONTEXT_TRANSITION_TICKS MAX(1, HZ / 50)
+#define RBPREP_CONTEXT_TRANSITION_FRAMES 7
 #define RBPREP_MAIN_SCREEN_X 101
 #define RBPREP_MAIN_SCREEN_Y 26
 #define RBPREP_MAIN_SCREEN_W 118
@@ -139,6 +146,7 @@ enum rbprep_mode {
     MODE_INDEX,
     MODE_GENRES,
     MODE_PLAYLIST_ACTIONS,
+    MODE_PLAYLIST_ORDER,
     MODE_ACCENT,
     MODE_MACRO_ACTIONS,
     MODE_MACRO_EDITOR,
@@ -156,6 +164,20 @@ enum rbprep_mode {
     MODE_MACRO,
     MODE_VISUALIZER_TWO,
     MODE_PITCH
+};
+
+enum rbprep_transition_style {
+    TRANSITION_HOME,
+    TRANSITION_CRATE,
+    TRANSITION_BLADES,
+    TRANSITION_USB,
+    TRANSITION_CONTROLS,
+    TRANSITION_DATABASE,
+    TRANSITION_FILTER,
+    TRANSITION_MACRO,
+    TRANSITION_DECK,
+    TRANSITION_DECK_PAGE,
+    TRANSITION_HOMING
 };
 
 enum rbprep_color_target {
@@ -244,7 +266,8 @@ enum rbprep_confirm_action {
     CONFIRM_MACRO_DELETE_STEP,
     CONFIRM_BURN_ALL_NOW,
     CONFIRM_TRACK_LOAD,
-    CONFIRM_PLAYLIST_SEED
+    CONFIRM_PLAYLIST_SEED,
+    CONFIRM_PLAYLIST_REORDER
 };
 
 enum rbprep_burn_request {
@@ -257,7 +280,19 @@ enum rbprep_playlist_operation {
     PLAYLIST_OP_CREATE = 'C',
     PLAYLIST_OP_RENAME = 'R',
     PLAYLIST_OP_MOVE = 'M',
-    PLAYLIST_OP_DELETE = 'D'
+    PLAYLIST_OP_DELETE = 'D',
+    PLAYLIST_OP_ORDER = 'O'
+};
+
+enum rbprep_playlist_view_order {
+    PLAYLIST_VIEW_ORIGINAL,
+    PLAYLIST_VIEW_SHUFFLE,
+    PLAYLIST_VIEW_TITLE,
+    PLAYLIST_VIEW_BPM,
+    PLAYLIST_VIEW_KEY,
+    PLAYLIST_VIEW_YEAR,
+    PLAYLIST_VIEW_IMPORTED,
+    PLAYLIST_VIEW_COUNT
 };
 
 struct rbprep_wave_column {
@@ -394,6 +429,10 @@ static unsigned short main_transition_x_lut[LCD_WIDTH];
 static unsigned short main_transition_y_lut[LCD_HEIGHT];
 static struct viewport *main_viewport;
 static bool transition_render_only;
+static bool transition_running;
+static enum rbprep_mode presented_mode;
+static unsigned context_change_serial;
+static unsigned presented_context_serial;
 static int activity_ticker_progress;
 static long activity_ticker_until;
 static long activity_ticker_last_update;
@@ -468,6 +507,7 @@ static int deferred_track_index = -1;
 static int deferred_track_row = -1;
 static enum rbprep_mode deferred_track_return_mode;
 static bool deferred_track_force_reload;
+static bool deferred_track_unload_authorized;
 static int confirm_slot;
 static int confirm_time;
 static int confirm_playlist_node;
@@ -632,11 +672,34 @@ struct rbprep_node_record {
 
 struct rbprep_playlist_cache_row {
     bool valid;
+    unsigned generation;
+    bool add_mode;
     uint32_t parent;
     int ordinal;
     int node_index;
+    int favorite_slot;
     struct rbprep_node_record node;
     char name[80];
+};
+
+struct rbprep_track_cache_row {
+    bool valid;
+    unsigned generation;
+    int ordinal;
+    int track_index;
+    struct rbprep_track_record track;
+    char title[96];
+    char secondary[96];
+    char key[24];
+};
+
+struct rbprep_playlist_order_item {
+    int track_index;
+    uint32_t track_id;
+    union {
+        int value;
+        char label[12];
+    } sort;
 };
 
 static int library_fd = -1;
@@ -658,11 +721,13 @@ static uint32_t library_sort_offsets[TRACK_SORT_COUNT];
 static uint32_t tree_parent = RBPREP_ROOT_NODE;
 static int tree_selection;
 static int tree_top;
+static int playlist_carousel_offset_fp;
 static int tree_child_count;
 static int tree_children[RBPREP_TREE_NODES];
 static int favorite_playlist_nodes[2] = { -1, -1 };
 static struct rbprep_playlist_cache_row
-    playlist_cache[RBPREP_LIST_ROWS];
+    playlist_cache[RBPREP_PLAYLIST_CACHE_ROWS];
+static unsigned playlist_cache_generation;
 static char tree_parent_name[80];
 static int track_selection;
 static int track_top;
@@ -678,6 +743,28 @@ static uint32_t shuffle_offset;
 static bool search_active;
 static bool collection_shuffle_active;
 static int active_playlist_node = -1;
+static bool track_context_initialized;
+static struct rbprep_node_record active_playlist_record;
+static bool active_playlist_record_valid;
+static char active_playlist_name[80];
+static struct rbprep_track_cache_row track_cache[RBPREP_TRACK_CACHE_ROWS];
+static unsigned track_cache_generation;
+static int track_prefetch_direction = 1;
+static unsigned char library_scan_buffer[RBPREP_LIBRARY_SCAN_BYTES];
+static struct rbprep_playlist_order_item
+    playlist_order_items[RBPREP_PLAYLIST_ORDER_MAX];
+static int playlist_order_count;
+static int playlist_view_order;
+static int playlist_order_menu_selection;
+static bool playlist_order_active;
+static bool playlist_reorder_editing;
+static bool playlist_reorder_grabbed;
+static bool playlist_order_dirty;
+static uint32_t playlist_order_source_id;
+static uint32_t recent_scan_index;
+static int recent_scan_today;
+static int recent_scan_cutoff;
+static bool recent_scan_active;
 static int selected_track_index = -1;
 static int selected_track_id = -1;
 static enum rbprep_mode deck_return_mode = MODE_LIBRARY;
@@ -2377,14 +2464,9 @@ static bool read_index_at(uint32_t offset, void *data, size_t size)
            rb->read(library_fd, data, size) == (ssize_t)size;
 }
 
-static bool read_track_record(int index, struct rbprep_track_record *track)
+static void decode_track_record(const unsigned char *data,
+                                struct rbprep_track_record *track)
 {
-    unsigned char data[RBPREP_TRACK_RECORD];
-
-    if (index < 0 || (uint32_t)index >= library_track_count ||
-        !read_index_at(library_track_offset + index * library_track_record_size,
-                       data, library_track_record_size))
-        return false;
     track->id = read_u32(data);
     track->path_offset = read_u32(data + 4);
     track->title_offset = read_u32(data + 8);
@@ -2414,7 +2496,31 @@ static bool read_track_record(int index, struct rbprep_track_record *track)
         track->tags_offset = 0;
         track->search_offset = 0;
     }
+}
+
+static bool read_track_record(int index, struct rbprep_track_record *track)
+{
+    unsigned char data[RBPREP_TRACK_RECORD];
+
+    if (index < 0 || (uint32_t)index >= library_track_count ||
+        !read_index_at(library_track_offset + index * library_track_record_size,
+                       data, library_track_record_size))
+        return false;
+    decode_track_record(data, track);
     return true;
+}
+
+static void decode_node_record(const unsigned char *data,
+                               struct rbprep_node_record *node)
+{
+    node->parent = read_u32(data);
+    node->name_offset = read_u32(data + 4);
+    node->first_member = read_u32(data + 8);
+    node->member_count = read_u32(data + 12);
+    node->kind = data[16];
+    node->source_id = library_index_version >= 2 ? read_u32(data + 20) : 0;
+    if (node->kind != 0 && playlist_has_smart_query(node->source_id))
+        node->kind = 2;
 }
 
 static bool read_node_record(int index, struct rbprep_node_record *node)
@@ -2425,14 +2531,7 @@ static bool read_node_record(int index, struct rbprep_node_record *node)
         !read_index_at(library_node_offset + index * library_node_record_size,
                        data, library_node_record_size))
         return false;
-    node->parent = read_u32(data);
-    node->name_offset = read_u32(data + 4);
-    node->first_member = read_u32(data + 8);
-    node->member_count = read_u32(data + 12);
-    node->kind = data[16];
-    node->source_id = library_index_version >= 2 ? read_u32(data + 20) : 0;
-    if (node->kind != 0 && playlist_has_smart_query(node->source_id))
-        node->kind = 2;
+    decode_node_record(data, node);
     return true;
 }
 
@@ -2654,27 +2753,37 @@ static void invalidate_playlist_cache(void)
 {
     int row;
 
-    for (row = 0; row < RBPREP_LIST_ROWS; row++)
+    playlist_cache_generation++;
+    if (!playlist_cache_generation)
+        playlist_cache_generation = 1;
+    for (row = 0; row < RBPREP_PLAYLIST_CACHE_ROWS; row++)
         playlist_cache[row].valid = false;
 }
 
-static bool cached_playlist_node(int ordinal,
-                                 struct rbprep_playlist_cache_row **result)
+static bool cached_playlist_visible(int ordinal, bool load,
+                                    struct rbprep_playlist_cache_row **result)
 {
     int slot;
     struct rbprep_playlist_cache_row *cached;
 
-    if (ordinal < 0 || ordinal >= tree_child_count)
+    if (ordinal < 0 || ordinal >= playlist_browser_count() ||
+        (playlist_add_mode && ordinal == 0))
         return false;
-    slot = ordinal % RBPREP_LIST_ROWS;
+    slot = ordinal % RBPREP_PLAYLIST_CACHE_ROWS;
     cached = &playlist_cache[slot];
-    if (!cached->valid || cached->parent != tree_parent ||
-        cached->ordinal != ordinal) {
+    if (!cached->valid || cached->generation != playlist_cache_generation ||
+        cached->add_mode != playlist_add_mode ||
+        cached->parent != tree_parent || cached->ordinal != ordinal) {
+        if (!load)
+            return false;
         cached->valid = false;
+        cached->generation = playlist_cache_generation;
+        cached->add_mode = playlist_add_mode;
         cached->parent = tree_parent;
         cached->ordinal = ordinal;
-        cached->node_index = tree_children[ordinal];
-        if (!read_node_record(cached->node_index, &cached->node) ||
+        cached->node_index = playlist_node_at_visible(
+            ordinal, &cached->node, &cached->favorite_slot);
+        if (cached->node_index < 0 ||
             !read_index_string(cached->node.name_offset, cached->name,
                                sizeof(cached->name)))
             return false;
@@ -2686,25 +2795,47 @@ static bool cached_playlist_node(int ordinal,
 
 static void refresh_tree_children(uint32_t parent)
 {
-    int index;
+    uint32_t index;
     struct rbprep_node_record node;
+    int records_per_chunk;
+    uint32_t previous_parent = tree_parent;
 
     tree_parent = parent;
+    if (mode == MODE_PLAYLISTS && parent != previous_parent)
+        context_change_serial++;
     tree_child_count = 0;
     tree_parent_name[0] = '\0';
     favorite_playlist_nodes[0] = favorite_playlist_nodes[1] = -1;
     invalidate_playlist_cache();
-    for (index = 0; (uint32_t)index < library_node_count; index++) {
-        if (!read_node_record(index, &node))
+    if (library_fd < 0 || library_node_record_size <= 0 ||
+        rb->lseek(library_fd, library_node_offset, SEEK_SET) < 0)
+        return;
+    records_per_chunk = RBPREP_LIBRARY_SCAN_BYTES /
+                        library_node_record_size;
+    for (index = 0; index < library_node_count;) {
+        uint32_t count = MIN((uint32_t)records_per_chunk,
+                             library_node_count - index);
+        uint32_t item;
+
+        if (!read_exact(library_fd, library_scan_buffer,
+                        count * library_node_record_size))
             break;
-        if (favorite_playlist_ids[0] > 0 &&
-            node.source_id == (uint32_t)favorite_playlist_ids[0])
-            favorite_playlist_nodes[0] = index;
-        if (favorite_playlist_ids[1] > 0 &&
-            node.source_id == (uint32_t)favorite_playlist_ids[1])
-            favorite_playlist_nodes[1] = index;
-        if (node.parent == parent && tree_child_count < RBPREP_TREE_NODES)
-            tree_children[tree_child_count++] = index;
+        for (item = 0; item < count; item++) {
+            int node_index = index + item;
+
+            decode_node_record(library_scan_buffer +
+                               item * library_node_record_size, &node);
+            if (favorite_playlist_ids[0] > 0 &&
+                node.source_id == (uint32_t)favorite_playlist_ids[0])
+                favorite_playlist_nodes[0] = node_index;
+            if (favorite_playlist_ids[1] > 0 &&
+                node.source_id == (uint32_t)favorite_playlist_ids[1])
+                favorite_playlist_nodes[1] = node_index;
+            if (node.parent == parent &&
+                tree_child_count < RBPREP_TREE_NODES)
+                tree_children[tree_child_count++] = node_index;
+        }
+        index += count;
     }
     if (parent != RBPREP_ROOT_NODE && read_node_record(parent, &node))
         read_index_string(node.name_offset, tree_parent_name,
@@ -2770,7 +2901,6 @@ static int find_track_row_in_collection(int track_index)
 static int track_index_at_row(int row)
 {
     unsigned char data[4];
-    struct rbprep_node_record node;
 
     if (active_playlist_node < 0) {
         if (collection_shuffle_active)
@@ -2787,12 +2917,184 @@ static int track_index_at_row(int row)
         }
         return collection_sorted_index_at(row);
     }
-    if (!read_node_record(active_playlist_node, &node) || row < 0 ||
-        (uint32_t)row >= node.member_count ||
+    if (playlist_order_active && active_playlist_record_valid &&
+        playlist_order_source_id == active_playlist_record.source_id)
+        return row >= 0 && row < playlist_order_count
+             ? playlist_order_items[row].track_index : -1;
+    if (!active_playlist_record_valid || row < 0 ||
+        (uint32_t)row >= active_playlist_record.member_count ||
         !read_index_at(library_member_offset +
-                       (node.first_member + row) * 4, data, sizeof(data)))
+                       (active_playlist_record.first_member + row) * 4,
+                       data, sizeof(data)))
         return -1;
     return read_u32(data);
+}
+
+static int track_cache_capacity(void)
+{
+    return capabilities.device_class == RBPREP_DEVICE_CLASSIC
+         ? RBPREP_TRACK_CACHE_ROWS : 12;
+}
+
+static void invalidate_track_cache(void)
+{
+    int row;
+
+    track_cache_generation++;
+    if (!track_cache_generation)
+        track_cache_generation = 1;
+    for (row = 0; row < RBPREP_TRACK_CACHE_ROWS; row++)
+        track_cache[row].valid = false;
+}
+
+static bool cached_track_visible(int ordinal, bool load,
+                                 struct rbprep_track_cache_row **result)
+{
+    int capacity = track_cache_capacity();
+    int slot;
+    struct rbprep_track_cache_row *cached;
+    char artist[72];
+    char genre[48];
+    char raw_key[24];
+    char scratch[72];
+
+    if (ordinal < 0 || ordinal >= track_row_count)
+        return false;
+    slot = ordinal % capacity;
+    cached = &track_cache[slot];
+    if (cached->valid && cached->generation == track_cache_generation &&
+        cached->ordinal == ordinal) {
+        *result = cached;
+        return true;
+    }
+    if (!load)
+        return false;
+
+    cached->valid = false;
+    cached->generation = track_cache_generation;
+    cached->ordinal = ordinal;
+    cached->track_index = track_index_at_row(ordinal);
+    if (!read_track_record(cached->track_index, &cached->track) ||
+        !read_index_string(cached->track.title_offset, cached->title,
+                           sizeof(cached->title)) ||
+        !read_index_string(cached->track.artist_offset, artist,
+                           sizeof(artist)))
+        return false;
+    if (!read_index_string(cached->track.genre_offset, genre,
+                           sizeof(genre)))
+        genre[0] = '\0';
+    if (!read_index_string(cached->track.key_offset, raw_key,
+                           sizeof(raw_key)))
+        raw_key[0] = '\0';
+    format_key_name(raw_key, cached->key, sizeof(cached->key));
+
+    rb->strlcpy(cached->secondary, artist, sizeof(cached->secondary));
+    if (track_sort_key == TRACK_SORT_COMMENTS) {
+        if (!read_index_string(cached->track.comments_offset,
+                               cached->secondary,
+                               sizeof(cached->secondary)))
+            cached->secondary[0] = '\0';
+    } else if (track_sort_key == TRACK_SORT_TAGS) {
+        if (!read_index_string(cached->track.tags_offset,
+                               cached->secondary,
+                               sizeof(cached->secondary)))
+            cached->secondary[0] = '\0';
+    } else if (track_sort_key == TRACK_SORT_YEAR) {
+        rb->strlcpy(scratch, cached->secondary, sizeof(scratch));
+        rb->snprintf(cached->secondary, sizeof(cached->secondary),
+                     "%04d  %.24s", cached->track.year, scratch);
+    } else if (track_sort_key == TRACK_SORT_IMPORTED) {
+        rb->strlcpy(scratch, cached->secondary, sizeof(scratch));
+        if (cached->track.import_date) {
+            int year = 1980 + (cached->track.import_date >> 9);
+            int month = (cached->track.import_date >> 5) & 15;
+            int day = cached->track.import_date & 31;
+
+            rb->snprintf(cached->secondary, sizeof(cached->secondary),
+                         "%04d-%02d-%02d  %.18s", year, month, day,
+                         scratch);
+        } else {
+            rb->snprintf(cached->secondary, sizeof(cached->secondary),
+                         "DATE --  %.22s", scratch);
+        }
+    }
+    if (genre[0]) {
+        rb->strlcat(cached->secondary, " [", sizeof(cached->secondary));
+        rb->strlcat(cached->secondary, genre, sizeof(cached->secondary));
+        rb->strlcat(cached->secondary, "]", sizeof(cached->secondary));
+    }
+    cached->valid = true;
+    *result = cached;
+    return true;
+}
+
+static bool service_track_cache_prefetch(void)
+{
+    struct rbprep_track_cache_row *cached;
+    int distance;
+
+    if (mode != MODE_TRACKS || track_row_count <= 0)
+        return false;
+    for (distance = 0; distance <= RBPREP_LIST_ROWS + 3; distance++) {
+        int ordinal;
+
+        if (distance == 0)
+            ordinal = track_selection;
+        else if (distance & 1)
+            ordinal = track_selection +
+                track_prefetch_direction * ((distance + 1) / 2);
+        else
+            ordinal = track_selection -
+                track_prefetch_direction * (distance / 2);
+        if (ordinal < 0 || ordinal >= track_row_count ||
+            cached_track_visible(ordinal, false, &cached))
+            continue;
+        if (cached_track_visible(ordinal, true, &cached)) {
+            force_full_redraw = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool service_playlist_cache_prefetch(void)
+{
+    struct rbprep_playlist_cache_row *cached;
+    int distance;
+
+    if (mode != MODE_PLAYLISTS || playlist_browser_count() <= 0)
+        return false;
+    for (distance = 0; distance < RBPREP_PLAYLIST_CAROUSEL_ROWS;
+         distance++) {
+        int ordinal;
+
+        if (distance == 0)
+            ordinal = tree_selection;
+        else if (distance & 1)
+            ordinal = tree_selection + (distance + 1) / 2;
+        else
+            ordinal = tree_selection - distance / 2;
+        if (ordinal < 0 || ordinal >= playlist_browser_count() ||
+            (playlist_add_mode && ordinal == 0) ||
+            cached_playlist_visible(ordinal, false, &cached))
+            continue;
+        if (cached_playlist_visible(ordinal, true, &cached)) {
+            force_full_redraw = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool service_playlist_carousel_motion(void)
+{
+    if (mode != MODE_PLAYLISTS || playlist_carousel_offset_fp == 0)
+        return false;
+    playlist_carousel_offset_fp = playlist_carousel_offset_fp * 5 / 8;
+    if (ABS(playlist_carousel_offset_fp) < 256)
+        playlist_carousel_offset_fp = 0;
+    force_full_redraw = true;
+    return true;
 }
 
 static bool contains_ascii_nocase(const char *text_value,
@@ -2862,6 +3164,7 @@ static void rebuild_search_results(void)
         search_result_fd = -1;
     }
     collection_shuffle_active = false;
+    invalidate_track_cache();
     search_active = track_search[0] != '\0';
     search_result_count = 0;
     if (!search_active) {
@@ -2936,27 +3239,53 @@ static int date_ordinal(int year, int month, int day)
            (153 * (month - 3) + 2) / 5 + day - 1;
 }
 
-static void refresh_recent_track_count(void)
+static void start_recent_track_scan(void)
 {
     struct tm *now = rb->get_time();
-    int today;
-    int cutoff;
-    int index;
 
     recent_tracks_30d = 0;
-    if (!now || library_fd < 0)
+    recent_tracks_ready = false;
+    recent_scan_active = false;
+    recent_scan_index = 0;
+    if (!now || library_fd < 0 || library_track_record_size <= 0)
         return;
-    today = date_ordinal(now->tm_year + 1900, now->tm_mon + 1,
-                         now->tm_mday);
-    cutoff = today - 29;
-    for (index = 0; (uint32_t)index < library_track_count; index++) {
+    recent_scan_today = date_ordinal(now->tm_year + 1900, now->tm_mon + 1,
+                                     now->tm_mday);
+    recent_scan_cutoff = recent_scan_today - 29;
+    recent_scan_active = library_track_count > 0;
+    if (!recent_scan_active)
+        recent_tracks_ready = true;
+}
+
+static bool service_recent_track_scan(void)
+{
+    uint32_t capacity;
+    uint32_t count;
+    uint32_t item;
+
+    if (!recent_scan_active)
+        return false;
+    capacity = RBPREP_LIBRARY_SCAN_BYTES / library_track_record_size;
+    count = MIN(capacity, library_track_count - recent_scan_index);
+    if (!count || !read_index_at(library_track_offset +
+                                 recent_scan_index *
+                                 library_track_record_size,
+                                 library_scan_buffer,
+                                 count * library_track_record_size)) {
+        recent_scan_active = false;
+        recent_tracks_ready = recent_scan_index >= library_track_count;
+        return false;
+    }
+    for (item = 0; item < count; item++) {
         struct rbprep_track_record track;
         int year;
         int month;
         int day;
         int ordinal;
 
-        if (!read_track_record(index, &track) || !track.import_date)
+        decode_track_record(library_scan_buffer +
+                            item * library_track_record_size, &track);
+        if (!track.import_date)
             continue;
         year = 1980 + (track.import_date >> 9);
         month = (track.import_date >> 5) & 15;
@@ -2964,10 +3293,22 @@ static void refresh_recent_track_count(void)
         if (month < 1 || month > 12 || day < 1 || day > 31)
             continue;
         ordinal = date_ordinal(year, month, day);
-        if (ordinal >= cutoff && ordinal <= today)
+        if (ordinal >= recent_scan_cutoff && ordinal <= recent_scan_today)
             recent_tracks_30d++;
     }
-    recent_tracks_ready = true;
+    recent_scan_index += count;
+    if (recent_scan_index >= library_track_count) {
+        recent_scan_active = false;
+        recent_tracks_ready = true;
+    }
+    return true;
+}
+
+static void refresh_recent_track_count(void)
+{
+    start_recent_track_scan();
+    while (recent_scan_active)
+        service_recent_track_scan();
 }
 
 static bool open_library_index(void)
@@ -3064,9 +3405,12 @@ static bool open_library_index(void)
     }
     if (library_string_offset < previous_end)
         goto invalid;
+    invalidate_track_cache();
+    active_playlist_record_valid = false;
+    active_playlist_name[0] = '\0';
     refresh_tree_children(RBPREP_ROOT_NODE);
     if (!recent_tracks_ready)
-        refresh_recent_track_count();
+        start_recent_track_scan();
     return true;
 
 invalid:
@@ -3076,6 +3420,7 @@ invalid:
     library_track_count = library_node_count = library_member_count = 0;
     recent_tracks_30d = 0;
     recent_tracks_ready = false;
+    recent_scan_active = false;
     library_track_offset = library_node_offset = library_member_offset = 0;
     library_string_offset = library_string_size = 0;
     return false;
@@ -5383,6 +5728,16 @@ static bool record_edit_change(void)
     return true;
 }
 
+static bool pending_edit_for_track(uint32_t track_id)
+{
+    int i;
+
+    for (i = 0; i < pending_snapshot_count; i++)
+        if (pending_entries[i].track_id == track_id)
+            return true;
+    return false;
+}
+
 static bool repair_playlist_journal_tail(void)
 {
     unsigned char buffer[128];
@@ -5529,7 +5884,7 @@ static bool parse_playlist_journal_line(
         return entry->track_id && entry->playlist_id;
     }
     if (count != 6 || field[0][1] != '\0' ||
-        !rb->strchr("ACRMD", field[0][0]))
+        !rb->strchr("ACRMDO", field[0][0]))
         return false;
     entry->operation = field[0][0];
     entry->track_id = rb->strtoul(field[1], NULL, 10);
@@ -5753,7 +6108,8 @@ static void merge_pending_playlist(
         if (cancels_create)
             return;
     } else if (incoming->operation == PLAYLIST_OP_RENAME ||
-               incoming->operation == PLAYLIST_OP_MOVE) {
+               incoming->operation == PLAYLIST_OP_MOVE ||
+               incoming->operation == PLAYLIST_OP_ORDER) {
         for (i = 0; i < pending_playlist_count; i++) {
             struct rbprep_pending_playlist *current = &pending_playlists[i];
             if (current->playlist_id != incoming->playlist_id)
@@ -5764,9 +6120,10 @@ static void merge_pending_playlist(
                 if (incoming->operation == PLAYLIST_OP_RENAME)
                     rb->strlcpy(current->name, incoming->name,
                                 sizeof(current->name));
-                else
+                else if (incoming->operation == PLAYLIST_OP_MOVE)
                     current->parent_id = incoming->parent_id;
-                return;
+                if (incoming->operation != PLAYLIST_OP_ORDER)
+                    return;
             }
             if (current->operation == incoming->operation) {
                 *current = *incoming;
@@ -6097,6 +6454,148 @@ playlist_delete_failed:
     return false;
 }
 
+static uint32_t playlist_order_checksum_update(uint32_t checksum,
+                                               uint32_t value)
+{
+    int byte;
+
+    for (byte = 0; byte < 4; byte++) {
+        checksum ^= (value >> (byte * 8)) & 0xff;
+        checksum *= 16777619u;
+    }
+    return checksum;
+}
+
+static void playlist_order_path(uint32_t playlist_id, char *path,
+                                size_t size, const char *suffix)
+{
+    rb->snprintf(path, size, "%s/%lu.rbo%s", RBPREP_PLAYLIST_ORDER_DIR,
+                 (unsigned long)playlist_id, suffix ? suffix : "");
+}
+
+static bool save_playlist_order_sidecar(uint32_t playlist_id,
+                                        uint32_t *saved_checksum)
+{
+    unsigned char header[20];
+    char path[MAX_PATH];
+    char temporary[MAX_PATH];
+    char previous[MAX_PATH];
+    uint32_t checksum = 2166136261u;
+    int fd;
+    int base;
+
+    if (!playlist_id || playlist_order_count <= 0 ||
+        playlist_order_count > RBPREP_PLAYLIST_ORDER_MAX)
+        return false;
+    for (base = 0; base < playlist_order_count; base++)
+        checksum = playlist_order_checksum_update(
+            checksum, playlist_order_items[base].track_id);
+    rb->memcpy(header, "RBO1", 4);
+    write_u32(header + 4, 1);
+    write_u32(header + 8, playlist_id);
+    write_u32(header + 12, playlist_order_count);
+    write_u32(header + 16, checksum);
+    rbprep_store_ensure_state_dir(rb);
+    rb->mkdir(RBPREP_PLAYLIST_ORDER_DIR);
+    playlist_order_path(playlist_id, path, sizeof(path), "");
+    playlist_order_path(playlist_id, temporary, sizeof(temporary), ".tmp");
+    playlist_order_path(playlist_id, previous, sizeof(previous), ".prev");
+    rb->remove(temporary);
+    fd = rb->open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0 || !write_exact(fd, header, sizeof(header))) {
+        if (fd >= 0)
+            rb->close(fd);
+        rb->remove(temporary);
+        return false;
+    }
+    for (base = 0; base < playlist_order_count;) {
+        int count = MIN(RBPREP_LIBRARY_SCAN_BYTES / 4,
+                        playlist_order_count - base);
+        int item;
+
+        for (item = 0; item < count; item++)
+            write_u32(library_scan_buffer + item * 4,
+                      playlist_order_items[base + item].track_id);
+        if (!write_exact(fd, library_scan_buffer, count * 4)) {
+            rb->close(fd);
+            rb->remove(temporary);
+            return false;
+        }
+        base += count;
+    }
+    if (rb->close(fd) < 0) {
+        rb->remove(temporary);
+        return false;
+    }
+    rb->remove(previous);
+    if (rb->file_exists(path) && rb->rename(path, previous) < 0) {
+        rb->remove(temporary);
+        return false;
+    }
+    if (rb->rename(temporary, path) < 0) {
+        if (rb->file_exists(previous))
+            rb->rename(previous, path);
+        return false;
+    }
+    rb->remove(previous);
+    if (saved_checksum)
+        *saved_checksum = checksum;
+    return true;
+}
+
+static int load_playlist_order_sidecar(uint32_t playlist_id,
+                                       uint32_t expected_count,
+                                       uint32_t expected_checksum)
+{
+    unsigned char header[20];
+    char path[MAX_PATH];
+    uint32_t count;
+    uint32_t checksum = 2166136261u;
+    uint32_t base;
+    int fd;
+
+    playlist_order_path(playlist_id, path, sizeof(path), "");
+    fd = rb->open(path, O_RDONLY);
+    if (fd < 0 || !read_exact(fd, header, sizeof(header)) ||
+        rb->memcmp(header, "RBO1", 4) || read_u32(header + 4) != 1 ||
+        read_u32(header + 8) != playlist_id) {
+        if (fd >= 0)
+            rb->close(fd);
+        return -1;
+    }
+    count = read_u32(header + 12);
+    if (!count || count > RBPREP_PLAYLIST_ORDER_MAX ||
+        (expected_count && count != expected_count) ||
+        rb->filesize(fd) != (off_t)(sizeof(header) + count * 4)) {
+        rb->close(fd);
+        return -1;
+    }
+    for (base = 0; base < count;) {
+        uint32_t amount = MIN((uint32_t)(RBPREP_LIBRARY_SCAN_BYTES / 4),
+                              count - base);
+        uint32_t item;
+
+        if (!read_exact(fd, library_scan_buffer, amount * 4)) {
+            rb->close(fd);
+            return -1;
+        }
+        for (item = 0; item < amount; item++) {
+            uint32_t track_id = read_u32(library_scan_buffer + item * 4);
+
+            playlist_order_items[base + item].track_id = track_id;
+            playlist_order_items[base + item].track_index = -1;
+            playlist_order_items[base + item].sort.value = base + item;
+            checksum = playlist_order_checksum_update(checksum, track_id);
+        }
+        base += amount;
+    }
+    rb->close(fd);
+    if (checksum != read_u32(header + 16) ||
+        (expected_checksum && checksum != expected_checksum))
+        return -1;
+    return count;
+}
+
 /* Keep the validated, rollback-safe DeviceSQL/RBI transaction out of the UI
    core while sharing its already-coalesced pending state. */
 #include "rbprep_burn.h"
@@ -6143,8 +6642,13 @@ static void refresh_active_playlist_context(uint32_t active_source_id)
         return;
     active_playlist_node = find_node_index_by_source_id(active_source_id);
     if (active_playlist_node >= 0) {
-        if (read_node_record(active_playlist_node, &active))
+        if (read_node_record(active_playlist_node, &active)) {
             track_row_count = active.member_count;
+            active_playlist_record = active;
+            active_playlist_record_valid = true;
+            read_index_string(active.name_offset, active_playlist_name,
+                              sizeof(active_playlist_name));
+        }
         playing_track_row = find_track_row_in_playlist(
                                 active_playlist_node, selected_track_index);
         if (playing_track_row >= 0)
@@ -6156,10 +6660,13 @@ static void refresh_active_playlist_context(uint32_t active_source_id)
             macro_active = linked_macro;
         macro_position = 0;
     } else {
+        active_playlist_record_valid = false;
+        active_playlist_name[0] = '\0';
         playing_track_row = -1;
         collection_shuffle_active = false;
         track_row_count = library_track_count;
     }
+    invalidate_track_cache();
 }
 
 static bool burn_playlist_changes_now(void)
@@ -6634,14 +7141,32 @@ static void open_track_browser(int playlist_node)
 {
     struct rbprep_node_record node;
     int linked_macro;
+    bool context_changed = !track_context_initialized ||
+                           playlist_node != active_playlist_node;
 
     active_playlist_node = playlist_node;
-    track_selection = 0;
-    track_top = 0;
+    track_context_initialized = true;
+    if (context_changed) {
+        track_selection = 0;
+        track_top = 0;
+        playlist_order_active = false;
+        playlist_reorder_editing = false;
+        playlist_reorder_grabbed = false;
+        playlist_order_dirty = false;
+        playlist_order_count = 0;
+        playlist_view_order = PLAYLIST_VIEW_ORIGINAL;
+        invalidate_track_cache();
+    }
+    active_playlist_record_valid = false;
+    active_playlist_name[0] = '\0';
     if (playlist_node < 0) {
         track_row_count = (search_active || collection_shuffle_active)
                         ? search_result_count : (int)library_track_count;
     } else if (read_node_record(playlist_node, &node)) {
+        active_playlist_record = node;
+        active_playlist_record_valid = true;
+        read_index_string(node.name_offset, active_playlist_name,
+                          sizeof(active_playlist_name));
         linked_macro = macro_link_for(node.source_id);
         if (linked_macro >= 0)
             macro_active = linked_macro;
@@ -6650,7 +7175,174 @@ static void open_track_browser(int playlist_node)
     } else {
         track_row_count = 0;
     }
+    track_selection = MAX(0, MIN(MAX(0, track_row_count - 1),
+                                 track_selection));
+    track_top = MAX(0, MIN(MAX(0, track_row_count - RBPREP_LIST_ROWS),
+                           track_top));
     mode = MODE_TRACKS;
+    force_full_redraw = true;
+}
+
+static int compare_playlist_order_items(const void *left_value,
+                                        const void *right_value)
+{
+    const struct rbprep_playlist_order_item *left = left_value;
+    const struct rbprep_playlist_order_item *right = right_value;
+    int compared = 0;
+
+    if (playlist_view_order == PLAYLIST_VIEW_TITLE ||
+        playlist_view_order == PLAYLIST_VIEW_KEY)
+        compared = rb->strcasecmp(left->sort.label, right->sort.label);
+    else if (left->sort.value != right->sort.value)
+        compared = left->sort.value < right->sort.value ? -1 : 1;
+    if (!compared && left->track_id != right->track_id)
+        compared = left->track_id < right->track_id ? -1 : 1;
+    return compared;
+}
+
+static bool load_playlist_order_items(void)
+{
+    uint32_t base;
+
+    if (!active_playlist_record_valid || active_playlist_node < 0 ||
+        active_playlist_record.kind == 0 ||
+        active_playlist_record.member_count > RBPREP_PLAYLIST_ORDER_MAX)
+        return false;
+    playlist_order_count = active_playlist_record.member_count;
+    for (base = 0; base < (uint32_t)playlist_order_count;) {
+        uint32_t count = MIN((uint32_t)(RBPREP_LIBRARY_SCAN_BYTES / 4),
+                             (uint32_t)playlist_order_count - base);
+        uint32_t item;
+
+        if (!read_index_at(library_member_offset +
+                           (active_playlist_record.first_member + base) * 4,
+                           library_scan_buffer, count * 4))
+            return false;
+        for (item = 0; item < count; item++) {
+            struct rbprep_playlist_order_item *ordered =
+                &playlist_order_items[base + item];
+            struct rbprep_track_record track;
+
+            rb->memset(ordered, 0, sizeof(*ordered));
+            ordered->track_index = read_u32(library_scan_buffer + item * 4);
+            if (!read_track_record(ordered->track_index, &track))
+                return false;
+            ordered->track_id = track.id;
+            if (playlist_view_order == PLAYLIST_VIEW_TITLE) {
+                if (!read_index_string(track.title_offset,
+                                       ordered->sort.label,
+                                       sizeof(ordered->sort.label)))
+                    ordered->sort.label[0] = '\0';
+            } else if (playlist_view_order == PLAYLIST_VIEW_KEY) {
+                char raw_key[24];
+
+                if (!read_index_string(track.key_offset, raw_key,
+                                       sizeof(raw_key)))
+                    raw_key[0] = '\0';
+                format_key_name(raw_key, ordered->sort.label,
+                                sizeof(ordered->sort.label));
+            } else if (playlist_view_order == PLAYLIST_VIEW_BPM) {
+                ordered->sort.value = track.bpm_x100;
+            } else if (playlist_view_order == PLAYLIST_VIEW_YEAR) {
+                ordered->sort.value = track.year;
+            } else if (playlist_view_order == PLAYLIST_VIEW_IMPORTED) {
+                ordered->sort.value = track.import_date;
+            }
+        }
+        base += count;
+        if ((base & 255) == 0)
+            rb->splash_progress(base, playlist_order_count,
+                                "ASSEMBLING PLAYLIST ORDER");
+    }
+    playlist_order_source_id = active_playlist_record.source_id;
+    return true;
+}
+
+static bool apply_playlist_view_order(int view_order)
+{
+    int index;
+
+    playlist_view_order = MAX(0, MIN(PLAYLIST_VIEW_COUNT - 1, view_order));
+    playlist_reorder_grabbed = false;
+    playlist_order_dirty = false;
+    if (playlist_view_order == PLAYLIST_VIEW_ORIGINAL) {
+        playlist_order_active = false;
+        playlist_order_count = active_playlist_record_valid
+                             ? active_playlist_record.member_count : 0;
+    } else {
+        if (!load_playlist_order_items())
+            return false;
+        if (playlist_view_order == PLAYLIST_VIEW_SHUFFLE) {
+            rb->srand((unsigned int)(*rb->current_tick ^
+                      active_playlist_record.source_id));
+            for (index = playlist_order_count - 1; index > 0; index--) {
+                int other = (unsigned int)rb->rand() % (index + 1);
+                struct rbprep_playlist_order_item swap =
+                    playlist_order_items[index];
+
+                playlist_order_items[index] = playlist_order_items[other];
+                playlist_order_items[other] = swap;
+            }
+        } else {
+            rb->qsort(playlist_order_items, playlist_order_count,
+                      sizeof(playlist_order_items[0]),
+                      compare_playlist_order_items);
+        }
+        playlist_order_active = true;
+    }
+    track_row_count = playlist_order_active ? playlist_order_count
+                    : (int)active_playlist_record.member_count;
+    track_selection = track_top = 0;
+    invalidate_track_cache();
+    force_full_redraw = true;
+    return true;
+}
+
+static bool begin_playlist_reorder_editor(void)
+{
+    if (!active_playlist_record_valid || active_playlist_record.kind != 1)
+        return false;
+    if (!playlist_order_active) {
+        playlist_view_order = PLAYLIST_VIEW_ORIGINAL;
+        if (!load_playlist_order_items())
+            return false;
+        playlist_order_active = true;
+    }
+    playlist_reorder_editing = true;
+    playlist_reorder_grabbed = false;
+    playlist_order_dirty = false;
+    track_row_count = playlist_order_count;
+    track_selection = MAX(0, MIN(track_row_count - 1, track_selection));
+    track_top = MAX(0, MIN(track_selection,
+                    MAX(0, track_row_count - RBPREP_LIST_ROWS)));
+    invalidate_track_cache();
+    mode = MODE_TRACKS;
+    force_full_redraw = true;
+    return true;
+}
+
+static void move_grabbed_playlist_track(int direction)
+{
+    int target;
+    struct rbprep_playlist_order_item swap;
+
+    if (!playlist_reorder_editing || !playlist_reorder_grabbed ||
+        playlist_order_count <= 1)
+        return;
+    target = MAX(0, MIN(playlist_order_count - 1,
+                        track_selection + direction));
+    if (target == track_selection)
+        return;
+    swap = playlist_order_items[track_selection];
+    playlist_order_items[track_selection] = playlist_order_items[target];
+    playlist_order_items[target] = swap;
+    track_selection = target;
+    if (track_selection < track_top)
+        track_top = track_selection;
+    else if (track_selection >= track_top + RBPREP_LIST_ROWS)
+        track_top = track_selection - RBPREP_LIST_ROWS + 1;
+    playlist_order_dirty = true;
+    invalidate_track_cache();
     force_full_redraw = true;
 }
 
@@ -6810,11 +7502,22 @@ static bool play_track_index(int index, int row,
         restore_black_canvas();
         return false;
     }
-    if ((index != selected_track_index || force_reload) &&
-        track_edit_dirty) {
-        begin_track_load_confirmation(index, row, return_mode,
-                                      force_reload);
-        return false;
+    if (!deferred_track_unload_authorized && selected_track_id >= 0 &&
+        (index != selected_track_index || force_reload)) {
+        bool pending = track_edit_dirty;
+
+        /* A previously journaled edit is still a pending device change even
+           when this process has no dirty RAM snapshot.  Re-read only at the
+           explicit track-unload boundary, never in the playback/render path. */
+        if (!pending) {
+            refresh_pending_summary();
+            pending = pending_edit_for_track((uint32_t)selected_track_id);
+        }
+        if (pending) {
+            begin_track_load_confirmation(index, row, return_mode,
+                                          force_reload);
+            return false;
+        }
     }
     id3 = rb->audio_current_track();
     already_loaded = !force_reload && id3 && id3->path &&
@@ -7099,6 +7802,8 @@ static void start_shuffled_collection(void)
     }
     track_search[0] = '\0';
     active_playlist_node = -1;
+    active_playlist_record_valid = false;
+    active_playlist_name[0] = '\0';
     collection_shuffle_active = true;
     search_result_count = count;
     rb->srand((unsigned int)(*rb->current_tick ^ library_track_count));
@@ -7124,6 +7829,8 @@ static void start_shuffled_collection(void)
     shuffle_offset = (uint32_t)rb->rand() % count;
     track_row_count = count;
     track_selection = track_top = 0;
+    track_context_initialized = true;
+    invalidate_track_cache();
     playing_track_row = -1;
     playlist_playback = true;
     macro_active = -1;
@@ -7299,9 +8006,93 @@ static void draw_main_glyph(int cx, int cy, int item, bool selected)
     }
 }
 
+static void draw_playlist_carousel_blade(
+    int delta, struct rbprep_playlist_cache_row *cached,
+    bool add_row)
+{
+    int depth = ABS(delta);
+    int height = 28 - depth * 4;
+    int y = 116 + delta * 36 - height / 2 +
+            playlist_carousel_offset_fp / 256;
+    int x = 10 + depth * 15 + (delta < 0 ? depth * 4 : -depth * 2);
+    int width = LCD_WIDTH - x * 2;
+    int fill = delta == 0 ? LCD_RGBPACK(24, 74, 52) :
+               depth == 1 ? LCD_RGBPACK(11, 34, 28) :
+                            LCD_RGBPACK(6, 20, 18);
+    int edge = delta == 0 ? RBPREP_GREEN :
+               depth == 1 ? theme_accent_dim : LCD_RGBPACK(25, 60, 48);
+    int label = delta == 0 ? LCD_WHITE :
+                depth == 1 ? LCD_RGBPACK(174, 201, 183) :
+                             LCD_RGBPACK(119, 151, 132);
+    char line[96];
+
+    /* Every blade is a rigid trapezoid. Their alternating horizontal bias
+       supplies the controlled-chaos twist while five stable Y planes retain
+       a readable map of the playlist tree. */
+    rb->lcd_set_foreground(fill);
+    rb->lcd_fillrect(x + 3, y, width - 6, height);
+    rb->lcd_drawline(x, y + 3, x + 3, y);
+    rb->lcd_drawline(x, y + height - 4, x + 3, y + height - 1);
+    rb->lcd_drawline(x + width - 4, y, x + width - 1, y + 3);
+    rb->lcd_drawline(x + width - 4, y + height - 1,
+                     x + width - 1, y + height - 4);
+    rb->lcd_set_foreground(edge);
+    rb->lcd_hline(x + 3, x + width - 4, y);
+    rb->lcd_hline(x + 3, x + width - 4, y + height - 1);
+    rb->lcd_drawline(x, y + 3, x, y + height - 4);
+    rb->lcd_drawline(x + width - 1, y + 3,
+                     x + width - 1, y + height - 4);
+    if (depth > 0) {
+        int vanish_x = delta < 0 ? LCD_WIDTH - 7 : 7;
+        int vanish_y = 116;
+
+        rb->lcd_set_foreground(LCD_RGBPACK(14, 42, 34));
+        rb->lcd_drawline(x + (delta < 0 ? 0 : width - 1),
+                         y + height / 2, vanish_x, vanish_y);
+    }
+
+    if (add_row) {
+        rb->lcd_set_foreground(label);
+        rb->lcd_drawrect(x + 10, y + height / 2 - 6, 13, 13);
+        rb->lcd_hline(x + 13, x + 20, y + height / 2);
+        rb->lcd_vline(x + 16, y + height / 2 - 3,
+                      y + height / 2 + 3);
+        text(x + 30, y + (height - 8) / 2, "NEW PLAYLIST...", label);
+        return;
+    }
+    if (!cached) {
+        rb->lcd_set_foreground(LCD_RGBPACK(28, 62, 50));
+        rb->lcd_fillrect(x + 12, y + height / 2 - 5, 11, 10);
+        rb->lcd_fillrect(x + 32, y + height / 2 - 2,
+                         MAX(12, width - 76), 3);
+        return;
+    }
+    draw_playlist_node_glyph(x + 17, y + height / 2,
+                             cached->node.kind == 0, delta == 0);
+    rb->snprintf(line, sizeof(line), "%s%.34s",
+                 cached->favorite_slot >= 0
+                    ? (cached->favorite_slot ? "F2  " : "F1  ") : "",
+                 cached->name);
+    text(x + 31, y + (height - 8) / 2, line, label);
+    if (cached->node.kind != 0) {
+        int macro_slot = macro_link_for(cached->node.source_id);
+        int right = x + width - 8;
+
+        rb->snprintf(line, sizeof(line), "%lu",
+                     (unsigned long)cached->node.member_count);
+        text(right - 24, y + (height - 8) / 2, line,
+             depth == 2 ? LCD_RGBPACK(105, 130, 114) : LCD_LIGHTGRAY);
+        if (cached->node.kind == 2)
+            text(right - 65, y + (height - 8) / 2, "SMART", edge);
+        if (macro_slot >= 0)
+            text(right - 85, y + (height - 8) / 2,
+                 macro_slot ? "M2" : "M1", LCD_RGBPACK(255, 145, 40));
+    }
+}
+
 static void draw_playlist_browser(void)
 {
-    int row;
+    int delta;
     char line[96];
 
     draw_blade_shell(playlist_add_mode ? "ADD TO PLAYLIST" :
@@ -7313,82 +8104,19 @@ static void draw_playlist_browser(void)
         text(112, RBPREP_STATUS_HEIGHT + 4, tree_parent_name,
              LCD_LIGHTGRAY);
 
-    for (row = 0; row < RBPREP_LIST_ROWS; row++) {
-        int ordinal = tree_top + row;
-        int y = 34 + row * 19;
+    for (delta = -2; delta <= 2; delta++) {
+        int ordinal = tree_selection + delta;
         struct rbprep_playlist_cache_row *cached;
-        struct rbprep_node_record favorite_node;
-        struct rbprep_node_record *node;
-        char favorite_name[80];
-        const char *display_name = "";
-        int favorite_slot = -1;
-        int actual_ordinal;
 
-        if (ordinal >= playlist_browser_count())
-            break;
-        if (playlist_add_mode && ordinal == 0) {
-            if (ordinal == tree_selection)
-                draw_blade_selection(y - 2, 19,
-                                     LCD_RGBPACK(34, 105, 73));
-            rb->lcd_set_foreground(ordinal == tree_selection
-                                   ? LCD_WHITE : RBPREP_GREEN);
-            rb->lcd_drawrect(10, y + 1, 13, 13);
-            rb->lcd_hline(13, 20, y + 7);
-            rb->lcd_vline(16, y + 4, y + 10);
-            text(30, y + 2, "NEW PLAYLIST...", LCD_WHITE);
+        if (ordinal < 0 || ordinal >= playlist_browser_count())
             continue;
-        }
-        actual_ordinal = ordinal - (playlist_add_mode ? 1 : 0);
-        if (tree_parent == RBPREP_ROOT_NODE) {
-            int slot;
-
-            for (slot = 0; slot < 2; slot++) {
-                if (favorite_playlist_nodes[slot] < 0)
-                    continue;
-                if (actual_ordinal-- == 0) {
-                    favorite_slot = slot;
-                    break;
-                }
-            }
-        }
-        if (favorite_slot >= 0) {
-            if (!read_node_record(favorite_playlist_nodes[favorite_slot],
-                                  &favorite_node) ||
-                !read_index_string(favorite_node.name_offset, favorite_name,
-                                   sizeof(favorite_name)))
-                continue;
-            node = &favorite_node;
-            display_name = favorite_name;
-        } else {
-            if (!cached_playlist_node(actual_ordinal, &cached))
-                continue;
-            node = &cached->node;
-            display_name = cached->name;
-        }
-        if (ordinal == tree_selection) {
-            draw_blade_selection(y - 2, 19,
-                                 node->kind == 0
-                                 ? LCD_RGBPACK(34, 105, 73)
-                                 : LCD_RGBPACK(27, 78, 128));
-        }
-        draw_playlist_node_glyph(16, y + 7, node->kind == 0,
-                                 ordinal == tree_selection);
-        rb->snprintf(line, sizeof(line), "%s%.34s",
-                     favorite_slot >= 0 ? (favorite_slot ? "F2  " : "F1  ")
-                                        : "",
-                     display_name);
-        text(30, y + 2, line, LCD_WHITE);
-        if (node->kind != 0) {
-            int macro_slot = macro_link_for(node->source_id);
-            if (node->kind == 2)
-                text(212, y + 2, "SMART", RBPREP_GREEN);
-            if (macro_slot >= 0)
-                text(258, y + 2, macro_slot ? "M2" : "M1",
-                     LCD_RGBPACK(255, 145, 40));
-            rb->snprintf(line, sizeof(line), "%lu",
-                         (unsigned long)node->member_count);
-            text(282, y + 2, line, LCD_LIGHTGRAY);
-        }
+        if (playlist_add_mode && ordinal == 0)
+            draw_playlist_carousel_blade(delta, NULL, true);
+        else
+            draw_playlist_carousel_blade(
+                delta,
+                cached_playlist_visible(ordinal, false, &cached)
+                    ? cached : NULL, false);
     }
     rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
     rb->lcd_fillrect(0, 210, LCD_WIDTH, 30);
@@ -7446,25 +8174,106 @@ static void draw_playlist_actions(void)
     text(7, 226, "MENU: BACK", LCD_LIGHTGRAY);
 }
 
+static const char *playlist_view_order_name(int view_order)
+{
+    static const char * const names[PLAYLIST_VIEW_COUNT] = {
+        "ORIGINAL", "SHUFFLE", "TITLE", "BPM", "KEY", "YEAR", "IMPORTED"
+    };
+
+    return names[MAX(0, MIN(PLAYLIST_VIEW_COUNT - 1, view_order))];
+}
+
+static void draw_playlist_order_menu(void)
+{
+    static const char * const items[] = {
+        "ORIGINAL ORDER", "SHUFFLE VIEW", "SORT BY TITLE",
+        "SORT BY BPM", "SORT BY KEY", "SORT BY YEAR",
+        "SORT BY IMPORT DATE", "EDIT / REORDER", "COMMIT CURRENT ORDER"
+    };
+    char line[96];
+    int row;
+
+    draw_blade_shell("PLAYLIST ORDER", RBPREP_GREEN);
+    rb->snprintf(line, sizeof(line), "%.28s  /  %s%s",
+                 active_playlist_name,
+                 playlist_view_order_name(playlist_view_order),
+                 playlist_order_dirty ? " *" : "");
+    text(16, 31, line, LCD_LIGHTGRAY);
+    for (row = 0; row < (int)ARRAYLEN(items); row++) {
+        int y = 47 + row * 18;
+        bool edit = row == 7;
+        bool commit = row == 8;
+        bool enabled = (!edit && !commit) ||
+                       (active_playlist_record_valid &&
+                        active_playlist_record.kind == 1 &&
+                        (!commit || playlist_order_active));
+
+        if (row == playlist_order_menu_selection)
+            draw_blade_selection(y - 2, 18,
+                                 enabled ? RBPREP_GREEN
+                                         : LCD_RGBPACK(45, 51, 47));
+        rb->lcd_set_foreground(enabled ? RBPREP_GREEN
+                                        : LCD_RGBPACK(55, 64, 58));
+        if (row == 1)
+            xlcd_drawcircle(17, y + 6, 5);
+        else if (row == 7)
+            rb->lcd_drawrect(11, y + 1, 12, 11);
+        else if (row == 8)
+            rb->lcd_fillrect(12, y + 2, 11, 10);
+        else {
+            rb->lcd_hline(11, 23, y + 2);
+            rb->lcd_hline(13, 23, y + 6);
+            rb->lcd_hline(15, 23, y + 10);
+        }
+        text(31, y + 2, items[row],
+             enabled ? LCD_WHITE : LCD_RGBPACK(65, 72, 67));
+        if (row < PLAYLIST_VIEW_COUNT &&
+            row == playlist_view_order)
+            text(278, y + 2, "LIVE", RBPREP_GREEN);
+    }
+    text(7, 214, "WHEEL: CHOOSE   SELECT: APPLY", LCD_WHITE);
+    text(7, 227, "TEMP VIEWS NEVER CHANGE REKORDBOX", LCD_LIGHTGRAY);
+}
+
+static void draw_track_cache_placeholder(int y, bool selected)
+{
+    int shade = selected ? LCD_RGBPACK(22, 48, 66)
+                         : LCD_RGBPACK(12, 24, 28);
+
+    if (selected)
+        draw_blade_selection(y - 1, 20, LCD_RGBPACK(25, 91, 148));
+    rb->lcd_set_foreground(shade);
+    xlcd_fillcircle(12, y + 8, 5);
+    rb->lcd_fillrect(24, y + 2, 118, 3);
+    rb->lcd_fillrect(30, y + 12, 156, 2);
+    rb->lcd_set_foreground(selected ? theme_accent_dim
+                                    : LCD_RGBPACK(20, 35, 31));
+    rb->lcd_hline(226, 267, y + 12);
+    rb->lcd_hline(278, 307, y + 12);
+}
+
 static void draw_track_browser(void)
 {
     int row;
-    char title_buffer[96];
-    char artist_buffer[72];
-    char genre_buffer[48];
-    char key_buffer[24];
-    char display_key[24];
-    char name[80];
     char line[96];
 
     draw_blade_shell(active_playlist_node < 0 ? "COLLECTION" : "PLAYLIST",
                      RBPREP_GREEN);
     if (active_playlist_node >= 0) {
-        struct rbprep_node_record node;
-        if (read_node_record(active_playlist_node, &node) &&
-            read_index_string(node.name_offset, name, sizeof(name))) {
-            text(75, RBPREP_STATUS_HEIGHT + 4, name, LCD_LIGHTGRAY);
-            if (node.kind == 2)
+        if (active_playlist_record_valid) {
+            text(75, RBPREP_STATUS_HEIGHT + 4, active_playlist_name,
+                 LCD_LIGHTGRAY);
+            if (playlist_reorder_editing)
+                text(260, RBPREP_STATUS_HEIGHT + 4,
+                     playlist_reorder_grabbed ? "GRAB" : "EDIT",
+                     playlist_reorder_grabbed ? LCD_RGBPACK(255, 145, 40)
+                                              : RBPREP_GREEN);
+            else if (playlist_view_order != PLAYLIST_VIEW_ORIGINAL) {
+                rb->snprintf(line, sizeof(line), "TMP %s",
+                             playlist_view_order_name(playlist_view_order));
+                text(245, RBPREP_STATUS_HEIGHT + 4, line,
+                     LCD_RGBPACK(255, 145, 40));
+            } else if (active_playlist_record.kind == 2)
                 text(272, RBPREP_STATUS_HEIGHT + 4, "SMART", RBPREP_GREEN);
         }
     } else {
@@ -7484,74 +8293,35 @@ static void draw_track_browser(void)
 
     for (row = 0; row < RBPREP_LIST_ROWS; row++) {
         int ordinal = track_top + row;
-        int index;
         int y = 32 + row * 20;
-        struct rbprep_track_record track;
+        struct rbprep_track_cache_row *cached;
 
         if (ordinal >= track_row_count)
             break;
-        index = track_index_at_row(ordinal);
-        if (!read_track_record(index, &track))
+        if (!cached_track_visible(ordinal, false, &cached)) {
+            draw_track_cache_placeholder(y, ordinal == track_selection);
             continue;
-        read_index_string(track.title_offset, title_buffer,
-                          sizeof(title_buffer));
-        read_index_string(track.artist_offset, artist_buffer,
-                          sizeof(artist_buffer));
-        if (!read_index_string(track.genre_offset, genre_buffer,
-                               sizeof(genre_buffer)))
-            genre_buffer[0] = '\0';
-        if (!read_index_string(track.key_offset, key_buffer,
-                               sizeof(key_buffer)))
-            key_buffer[0] = '\0';
-        format_key_name(key_buffer, display_key, sizeof(display_key));
-        if (track_sort_key == TRACK_SORT_COMMENTS)
-            read_index_string(track.comments_offset, artist_buffer,
-                              sizeof(artist_buffer));
-        else if (track_sort_key == TRACK_SORT_TAGS)
-            read_index_string(track.tags_offset, artist_buffer,
-                              sizeof(artist_buffer));
-        else if (track_sort_key == TRACK_SORT_YEAR) {
-            rb->strlcpy(name, artist_buffer, sizeof(name));
-            rb->snprintf(artist_buffer, sizeof(artist_buffer),
-                         "%04d  %.24s", track.year, name);
-        } else if (track_sort_key == TRACK_SORT_IMPORTED) {
-            rb->strlcpy(name, artist_buffer, sizeof(name));
-            if (track.import_date) {
-                int year = 1980 + (track.import_date >> 9);
-                int month = (track.import_date >> 5) & 15;
-                int day = track.import_date & 31;
-                rb->snprintf(artist_buffer, sizeof(artist_buffer),
-                             "%04d-%02d-%02d  %.18s", year, month, day,
-                             name);
-            } else {
-                rb->snprintf(artist_buffer, sizeof(artist_buffer),
-                             "DATE --  %.22s", name);
-            }
-        }
-        if (genre_buffer[0]) {
-            rb->strlcat(artist_buffer, " [", sizeof(artist_buffer));
-            rb->strlcat(artist_buffer, genre_buffer, sizeof(artist_buffer));
-            rb->strlcat(artist_buffer, "]", sizeof(artist_buffer));
         }
         if (ordinal == track_selection) {
             draw_blade_selection(y - 1, 20,
                                  LCD_RGBPACK(25, 91, 148));
         }
         draw_record_badge(12, y + 8, 5,
-                          track_color_display(track.color),
+                          track_color_display(cached->track.color),
                           ordinal == track_selection);
-        rb->snprintf(line, sizeof(line), "%.38s", title_buffer);
+        rb->snprintf(line, sizeof(line), "%.38s", cached->title);
         text(22, y, line, LCD_WHITE);
         /* Let the secondary metadata run beneath the fixed DJ columns. BPM
            and Key are drawn afterwards, so they remain authoritative when a
            long Artist + [Genre] string reaches the right-hand side. */
-        rb->snprintf(line, sizeof(line), "%.46s", artist_buffer);
+        rb->snprintf(line, sizeof(line), "%.46s", cached->secondary);
         text(28, y + 10, line, LCD_RGBPACK(145, 165, 151));
         rb->snprintf(line, sizeof(line), "%d.%02d",
-                     track.bpm_x100 / 100, track.bpm_x100 % 100);
+                     cached->track.bpm_x100 / 100,
+                     cached->track.bpm_x100 % 100);
         text(232, y + 10, line, RBPREP_GREEN);
         rb->snprintf(line, sizeof(line), "%.6s",
-                     key_buffer[0] ? display_key : "--");
+                     cached->key[0] ? cached->key : "--");
         text(276, y + 10, line, LCD_WHITE);
     }
     rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
@@ -7560,7 +8330,13 @@ static void draw_track_browser(void)
                  track_row_count);
     text(7, 213, line, RBPREP_GREEN);
     text(78, 213, "WHEEL: BROWSE", LCD_LIGHTGRAY);
-    if (search_active) {
+    if (playlist_reorder_editing) {
+        text(7, 226, playlist_reorder_grabbed
+             ? "WHEEL: MOVE   SELECT: DROP   PLAY: SAVE"
+             : "SELECT: PICK UP   PLAY: SAVE   MENU: CANCEL",
+             playlist_reorder_grabbed ? LCD_RGBPACK(255, 145, 40)
+                                      : LCD_WHITE);
+    } else if (search_active) {
         rb->snprintf(line, sizeof(line), "SEARCH: %.31s", track_search);
         text(7, 226, line, LCD_RGBPACK(255, 145, 40));
     } else {
@@ -9540,13 +10316,16 @@ static void draw_main_dissolve_mask(int reveal)
                 rb->lcd_drawpixel(x, y);
 }
 
-static void animate_main_dissolve(bool reveal)
+static void animate_context_dissolve(bool reveal, int frames)
 {
     int frame;
 
-    for (frame = 0; frame <= RBPREP_MAIN_DISSOLVE_STEPS; frame++) {
+    frames = MAX(1, frames);
+    for (frame = 0; frame <= frames; frame++) {
         int amount = reveal ? frame :
-                     RBPREP_MAIN_DISSOLVE_STEPS - frame;
+                     frames - frame;
+
+        amount = amount * RBPREP_MAIN_DISSOLVE_STEPS / frames;
 
         /* Fade-out is monotonic, so preserve the exact live framebuffer and
            add black pixels to it. Fade-in must restore newly revealed pixels
@@ -9560,8 +10339,8 @@ static void animate_main_dissolve(bool reveal)
         }
         draw_main_dissolve_mask(amount);
         rb->lcd_update();
-        if (frame < RBPREP_MAIN_DISSOLVE_STEPS)
-            rb->sleep(RBPREP_MAIN_TRANSITION_FRAME_TICKS);
+        if (frame < frames)
+            rb->sleep(RBPREP_CONTEXT_TRANSITION_TICKS);
     }
 }
 
@@ -9584,6 +10363,10 @@ static void present_transition_destination(void)
        the same turn, so the final phase cannot linger as a softened frame. */
     main_transition_thumbnail_valid = false;
     transition_render_only = false;
+    transition_running = false;
+    context_change_serial = 0;
+    presented_context_serial = 0;
+    presented_mode = mode;
     force_full_redraw = true;
     draw_screen();
 }
@@ -9602,19 +10385,270 @@ static void draw_main_menu(void)
     draw_main_menu_fx();
 }
 
-static void animate_main_launch_transition(void)
+static enum rbprep_transition_style transition_style_for(
+    enum rbprep_mode old_mode, enum rbprep_mode new_mode)
 {
-    clear_transition_ticker();
-    animate_main_dissolve(false);
+    if (new_mode == MODE_LIBRARY)
+        return TRANSITION_HOME;
+    if (new_mode == MODE_TRACKS)
+        return TRANSITION_CRATE;
+    if (new_mode == MODE_PLAYLISTS || new_mode == MODE_PLAYLIST_ACTIONS ||
+        new_mode == MODE_PLAYLIST_ORDER)
+        return TRANSITION_BLADES;
+    if (new_mode == MODE_USB)
+        return TRANSITION_USB;
+    if (new_mode == MODE_SETTINGS || new_mode == MODE_ACCENT)
+        return TRANSITION_CONTROLS;
+    if (new_mode == MODE_INDEX || new_mode == MODE_PENDING)
+        return TRANSITION_DATABASE;
+    if (new_mode == MODE_FILTER || new_mode == MODE_GENRES)
+        return TRANSITION_FILTER;
+    if (new_mode == MODE_MACRO_ACTIONS || new_mode == MODE_MACRO_EDITOR ||
+        new_mode == MODE_MACRO_PICKER || new_mode == MODE_MACRO_VALUE)
+        return TRANSITION_MACRO;
+    if (new_mode >= MODE_DECK)
+        return old_mode >= MODE_DECK ? TRANSITION_DECK_PAGE
+                                     : TRANSITION_DECK;
+    return TRANSITION_HOMING;
 }
 
-static void animate_main_return_transition(void)
+static void service_transition_destination(void)
 {
+    if (mode == MODE_TRACKS)
+        service_track_cache_prefetch();
+    else if (mode == MODE_PLAYLISTS)
+        service_playlist_cache_prefetch();
+}
+
+static void draw_transition_homing_rings(int progress, int center_x,
+                                         int center_y, int spread)
+{
+    int ring;
+
+    for (ring = 0; ring < 4; ring++) {
+        int radius = 8 + ((1024 - progress) * spread / 1024) + ring * 13;
+        int color = ring == 0 ? LCD_WHITE :
+                    ring == 1 ? RBPREP_GREEN : theme_accent_dim;
+
+        rb->lcd_set_foreground(color);
+        if (radius > 1 && radius < 155)
+            xlcd_drawcircle(center_x, center_y, radius);
+    }
+}
+
+static void draw_context_transition_motif(enum rbprep_transition_style style,
+                                          int frame, int frames)
+{
+    static const signed char dial_x[8] = { 0, 5, 7, 5, 0, -5, -7, -5 };
+    static const signed char dial_y[8] = { -7, -5, 0, 5, 7, 5, 0, -5 };
+    int progress = frame * 1024 / MAX(1, frames);
+    int i;
+
+    rb->lcd_set_background(LCD_BLACK);
+    rb->lcd_clear_display();
+
+    /* Homing rings are the shared motion grammar: every destination feels
+       related, while the rigid destination geometry below gives each
+       context a distinct physical metaphor. */
+    draw_transition_homing_rings(progress, LCD_WIDTH / 2, LCD_HEIGHT / 2,
+                                 style == TRANSITION_DECK_PAGE ? 34 : 92);
+    rb->lcd_set_foreground(LCD_RGBPACK(5, 15, 12));
+    for (i = 8; i < LCD_HEIGHT; i += 16)
+        rb->lcd_hline(0, LCD_WIDTH - 1, i);
+
+    if (style == TRANSITION_CRATE) {
+        int crate_y = 146;
+
+        rb->lcd_set_foreground(theme_accent_dim);
+        rb->lcd_drawrect(72, crate_y, 176, 65);
+        rb->lcd_hline(83, 237, crate_y + 10);
+        for (i = 0; i < 6; i++) {
+            int target_y = 54 + i * 12;
+            int y = -40 - i * 8 + (target_y + 40 + i * 8) *
+                    progress / 1024;
+            int x = 93 + (i & 1) * 5;
+
+            rb->lcd_set_foreground(i == frame % 6 ? RBPREP_GREEN
+                                                   : LCD_LIGHTGRAY);
+            rb->lcd_drawrect(x, y, 134, 37);
+            xlcd_drawcircle(x + 18, y + 18, 9);
+            rb->lcd_hline(x + 38, x + 112, y + 12);
+            rb->lcd_hline(x + 38, x + 122, y + 20);
+        }
+    } else if (style == TRANSITION_BLADES) {
+        for (i = -2; i <= 2; i++) {
+            int depth = ABS(i);
+            int y = 116 + i * 33;
+            int half = 142 - depth * 16;
+            int fly = (1024 - progress) * (i < 0 ? -90 : 90) / 1024;
+
+            rb->lcd_set_foreground(i == 0 ? RBPREP_GREEN
+                                           : theme_accent_dim);
+            rb->lcd_drawline(LCD_WIDTH / 2 - half + fly, y - 10,
+                             LCD_WIDTH / 2 + half + fly, y - 10);
+            rb->lcd_drawline(LCD_WIDTH / 2 - half - 4 + fly, y + 10,
+                             LCD_WIDTH / 2 + half + 4 + fly, y + 10);
+            rb->lcd_drawline(LCD_WIDTH / 2 - half + fly, y - 10,
+                             LCD_WIDTH / 2 - half - 4 + fly, y + 10);
+            rb->lcd_drawline(LCD_WIDTH / 2 + half + fly, y - 10,
+                             LCD_WIDTH / 2 + half + 4 + fly, y + 10);
+        }
+    } else if (style == TRANSITION_USB) {
+        int plug_x = -62 + progress * 213 / 1024;
+
+        rb->lcd_set_foreground(LCD_RGBPACK(55, 64, 59));
+        rb->lcd_drawrect(222, 95, 62, 42);
+        rb->lcd_drawrect(232, 105, 42, 22);
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        rb->lcd_drawrect(plug_x, 100, 62, 32);
+        rb->lcd_fillrect(plug_x + 47, 106, 20, 20);
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_fillrect(plug_x + 52, 110, 4, 4);
+        rb->lcd_fillrect(plug_x + 60, 110, 4, 4);
+        rb->lcd_set_foreground(theme_accent_dim);
+        for (i = 0; i < 5; i++)
+            rb->lcd_drawline(20, 54 + i * 25,
+                             120 + progress * 70 / 1024, 54 + i * 25);
+    } else if (style == TRANSITION_CONTROLS) {
+        for (i = 0; i < 3; i++) {
+            int cx = 82 + i * 78;
+            int phase = (frame + i * 2) & 7;
+
+            rb->lcd_set_foreground(i == 1 ? RBPREP_GREEN
+                                           : theme_accent_dim);
+            xlcd_drawcircle(cx, 118, 27);
+            xlcd_drawcircle(cx, 118, 20);
+            rb->lcd_drawline(cx, 118, cx + dial_x[phase] * 2,
+                             118 + dial_y[phase] * 2);
+            rb->lcd_vline(cx, 162, 203);
+            rb->lcd_fillrect(cx - 7, 180 - progress * (i + 1) / 96,
+                             15, 5);
+        }
+    } else if (style == TRANSITION_DATABASE) {
+        for (i = 0; i < 9; i++) {
+            int column = i % 3;
+            int row = i / 3;
+            int delay = i * 78;
+            int local = MAX(0, MIN(1024, progress * 2 - delay));
+
+            rb->lcd_set_foreground(i == frame % 9 ? RBPREP_GREEN
+                                                   : theme_accent_dim);
+            rb->lcd_drawrect(58 + column * 70, 53 + row * 47,
+                             MAX(2, 55 * local / 1024), 31);
+            rb->lcd_hline(65 + column * 70,
+                          65 + column * 70 + 35 * local / 1024,
+                          63 + row * 47);
+        }
+    } else if (style == TRANSITION_FILTER) {
+        rb->lcd_set_foreground(theme_accent_dim);
+        rb->lcd_drawline(60, 48, 260, 48);
+        rb->lcd_drawline(60, 48, 146, 153);
+        rb->lcd_drawline(260, 48, 174, 153);
+        rb->lcd_drawline(146, 153, 146, 195);
+        rb->lcd_drawline(174, 153, 174, 195);
+        for (i = 0; i < 10; i++) {
+            int x = 75 + ((i * 47 + frame * 19) % 170);
+            int y = 53 + ((i * 23 + progress / 16) % 90);
+
+            rb->lcd_set_foreground(i & 1 ? RBPREP_GREEN : LCD_WHITE);
+            xlcd_fillcircle(x, y, 2);
+        }
+    } else if (style == TRANSITION_MACRO) {
+        int previous_x = 22;
+        int previous_y = 120;
+
+        for (i = 0; i < 8; i++) {
+            int x = 30 + i * 38;
+            int y = 120 + ((i & 1) ? -25 : 25);
+            int shown = progress > i * 110;
+
+            if (!shown)
+                continue;
+            rb->lcd_set_foreground(theme_accent_dim);
+            if (i)
+                rb->lcd_drawline(previous_x, previous_y, x, y);
+            rb->lcd_set_foreground(i == frame % 8 ? LCD_WHITE
+                                                   : RBPREP_GREEN);
+            xlcd_fillcircle(x, y, 7);
+            previous_x = x;
+            previous_y = y;
+        }
+    } else if (style == TRANSITION_DECK ||
+               style == TRANSITION_DECK_PAGE) {
+        int span = progress * (LCD_WIDTH / 2 - 10) / 1024;
+
+        rb->lcd_set_foreground(theme_accent_dim);
+        for (i = -span; i <= span; i += 4) {
+            int height = 5 + ((i * i + frame * 37) & 31);
+
+            rb->lcd_vline(LCD_WIDTH / 2 + i, 120 - height,
+                          120 + height);
+        }
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_vline(LCD_WIDTH / 2, 68, 172);
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        rb->lcd_hline(10, LCD_WIDTH - 11, 120);
+    } else if (style == TRANSITION_HOME) {
+        int radius = 18 + progress * 70 / 1024;
+
+        rb->lcd_set_foreground(theme_accent_dim);
+        rb->lcd_drawrect(64, 38, 192, 164);
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        xlcd_drawcircle(LCD_WIDTH / 2, 126, radius);
+        if (radius > 18)
+            xlcd_drawcircle(LCD_WIDTH / 2, 126, radius - 12);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_drawline(LCD_WIDTH / 2, 126,
+                         LCD_WIDTH / 2 + radius * 3 / 4,
+                         126 - radius / 3);
+    } else {
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        for (i = 0; i < 12; i++) {
+            int reach = progress * 145 / 1024;
+            int dx = dial_x[i & 7] * reach / 7;
+            int dy = dial_y[i & 7] * reach / 7;
+
+            rb->lcd_drawline(LCD_WIDTH / 2, LCD_HEIGHT / 2,
+                             LCD_WIDTH / 2 + dx, LCD_HEIGHT / 2 + dy);
+        }
+    }
+
+    rb->lcd_set_foreground(theme_accent_dim);
+    rb->lcd_fillrect(0, 2, LCD_WIDTH, 2);
+    rb->lcd_set_foreground(RBPREP_GREEN);
+    rb->lcd_fillrect(0, 2, MAX(1, progress * LCD_WIDTH / 1024), 2);
+    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_fillrect(MIN(LCD_WIDTH - 3,
+                         progress * (LCD_WIDTH - 3) / 1024), 1, 3, 4);
+}
+
+static void animate_context_transition(enum rbprep_mode old_mode,
+                                       enum rbprep_mode new_mode)
+{
+    enum rbprep_transition_style style =
+        transition_style_for(old_mode, new_mode);
+    int motif_frames = style == TRANSITION_DECK_PAGE ? 3 :
+                       capabilities.device_class == RBPREP_DEVICE_CLASSIC
+                       ? RBPREP_CONTEXT_TRANSITION_FRAMES : 5;
+    int dissolve_frames = style == TRANSITION_DECK_PAGE ? 2 : 4;
+    int frame;
+
+    if (transition_running || display_locked)
+        return;
+    transition_running = true;
     clear_transition_ticker();
-    animate_main_dissolve(false);
+    animate_context_dissolve(false, dissolve_frames);
+    for (frame = 0; frame <= motif_frames; frame++) {
+        service_transition_destination();
+        draw_context_transition_motif(style, frame, motif_frames);
+        rb->lcd_update();
+        if (frame < motif_frames)
+            rb->sleep(RBPREP_CONTEXT_TRANSITION_TICKS);
+    }
     capture_transition_destination();
-    animate_main_dissolve(true);
+    animate_context_dissolve(true, dissolve_frames);
     present_transition_destination();
+    transition_running = false;
 }
 
 static void draw_pending_edits(void)
@@ -9677,6 +10711,7 @@ static void draw_pending_edits(void)
                          entry->operation == PLAYLIST_OP_CREATE ? "CREATE" :
                          entry->operation == PLAYLIST_OP_RENAME ? "RENAME" :
                          entry->operation == PLAYLIST_OP_MOVE ? "MOVE" :
+                         entry->operation == PLAYLIST_OP_ORDER ? "ORDER" :
                          "DELETE", entry->name);
             text(19, y, line, LCD_WHITE);
             if (entry->operation == PLAYLIST_OP_ADD)
@@ -9836,7 +10871,7 @@ static bool append_playlist_operation(unsigned char operation,
     int length;
     bool ok;
 
-    if (!playlist_id || !rb->strchr("ACRMD", operation))
+    if (!playlist_id || !rb->strchr("ACRMDO", operation))
         return false;
     length = rb->snprintf(line, sizeof(line),
                           "%c\t%lu\t%lu\t%lu\t%d\t%s\n",
@@ -9862,6 +10897,33 @@ static bool append_playlist_operation(unsigned char operation,
     if (!ok)
         return false;
     refresh_pending_summary();
+    return true;
+}
+
+static bool commit_playlist_order(void)
+{
+    uint32_t checksum;
+
+    if (!active_playlist_record_valid || !playlist_order_active ||
+        active_playlist_record.kind != 1 ||
+        playlist_order_source_id != active_playlist_record.source_id ||
+        playlist_order_count != (int)active_playlist_record.member_count ||
+        !save_playlist_order_sidecar(active_playlist_record.source_id,
+                                     &checksum) ||
+        !append_playlist_operation(PLAYLIST_OP_ORDER,
+                                   playlist_order_count,
+                                   active_playlist_record.source_id,
+                                   checksum, 1,
+                                   active_playlist_name))
+        return false;
+    if (!burn_playlist_changes_now())
+        return false;
+    playlist_order_dirty = false;
+    playlist_reorder_editing = false;
+    playlist_reorder_grabbed = false;
+    playlist_view_order = PLAYLIST_VIEW_ORIGINAL;
+    playlist_order_active = false;
+    invalidate_track_cache();
     return true;
 }
 
@@ -10037,17 +11099,24 @@ static void finish_confirmation(bool apply)
                 return;
             }
         } else {
+            /* KEEP LOCAL makes the edit durable in Rekordpod's journal but
+               deliberately leaves the Rekordbox device database untouched. */
             staged_tool = -1;
-            track_edit_dirty = false;
+            if (!flush_deferred_edit()) {
+                rb->splash(HZ * 2, "Could not save pending track edit");
+                restore_black_canvas();
+                return;
+            }
+            refresh_pending_summary();
         }
         force_track_reload = deferred_track_force_reload;
+        deferred_track_unload_authorized = true;
         success = play_track_index(deferred_track_index,
                                    deferred_track_row,
                                    deferred_track_return_mode);
+        deferred_track_unload_authorized = false;
         force_track_reload = false;
         if (!success) {
-            if (confirm_choice == 1)
-                track_edit_dirty = true;
             if (resume_on_failure &&
                 (rb->audio_status() & AUDIO_STATUS_PAUSE))
                 rb->audio_resume();
@@ -10089,8 +11158,9 @@ static void finish_confirmation(bool apply)
         if (append_playlist_journal(confirm_playlist_node)) {
             playlist_add_mode = false;
             mode = MODE_DECK;
-            refresh_pending_summary();
-            burn_request = BURN_REQUEST_ALL;
+            if (!burn_playlist_changes_now())
+                rb->splash(HZ * 2,
+                           "Playlist add saved; device burn failed");
         } else {
             rb->splash(HZ * 2, "Could not queue playlist add");
         }
@@ -10100,8 +11170,11 @@ static void finish_confirmation(bool apply)
                                            playlist_action_name)) {
             playlist_add_mode = false;
             mode = MODE_DECK;
-            burn_request = BURN_REQUEST_ALL;
-            rb->splash(HZ, "Playlist seed queued");
+            if (!burn_playlist_changes_now())
+                rb->splash(HZ * 2,
+                           "Playlist seed saved; device burn failed");
+            else
+                rb->splash(HZ, "Playlist created and track added");
         } else {
             rb->splash(HZ * 2, "Could not create playlist seed");
         }
@@ -10114,6 +11187,14 @@ static void finish_confirmation(bool apply)
         burn_all_now();
     } else if (action == CONFIRM_BURN_ALL_NOW) {
         burn_all_now();
+    } else if (action == CONFIRM_PLAYLIST_REORDER) {
+        if (!commit_playlist_order()) {
+            rb->splash(HZ * 2, "Playlist order burn failed");
+            restore_black_canvas();
+        } else {
+            rb->splash(HZ, "Playlist order committed");
+            restore_black_canvas();
+        }
     } else if (action == CONFIRM_MACRO_CLEAR) {
         clear_macro(confirm_slot);
     } else if (action == CONFIRM_MACRO_DELETE_STEP) {
@@ -10183,20 +11264,26 @@ static void draw_confirmation(void)
 
     if (confirm_action == CONFIRM_TRACK_LOAD) {
         static const char * const choices[] = {
-            "SAVE & LOAD", "DISCARD & LOAD", "STAY"
+            "BURN & LOAD", "KEEP LOCAL", "STAY"
         };
-        static const int widths[] = { 86, 104, 52 };
+        static const int widths[] = { 88, 88, 52 };
         int left = x + 8;
         int choice;
 
         for (choice = 0; choice < 3; choice++) {
             bool selected = confirm_choice == choice;
 
-            rb->lcd_set_foreground(selected ? RBPREP_GREEN
+            /* Selection contrast must not depend on a user accent that may
+               be too bright, dark, or close to the label color. */
+            rb->lcd_set_foreground(selected ? LCD_WHITE
                                              : LCD_RGBPACK(20, 26, 22));
             rb->lcd_fillrect(left, y + 53, widths[choice], 20);
             centered_text(left, widths[choice], y + 58, choices[choice],
                           selected ? LCD_BLACK : LCD_WHITE);
+            if (selected) {
+                rb->lcd_set_foreground(RBPREP_GREEN);
+                rb->lcd_drawrect(left, y + 53, widths[choice], 20);
+            }
             left += widths[choice] + 4;
         }
         text(x + 10, y + 79, "LEFT/RIGHT: CHOOSE   SELECT: CONFIRM",
@@ -10205,13 +11292,21 @@ static void draw_confirmation(void)
     }
 
     rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(20, 26, 22)
-                                      : LCD_RGBPACK(12, 49, 29));
+                                      : LCD_WHITE);
     rb->lcd_fillrect(x + 12, y + 51, 72, 18);
-    text(x + 29, y + 55, "CANCEL", LCD_WHITE);
-    rb->lcd_set_foreground(confirm_ok ? RBPREP_GREEN
+    text(x + 29, y + 55, "CANCEL", confirm_ok ? LCD_WHITE : LCD_BLACK);
+    if (!confirm_ok) {
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        rb->lcd_drawrect(x + 12, y + 51, 72, 18);
+    }
+    rb->lcd_set_foreground(confirm_ok ? LCD_WHITE
                                       : LCD_RGBPACK(20, 26, 22));
     rb->lcd_fillrect(x + width - 66, y + 51, 54, 18);
     text(x + width - 48, y + 55, "OK", confirm_ok ? LCD_BLACK : LCD_WHITE);
+    if (confirm_ok) {
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        rb->lcd_drawrect(x + width - 66, y + 51, 54, 18);
+    }
 }
 
 static void draw_screen(void)
@@ -10224,7 +11319,8 @@ static void draw_screen(void)
     if (mode == MODE_PLAYLISTS || mode == MODE_TRACKS || mode == MODE_FILTER ||
         mode == MODE_LIBRARY || mode == MODE_USB || mode == MODE_SETTINGS ||
         mode == MODE_PENDING || mode == MODE_INDEX || mode == MODE_GENRES ||
-        mode == MODE_PLAYLIST_ACTIONS || mode == MODE_ACCENT ||
+        mode == MODE_PLAYLIST_ACTIONS || mode == MODE_PLAYLIST_ORDER ||
+        mode == MODE_ACCENT ||
         mode == MODE_MACRO_ACTIONS || mode == MODE_MACRO_EDITOR ||
         mode == MODE_MACRO_PICKER || mode == MODE_MACRO_VALUE) {
         rb->lcd_clear_display();
@@ -10246,6 +11342,8 @@ static void draw_screen(void)
             draw_genre_picker();
         else if (mode == MODE_PLAYLIST_ACTIONS)
             draw_playlist_actions();
+        else if (mode == MODE_PLAYLIST_ORDER)
+            draw_playlist_order_menu();
         else if (mode == MODE_ACCENT)
             draw_accent_picker();
         else if (mode == MODE_MACRO_ACTIONS)
@@ -11223,6 +12321,7 @@ static void edit_collection_search(void)
 static void choose_collection_sort(int sort_key)
 {
     collection_shuffle_active = false;
+    invalidate_track_cache();
     if (sort_key == track_sort_key)
         track_sort_descending = !track_sort_descending;
     else {
@@ -11279,11 +12378,7 @@ static void activate_main_selection(int item)
 static void begin_main_launch(int item)
 {
     item = MAX(0, MIN((int)ARRAYLEN(main_menu_items) - 1, item));
-    animate_main_launch_transition();
     activate_main_selection(item);
-    capture_transition_destination();
-    animate_main_dissolve(true);
-    present_transition_destination();
 }
 
 static void short_select(void)
@@ -11338,8 +12433,35 @@ static void short_select(void)
         }
     } else if (mode == MODE_PLAYLIST_ACTIONS) {
         choose_playlist_action();
+    } else if (mode == MODE_PLAYLIST_ORDER) {
+        if (playlist_order_menu_selection < PLAYLIST_VIEW_COUNT) {
+            if (!apply_playlist_view_order(playlist_order_menu_selection)) {
+                rb->splash(HZ * 2, "Playlist order unavailable");
+                restore_black_canvas();
+            } else {
+                mode = MODE_TRACKS;
+            }
+        } else if (playlist_order_menu_selection == PLAYLIST_VIEW_COUNT) {
+            if (!begin_playlist_reorder_editor()) {
+                rb->splash(HZ * 2,
+                    active_playlist_record_valid &&
+                    active_playlist_record.kind == 2
+                    ? "Smart order stays query-driven"
+                    : "Playlist is too large to edit");
+                restore_black_canvas();
+            }
+        } else if (playlist_order_active &&
+                   active_playlist_record_valid &&
+                   active_playlist_record.kind == 1) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "COMMIT THIS PLAYLIST ORDER?");
+            begin_confirmation(CONFIRM_PLAYLIST_REORDER);
+        }
     } else if (mode == MODE_TRACKS) {
-        if (track_row_count > 0)
+        if (playlist_reorder_editing) {
+            playlist_reorder_grabbed = !playlist_reorder_grabbed;
+            force_full_redraw = true;
+        } else if (track_row_count > 0)
             play_track_row(track_selection);
     } else if (mode == MODE_FILTER) {
         if (filter_selection == 0) {
@@ -12638,8 +13760,6 @@ static void bank_tool_page(int direction)
 
 static void handle_escape_once(void)
 {
-    enum rbprep_mode old_mode = mode;
-
     if (tool_menu_active) {
         select_tool(tool_menu_original);
         tool_menu_active = false;
@@ -12715,6 +13835,15 @@ static void handle_escape_once(void)
         mode = MODE_METADATA;
     } else if (mode == MODE_PLAYLIST_ACTIONS) {
         mode = MODE_PLAYLISTS;
+    } else if (mode == MODE_PLAYLIST_ORDER) {
+        mode = MODE_TRACKS;
+    } else if (mode == MODE_TRACKS && playlist_reorder_editing) {
+        int previous_view = playlist_view_order;
+
+        playlist_reorder_editing = false;
+        playlist_reorder_grabbed = false;
+        playlist_order_dirty = false;
+        apply_playlist_view_order(previous_view);
     } else if (mode == MODE_PLAYLISTS &&
                tree_parent != RBPREP_ROOT_NODE) {
         struct rbprep_node_record parent;
@@ -12740,8 +13869,6 @@ static void handle_escape_once(void)
     } else {
         mode = MODE_LIBRARY;
     }
-    if (old_mode != MODE_LIBRARY && mode == MODE_LIBRARY)
-        animate_main_return_transition();
     force_full_redraw = true;
 }
 
@@ -13294,6 +14421,14 @@ enum plugin_status plugin_start(const void *parameter)
     playlist_playback = !!autoplay_enabled;
     playlist_add_mode = false;
     playlist_move_mode = false;
+    playlist_order_count = 0;
+    playlist_view_order = PLAYLIST_VIEW_ORIGINAL;
+    playlist_order_menu_selection = 0;
+    playlist_order_active = false;
+    playlist_reorder_editing = false;
+    playlist_reorder_grabbed = false;
+    playlist_order_dirty = false;
+    playlist_order_source_id = 0;
     force_track_reload = false;
     playlist_action_selection = 0;
     playlist_action_node = playlist_action_parent = -1;
@@ -13349,6 +14484,15 @@ enum plugin_status plugin_start(const void *parameter)
     track_search[0] = '\0';
     search_active = false;
     collection_shuffle_active = false;
+    track_context_initialized = false;
+    active_playlist_record_valid = false;
+    active_playlist_name[0] = '\0';
+    playlist_cache_generation = 0;
+    track_cache_generation = 0;
+    track_prefetch_direction = 1;
+    playlist_carousel_offset_fp = 0;
+    invalidate_playlist_cache();
+    invalidate_track_cache();
     search_result_count = 0;
     pending_selection = pending_top = 0;
     recent_tracks_ready = false;
@@ -13447,6 +14591,20 @@ enum plugin_status plugin_start(const void *parameter)
             redraw = true;
         if (service_playlist_playback())
             redraw = true;
+        if (!display_locked && mode < MODE_DECK) {
+            if (service_playlist_carousel_motion())
+                redraw = true;
+            if (service_track_cache_prefetch() ||
+                service_playlist_cache_prefetch())
+                redraw = true;
+            /* The 30-day statistic is a low-priority sequential scan. One
+               compact chunk per idle main-menu pass makes launch immediate
+               and never competes with deck playback. */
+            if (mode == MODE_LIBRARY && recent_scan_active &&
+                !(rb->audio_status() & AUDIO_STATUS_PLAY) &&
+                service_recent_track_scan())
+                redraw = true;
+        }
         if (exit_requested) {
             stop_editor_audio();
             if (library_fd >= 0)
@@ -13454,6 +14612,22 @@ enum plugin_status plugin_start(const void *parameter)
             if (genre_fd >= 0)
                 rb->close(genre_fd);
             return PLUGIN_OK;
+        }
+
+        if (display_locked) {
+            /* A locked display consumes no ornamental frames. On unlock the
+               current context appears immediately instead of replaying old
+               navigation. */
+            presented_mode = mode;
+            presented_context_serial = context_change_serial;
+        } else if (!confirm_active &&
+                   (mode != presented_mode ||
+                    context_change_serial != presented_context_serial)) {
+            animate_context_transition(presented_mode, mode);
+            presented_mode = mode;
+            presented_context_serial = context_change_serial;
+            redraw = false;
+            frame_deadline = *rb->current_tick + 1;
         }
 
         /* Rendering never owns the input rate. Coalesce rapid wheel/chord
@@ -13677,6 +14851,23 @@ enum plugin_status plugin_start(const void *parameter)
                 bank_macro_picker(1);
             } else if (mode == MODE_MACRO_ACTIONS) {
                 /* Playback is deliberately inert inside workflow setup. */
+            } else if (mode == MODE_TRACKS && active_playlist_node >= 0) {
+                if (playlist_reorder_editing) {
+                    if (playlist_order_dirty) {
+                        rb->snprintf(confirm_message,
+                                     sizeof(confirm_message),
+                                     "COMMIT THIS PLAYLIST ORDER?");
+                        begin_confirmation(CONFIRM_PLAYLIST_REORDER);
+                    } else {
+                        playlist_reorder_editing = false;
+                        playlist_reorder_grabbed = false;
+                        force_full_redraw = true;
+                    }
+                } else {
+                    playlist_order_menu_selection = playlist_view_order;
+                    mode = MODE_PLAYLIST_ORDER;
+                    force_full_redraw = true;
+                }
             } else if (mode == MODE_TRACKS && active_playlist_node < 0) {
                 filter_selection = 0;
                 mode = MODE_FILTER;
@@ -13844,11 +15035,25 @@ enum plugin_status plugin_start(const void *parameter)
                 navigate_main_menu(1);
             else if (mode == MODE_PLAYLISTS &&
                      playlist_browser_count() > 0) {
+                int previous_selection = tree_selection;
+
                 tree_selection = MIN(playlist_browser_count() - 1,
                                      tree_selection + 1);
-                if (tree_selection >= tree_top + RBPREP_LIST_ROWS)
-                    tree_top = tree_selection - RBPREP_LIST_ROWS + 1;
+                if (tree_selection != previous_selection)
+                    playlist_carousel_offset_fp = 36 * 256;
+                if (tree_selection >= tree_top +
+                                      RBPREP_PLAYLIST_CAROUSEL_ROWS)
+                    tree_top = tree_selection -
+                               RBPREP_PLAYLIST_CAROUSEL_ROWS + 1;
+            } else if (mode == MODE_PLAYLIST_ORDER) {
+                playlist_order_menu_selection =
+                    MIN(PLAYLIST_VIEW_COUNT + 1,
+                        playlist_order_menu_selection + 1);
+            } else if (mode == MODE_TRACKS && playlist_reorder_editing &&
+                       playlist_reorder_grabbed) {
+                move_grabbed_playlist_track(1);
             } else if (mode == MODE_TRACKS && track_row_count > 0) {
+                track_prefetch_direction = 1;
                 track_selection = MIN(track_row_count - 1,
                                       track_selection + 1);
                 if (track_selection >= track_top + RBPREP_LIST_ROWS)
@@ -13904,10 +15109,21 @@ enum plugin_status plugin_start(const void *parameter)
             else if (mode == MODE_LIBRARY)
                 navigate_main_menu(-1);
             else if (mode == MODE_PLAYLISTS) {
+                int previous_selection = tree_selection;
+
                 tree_selection = MAX(0, tree_selection - 1);
+                if (tree_selection != previous_selection)
+                    playlist_carousel_offset_fp = -36 * 256;
                 if (tree_selection < tree_top)
                     tree_top = tree_selection;
+            } else if (mode == MODE_PLAYLIST_ORDER) {
+                playlist_order_menu_selection =
+                    MAX(0, playlist_order_menu_selection - 1);
+            } else if (mode == MODE_TRACKS && playlist_reorder_editing &&
+                       playlist_reorder_grabbed) {
+                move_grabbed_playlist_track(-1);
             } else if (mode == MODE_TRACKS) {
+                track_prefetch_direction = -1;
                 track_selection = MAX(0, track_selection - 1);
                 if (track_selection < track_top)
                     track_top = track_selection;

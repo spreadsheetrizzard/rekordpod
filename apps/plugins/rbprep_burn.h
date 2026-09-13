@@ -2042,6 +2042,284 @@ static void burn_finish_analysis_files(struct rbprep_pdb *pdb,
     rb->close(fd);
 }
 
+#define RBPREP_PLAYLIST_ORDER_FOUND 0x80000000u
+#define RBPREP_PLAYLIST_ORDER_RANK  0x7fffffffu
+
+static int burn_compare_playlist_order_ids(const void *left_value,
+                                           const void *right_value)
+{
+    const struct rbprep_playlist_order_item *left = left_value;
+    const struct rbprep_playlist_order_item *right = right_value;
+
+    if (left->track_id == right->track_id)
+        return 0;
+    return left->track_id < right->track_id ? -1 : 1;
+}
+
+static int burn_compare_playlist_order_rank(const void *left_value,
+                                            const void *right_value)
+{
+    const struct rbprep_playlist_order_item *left = left_value;
+    const struct rbprep_playlist_order_item *right = right_value;
+
+    if (left->sort.value == right->sort.value)
+        return 0;
+    return left->sort.value < right->sort.value ? -1 : 1;
+}
+
+static bool rbi_write_member(int fd, uint32_t member);
+
+static int burn_playlist_order_rank(uint32_t track_id, int count)
+{
+    int low = 0;
+    int high = count;
+
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+        uint32_t candidate = playlist_order_items[middle].track_id;
+
+        if (candidate < track_id)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    return low < count && playlist_order_items[low].track_id == track_id
+         ? low : -1;
+}
+
+static bool pdb_validate_playlist_order(struct rbprep_pdb *pdb,
+                                        uint32_t playlist, int count,
+                                        bool verify_sort)
+{
+    uint32_t entry;
+    unsigned char table[16];
+    uint32_t page;
+    uint32_t last;
+    int matched = 0;
+    int guard = 0;
+    int i;
+
+    for (i = 0; i < count; i++)
+        playlist_order_items[i].sort.value =
+            (int)((uint32_t)playlist_order_items[i].sort.value &
+                  RBPREP_PLAYLIST_ORDER_RANK);
+    if (!pdb_table_entry(pdb, 8, &entry) ||
+        !burn_read_at(pdb->fd, entry, table, sizeof(table)))
+        return false;
+    page = read_u32(table + 8);
+    last = read_u32(table + 12);
+    while (guard++ < 100000) {
+        int slots;
+        int slot;
+        uint32_t next;
+
+        if (!burn_read_at(pdb->fd, page * pdb->page_size,
+                          rbprep_burn_page, pdb->page_size))
+            return false;
+        slots = pdb_slot_count(rbprep_burn_page);
+        next = read_u32(rbprep_burn_page + 0x0c);
+        if (!(rbprep_burn_page[0x1b] & 0x40)) {
+            for (slot = 0; slot < slots; slot++) {
+                unsigned char *values;
+                int rank;
+
+                if (!pdb_row_present(rbprep_burn_page, pdb->page_size, slot))
+                    continue;
+                values = rbprep_burn_page + 0x28 +
+                         pdb_row_heap_offset(rbprep_burn_page,
+                                             pdb->page_size, slot);
+                if (read_u32(values + 8) != playlist)
+                    continue;
+                rank = burn_playlist_order_rank(read_u32(values + 4), count);
+                if (rank < 0 ||
+                    ((uint32_t)playlist_order_items[rank].sort.value &
+                     RBPREP_PLAYLIST_ORDER_FOUND) ||
+                    (verify_sort && read_u32(values) !=
+                     ((uint32_t)playlist_order_items[rank].sort.value &
+                      RBPREP_PLAYLIST_ORDER_RANK) + 1))
+                    return false;
+                playlist_order_items[rank].sort.value = (int)(
+                    (uint32_t)playlist_order_items[rank].sort.value |
+                    RBPREP_PLAYLIST_ORDER_FOUND);
+                matched++;
+            }
+        }
+        if (page == last)
+            break;
+        page = next;
+    }
+    if (matched != count)
+        return false;
+    for (i = 0; i < count; i++)
+        if (!((uint32_t)playlist_order_items[i].sort.value &
+              RBPREP_PLAYLIST_ORDER_FOUND))
+            return false;
+    return true;
+}
+
+static bool pdb_apply_playlist_order(struct rbprep_pdb *pdb,
+                                     uint32_t playlist, int count)
+{
+    uint32_t entry;
+    unsigned char table[16];
+    uint32_t page;
+    uint32_t last;
+    int guard = 0;
+
+    if (!pdb_table_entry(pdb, 8, &entry) ||
+        !burn_read_at(pdb->fd, entry, table, sizeof(table)))
+        return false;
+    page = read_u32(table + 8);
+    last = read_u32(table + 12);
+    while (guard++ < 100000) {
+        struct rbprep_pdb_touch *touch;
+        uint32_t next;
+        int slots;
+        int slot;
+        bool changed = false;
+
+        if (!burn_read_at(pdb->fd, page * pdb->page_size,
+                          rbprep_burn_page, pdb->page_size))
+            return false;
+        slots = pdb_slot_count(rbprep_burn_page);
+        next = read_u32(rbprep_burn_page + 0x0c);
+        if (!(rbprep_burn_page[0x1b] & 0x40)) {
+            for (slot = 0; slot < slots; slot++) {
+                unsigned char *values;
+
+                if (!pdb_row_present(rbprep_burn_page, pdb->page_size, slot))
+                    continue;
+                values = rbprep_burn_page + 0x28 +
+                         pdb_row_heap_offset(rbprep_burn_page,
+                                             pdb->page_size, slot);
+                if (read_u32(values + 8) != playlist)
+                    continue;
+                changed = true;
+                break;
+            }
+        }
+        if (changed) {
+            touch = pdb_touch(pdb, 8, page, slots);
+            if (!touch ||
+                !burn_read_at(pdb->fd, page * pdb->page_size,
+                              rbprep_burn_page, pdb->page_size))
+                return false;
+            pdb_prepare_touch(pdb, touch, rbprep_burn_page);
+            for (slot = 0; slot < slots; slot++) {
+                unsigned char *values;
+                int rank;
+                int group;
+                int bit;
+                int base;
+
+                if (!pdb_row_present(rbprep_burn_page, pdb->page_size, slot))
+                    continue;
+                values = rbprep_burn_page + 0x28 +
+                         pdb_row_heap_offset(rbprep_burn_page,
+                                             pdb->page_size, slot);
+                if (read_u32(values + 8) != playlist)
+                    continue;
+                rank = burn_playlist_order_rank(read_u32(values + 4), count);
+                if (rank < 0)
+                    return false;
+                write_u32(values,
+                          ((uint32_t)playlist_order_items[rank].sort.value &
+                           RBPREP_PLAYLIST_ORDER_RANK) + 1);
+                group = slot / 16;
+                bit = slot & 15;
+                base = pdb->page_size - group * 0x24;
+                write_u16(rbprep_burn_page + base - 2,
+                          read_u16(rbprep_burn_page + base - 2) |
+                          (1u << bit));
+            }
+            write_u32(rbprep_burn_page + 0x10, touch->generation);
+            if (!burn_write_at(pdb->fd, page * pdb->page_size,
+                               rbprep_burn_page, pdb->page_size))
+                return false;
+        }
+        if (page == last)
+            break;
+        page = next;
+    }
+    return true;
+}
+
+static bool pdb_reorder_playlist(struct rbprep_pdb *pdb,
+                                 const struct rbprep_pending_playlist *order)
+{
+    int count = load_playlist_order_sidecar(order->playlist_id,
+                                            order->track_id,
+                                            order->parent_id);
+    int i;
+
+    if (count <= 0)
+        return false;
+    rb->qsort(playlist_order_items, count,
+              sizeof(playlist_order_items[0]),
+              burn_compare_playlist_order_ids);
+    for (i = 1; i < count; i++)
+        if (playlist_order_items[i - 1].track_id ==
+            playlist_order_items[i].track_id)
+            return false;
+    return pdb_validate_playlist_order(pdb, order->playlist_id,
+                                       count, false) &&
+           pdb_apply_playlist_order(pdb, order->playlist_id, count) &&
+           pdb_validate_playlist_order(pdb, order->playlist_id,
+                                       count, true);
+}
+
+static bool rbi_write_playlist_order(int output,
+                                     const struct rbprep_node_record *node,
+                                     const struct rbprep_pending_playlist *order)
+{
+    int count = load_playlist_order_sidecar(order->playlist_id,
+                                            order->track_id,
+                                            order->parent_id);
+    uint32_t base;
+    int i;
+
+    if (count != (int)node->member_count)
+        return false;
+    rb->qsort(playlist_order_items, count,
+              sizeof(playlist_order_items[0]),
+              burn_compare_playlist_order_ids);
+    for (i = 0; i < count; i++)
+        playlist_order_items[i].track_index = -1;
+    for (base = 0; base < library_track_count;) {
+        uint32_t amount = MIN((uint32_t)(RBPREP_LIBRARY_SCAN_BYTES /
+                                        library_track_record_size),
+                              library_track_count - base);
+        uint32_t item;
+
+        if (!read_index_at(library_track_offset +
+                           base * library_track_record_size,
+                           library_scan_buffer,
+                           amount * library_track_record_size))
+            return false;
+        for (item = 0; item < amount; item++) {
+            struct rbprep_track_record track;
+            int rank;
+
+            decode_track_record(library_scan_buffer +
+                                item * library_track_record_size, &track);
+            rank = burn_playlist_order_rank(track.id, count);
+            if (rank >= 0)
+                playlist_order_items[rank].track_index = base + item;
+        }
+        base += amount;
+    }
+    for (i = 0; i < count; i++)
+        if (playlist_order_items[i].track_index < 0)
+            return false;
+    rb->qsort(playlist_order_items, count,
+              sizeof(playlist_order_items[0]),
+              burn_compare_playlist_order_rank);
+    for (i = 0; i < count; i++)
+        if (!rbi_write_member(output, playlist_order_items[i].track_index))
+            return false;
+    return true;
+}
+
 static bool burn_playlist_operation(
     struct rbprep_pdb *pdb, const struct rbprep_pending_playlist *operation,
     int *completed, int total)
@@ -2093,6 +2371,8 @@ static bool burn_playlist_operation(
         success = pdb_move_playlist(pdb, playlist, operation->parent_id);
     } else if (operation->operation == PLAYLIST_OP_DELETE) {
         success = pdb_delete_playlist(pdb, playlist);
+    } else if (operation->operation == PLAYLIST_OP_ORDER) {
+        success = pdb_reorder_playlist(pdb, operation);
     }
     if (!success && !rbprep_burn_failure_detail[0])
         rb->snprintf(rbprep_burn_failure_detail,
@@ -2504,15 +2784,22 @@ static bool burn_rewrite_local_index(void)
         goto done;
     for (index = 0; index < library_node_count; index++) {
         struct rbprep_node_record node;
+        const struct rbprep_pending_playlist *order;
         if (!read_node_record(index, &node))
             goto done;
         if (rbi_playlist_operation(PLAYLIST_OP_DELETE, node.source_id))
             continue;
-        if (node.member_count > 0 &&
-            !burn_copy_range(library_fd, output,
-                library_member_offset + node.first_member * 4,
-                node.member_count * 4))
-            goto done;
+        order = rbi_playlist_operation(PLAYLIST_OP_ORDER, node.source_id);
+        if (node.member_count > 0) {
+            if (order) {
+                if (!rbi_write_playlist_order(output, &node, order))
+                    goto done;
+            } else if (!burn_copy_range(library_fd, output,
+                       library_member_offset + node.first_member * 4,
+                       node.member_count * 4)) {
+                goto done;
+            }
+        }
         if (!rbi_write_new_members(output, &node))
             goto done;
     }
