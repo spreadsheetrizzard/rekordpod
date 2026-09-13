@@ -108,6 +108,7 @@
 #define RBPREP_TOOL_PAGE_MAX 5
 #define RBPREP_SELECT_DOUBLE_TICKS MAX(1, HZ * 3 / 10)
 #define RBPREP_SETTINGS_LAST 13
+#define RBPREP_SETTINGS_ROWS 11
 #define RBPREP_MAIN_DISSOLVE_STEPS 16
 #define RBPREP_CONTEXT_TRANSITION_TICKS MAX(1, HZ / 50)
 #define RBPREP_CONTEXT_TRANSITION_FRAMES 7
@@ -8387,21 +8388,6 @@ static void draw_blade_shell(const char *title, int accent)
     rb->lcd_fillrect(5, RBPREP_STATUS_HEIGHT + 3, 3,
                      LCD_HEIGHT - RBPREP_STATUS_HEIGHT - 8);
     text(10, RBPREP_STATUS_HEIGHT + 4, title, LCD_WHITE);
-    {
-        static const char *tabs[] = { "BRS", "TAG", "INF", "MNU" };
-        int tab;
-
-        for (tab = 0; tab < 4; tab++) {
-            int x = 218 + tab * 24;
-            rb->lcd_set_foreground(LCD_RGBPACK(25, 31, 27));
-            rb->lcd_fillrect(x, RBPREP_STATUS_HEIGHT + 5, 21, 12);
-            rb->lcd_set_foreground(tab == 0 ? accent
-                                            : LCD_RGBPACK(72, 82, 76));
-            rb->lcd_drawrect(x, RBPREP_STATUS_HEIGHT + 5, 21, 12);
-            text(x + 2, RBPREP_STATUS_HEIGHT + 7, tabs[tab],
-                 tab == 0 ? LCD_WHITE : LCD_RGBPACK(140, 150, 144));
-        }
-    }
 }
 
 static void draw_blade_selection(int y, int height, int color)
@@ -9995,7 +9981,11 @@ static void draw_top_hud(void)
 
 static void draw_settings(void)
 {
+    const int list_top = 43;
+    const int row_height = 13;
     int row;
+    int visible;
+    int settings_top;
     int value_width;
     int value_x;
     const char *names[] = {
@@ -10023,10 +10013,17 @@ static void draw_settings(void)
     draw_blade_shell("REKORDPOD SETTINGS", RBPREP_GREEN);
     text(10, 29, "PLAYBACK  /  WORKFLOW  /  DISPLAY",
          LCD_RGBPACK(105, 125, 112));
-    for (row = 0; row < (int)ARRAYLEN(names); row++) {
-        int y = 33 + row * 11;
+    settings_top = MAX(0, settings_selection - RBPREP_SETTINGS_ROWS + 1);
+    settings_top = MIN(settings_top,
+        MAX(0, (int)ARRAYLEN(names) - RBPREP_SETTINGS_ROWS));
+    for (visible = 0; visible < RBPREP_SETTINGS_ROWS; visible++) {
+        int y = list_top + visible * row_height;
+
+        row = settings_top + visible;
+        if (row >= (int)ARRAYLEN(names))
+            break;
         if (row == settings_selection)
-            draw_blade_selection(y - 1, 11, RBPREP_GREEN);
+            draw_blade_selection(y - 1, 12, RBPREP_GREEN);
         rb->lcd_set_foreground(row == settings_selection
                                ? LCD_WHITE : RBPREP_GREEN);
         xlcd_fillcircle(17, y + 5, row == settings_selection ? 4 : 3);
@@ -10041,6 +10038,21 @@ static void draw_settings(void)
                                : LCD_RGBPACK(17, 25, 20));
         rb->lcd_fillrect(value_x - 5, y, value_width + 10, 11);
         text(value_x, y, values[row], RBPREP_GREEN);
+    }
+    if ((int)ARRAYLEN(names) > RBPREP_SETTINGS_ROWS) {
+        const int rail_top = list_top;
+        const int rail_height = RBPREP_SETTINGS_ROWS * row_height - 1;
+        int thumb_height = MAX(12, rail_height * RBPREP_SETTINGS_ROWS /
+                                   (int)ARRAYLEN(names));
+        int thumb_y = rail_top +
+            (rail_height - thumb_height) * settings_top /
+            ((int)ARRAYLEN(names) - RBPREP_SETTINGS_ROWS);
+
+        rb->lcd_set_foreground(LCD_RGBPACK(35, 45, 39));
+        rb->lcd_vline(LCD_WIDTH - 4, rail_top,
+                      rail_top + rail_height - 1);
+        rb->lcd_set_foreground(RBPREP_GREEN);
+        rb->lcd_fillrect(LCD_WIDTH - 5, thumb_y, 3, thumb_height);
     }
     description = settings_selection == 0
          ? (autoboot_enabled ? "Launch Rekordpod automatically after boot"
@@ -10552,20 +10564,15 @@ static void draw_main_cdj_controls(int glow)
     };
     int index;
 
-    for (index = 0; index < 4; index++)
-        draw_cdj_face_button(82 + index * 40, 10, 37, 11, "",
-                             theme_accent,
-                             glow == index * 2);
-
-    /* Unlabeled utility glyphs preserve the real control hierarchy when the
-       full-size legends would be smaller than a readable LCD pixel. */
-    rb->lcd_set_foreground(LCD_RGBPACK(185, 191, 187));
+    /* The four hardware utility keys are intentionally tiny at this scale.
+       Solid caps read more cleanly than +/- glyphs inside oversized boxes. */
     for (index = 0; index < 4; index++) {
-        int cx = 100 + index * 40;
-        rb->lcd_hline(cx - 4, cx + 4, 14);
-        rb->lcd_drawpixel(cx, 12);
-        if (index & 1)
-            rb->lcd_vline(cx, 13, 17);
+        int x = 89 + index * 39;
+
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_fillrect(x - 1, 13, 24, 7);
+        rb->lcd_set_foreground(LCD_WHITE);
+        rb->lcd_fillrect(x, 13, 22, 5);
     }
 
     rb->lcd_set_foreground(LCD_RGBPACK(24, 27, 25));
