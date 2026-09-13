@@ -95,7 +95,12 @@
 #define RBPREP_GREEN theme_accent
 #define RBPREP_GREEN_DIM theme_accent_dim
 #define RBPREP_MENU_TEXT LCD_RGBPACK(188, 205, 193)
-#define RBPREP_TOOL_PAGE_MAX 4
+#define RBPREP_TOOL_PAGE_MAX 5
+#define RBPREP_SELECT_DOUBLE_TICKS MAX(1, HZ * 3 / 10)
+#define RBPREP_SETTINGS_LAST 13
+#define RBPREP_MAIN_TRANSITION_TICKS MAX(1, HZ * 3 / 10)
+#define RBPREP_RETURN_THUMB_W 80
+#define RBPREP_RETURN_THUMB_H 60
 #define RBPREP_HIGH_RES_WINDOW_WIDTH 112
 #define RBPREP_WHEEL_ARM_UNITS 3
 #define RBPREP_MACRO_COUNT 2
@@ -154,6 +159,12 @@ enum rbprep_color_target {
     COLOR_TARGET_WHEEL
 };
 
+enum rbprep_key_display {
+    KEY_DISPLAY_CHROMATIC,
+    KEY_DISPLAY_CAMELOT,
+    KEY_DISPLAY_ORIGINAL
+};
+
 enum rbprep_tool {
     /* These values are persisted in tool-macros.rbm. Never renumber an
        existing tool: append new values immediately before TOOL_COUNT. */
@@ -202,7 +213,10 @@ enum rbprep_tool {
     TOOL_VIS_HARMONIC = 42,
     TOOL_META_KEY = 43,
     TOOL_KEY_NOTATION = 44,
-    TOOL_COUNT = 45
+    TOOL_FAVORITE_ONE = 45,
+    TOOL_FAVORITE_TWO = 46,
+    TOOL_IPOD_SEEK = 47,
+    TOOL_COUNT = 48
 };
 
 enum rbprep_confirm_action {
@@ -320,12 +334,24 @@ static int visualizer_two_tool;
 static int list_tool;
 static int pnav_tool;
 static int macro_tool;
+static int macro_tool_override = -1;
+static bool select_click_pending;
+static bool select_double_consumed;
+static long select_click_deadline;
+static bool seek_portal_active;
+static enum rbprep_mode seek_return_mode;
+static int seek_return_tool;
+static int seek_return_macro_active;
+static int seek_return_macro_position;
+static bool seek_return_macro_lock;
+static int seek_return_macro_override;
 static int waveform_half;
 static int visualizer_mode;
 static int save_on_track_load;
 static int auto_burn;
 static int click_sound;
 static int platter_wheel_mode = 1;
+static int ipod_seek_first;
 static int keylock_enabled = 1;
 static int key_notation;
 static int autoplay_enabled = 1;
@@ -355,9 +381,19 @@ static int main_wheel_phase_fp;
 static int main_wheel_velocity_fp;
 static int main_wheel_touch_position;
 static long main_wheel_motion_tick;
-static int main_blade_shift_fp;
-static long main_blade_motion_tick;
 static long main_name_scroll_deadline;
+static bool main_launch_active;
+static int main_launch_item;
+static long main_launch_tick;
+static bool main_return_active;
+static long main_return_tick;
+static fb_data main_return_thumbnail[RBPREP_RETURN_THUMB_W *
+                                     RBPREP_RETURN_THUMB_H];
+static struct viewport *main_viewport;
+static int activity_ticker_progress;
+static long activity_ticker_until;
+static long activity_ticker_last_update;
+static unsigned char activity_ticker_burst;
 static char device_usb_name[32] = "REKORDPOD";
 static int scrub_step_index = 4;
 static int settings_selection;
@@ -850,7 +886,7 @@ static const char * const tool_names[TOOL_COUNT] = {
     "BURN TRACK", "BURN ALL", "PREV TRACK", "NEXT TRACK",
     "RESTART", "RELOAD", "SPECTRAL CANYON", "STEREO ORBIT",
     "PHRASE MAP", "HARMONIC CONSTELLATION", "KEY EDITOR",
-    "KEY NOTATION"
+    "KEY NOTATION", "FAVLIST1", "FAVLIST2", "IPOD SEEK"
 };
 
 /* On-disk workflow identities are deliberately independent of enum order.
@@ -902,6 +938,9 @@ static const uint16_t macro_tool_storage_ids[TOOL_COUNT] = {
     [TOOL_VIS_HARMONIC]      = 0x012a,
     [TOOL_META_KEY]          = 0x012b,
     [TOOL_KEY_NOTATION]      = 0x012c,
+    [TOOL_FAVORITE_ONE]      = 0x012d,
+    [TOOL_FAVORITE_TWO]      = 0x012e,
+    [TOOL_IPOD_SEEK]         = 0x012f,
 };
 
 static char *waveform_styles[] = { "full", "half" };
@@ -921,7 +960,10 @@ static const char *spectrum_labels[] = {
 static char *save_on_load_styles[] = { "immediate", "next track" };
 static char *auto_burn_styles[] = { "off", "next track load" };
 static char *off_on_styles[] = { "off", "on" };
-static char *key_notation_styles[] = { "chromatic", "camelot" };
+static char *ipod_seek_position_styles[] = { "last", "first" };
+static char *key_notation_styles[] = {
+    "chromatic equivalent", "camelot equivalent", "original"
+};
 static const char * const chromatic_key_names[] = {
     "C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
     "Cm", "Dbm", "Dm", "Ebm", "Em", "Fm", "F#m", "Gm", "Abm", "Am",
@@ -931,6 +973,18 @@ static const char * const camelot_key_names[] = {
     "8B", "3B", "10B", "5B", "12B", "7B", "2B", "9B", "4B", "11B",
     "6B", "1B", "5A", "12A", "7A", "2A", "9A", "4A", "11A", "6A",
     "1A", "8A", "3A", "10A"
+};
+struct rbprep_key_alias {
+    const char *name;
+    unsigned char index;
+};
+static const struct rbprep_key_alias key_aliases[] = {
+    { "B#", 0 }, { "C#", 1 }, { "D#", 3 }, { "E#", 5 },
+    { "Gb", 6 }, { "G#", 8 }, { "A#", 10 }, { "Cb", 11 },
+    { "Fb", 4 },
+    { "B#m", 12 }, { "C#m", 13 }, { "D#m", 15 }, { "E#m", 17 },
+    { "Gbm", 18 }, { "G#m", 20 }, { "A#m", 22 }, { "Cbm", 23 },
+    { "Fbm", 16 }
 };
 static char *turntable_arm_styles[] = { "straight", "s-shaped" };
 static char *turntable_headshell_styles[] = {
@@ -973,9 +1027,12 @@ static const struct configdata rbprep_config[] = {
       "wheel click", off_on_styles },
     { TYPE_ENUM, 0, 1, { .int_p = &platter_wheel_mode },
       "platter wheel mode", off_on_styles },
+    { TYPE_ENUM, 0, 1, { .int_p = &ipod_seek_first },
+      "ipod seek position", ipod_seek_position_styles },
     { TYPE_ENUM, 0, 1, { .int_p = &keylock_enabled },
       "keylock", off_on_styles },
-    { TYPE_ENUM, 0, 1, { .int_p = &key_notation },
+    { TYPE_ENUM, 0, ARRAYLEN(key_notation_styles) - 1,
+      { .int_p = &key_notation },
       "key notation", key_notation_styles },
     { TYPE_ENUM, 0, 1, { .int_p = &autoplay_enabled },
       "autoplay default", off_on_styles },
@@ -1116,37 +1173,66 @@ struct rbprep_tool_page {
     enum rbprep_tool tools[RBPREP_TOOL_PAGE_MAX];
 };
 
-static const struct rbprep_tool_page tool_pages[] = {
-    { MODE_DECK, "PLAYER", 4,
-      { TOOL_SEEK, TOOL_SCRUB_STEP, TOOL_ZOOM, TOOL_GAIN } },
-    { MODE_PNAV, "PLNAV", 4,
+static struct rbprep_tool_page tool_pages[] = {
+    { MODE_DECK, "PLAYER", 5,
+      { TOOL_SEEK, TOOL_SCRUB_STEP, TOOL_ZOOM, TOOL_GAIN,
+        TOOL_IPOD_SEEK } },
+    { MODE_PNAV, "PLNAV", 3,
       { TOOL_PLAYLIST_PREVIOUS, TOOL_PLAYLIST_NEXT,
-        TOOL_RESTART_PLAYBACK, TOOL_RELOAD_TRACK } },
-    { MODE_TEMPO, "TEMPO", 4,
-      { TOOL_PITCH_BEND, TOOL_TEMPO, TOOL_HOST_RPM, TOOL_PLAY_RPM } },
-    { MODE_GRID, "BGRID", 4,
-      { TOOL_GRID_NUDGE, TOOL_GRID_BPM, TOOL_GRID_ORIGIN,
-        TOOL_GRID_QUANTIZE } },
-    { MODE_CUES, "HOTCUE", 4,
-      { TOOL_CUE_SLOT, TOOL_CUE_MOVE, TOOL_CUE_COLOR, TOOL_CUE_DELETE } },
-    { MODE_LOOP, "LOOPS", 4,
-      { TOOL_LOOP_LENGTH, TOOL_LOOP_IN, TOOL_LOOP_OUT, TOOL_LOOP_ACTIVE } },
-    { MODE_METADATA, "DETAIL", 4,
-      { TOOL_META_RATING, TOOL_META_COLOR, TOOL_META_YEAR, TOOL_META_GENRE } },
-    { MODE_PITCH, "PITCH", 3,
-      { TOOL_META_KEY, TOOL_KEY_NOTATION, TOOL_KEYLOCK } },
+        TOOL_RESTART_PLAYBACK } },
+    { MODE_GRID, "BTGRID", 3,
+      { TOOL_GRID_NUDGE, TOOL_GRID_ORIGIN, TOOL_GRID_BPM } },
     { MODE_LIST, "LISTS", 4,
       { TOOL_PLAYLIST_MODE, TOOL_ADD_PLAYLIST,
-        TOOL_BURN_SONG, TOOL_BURN_ALL } },
-    { MODE_VISUALIZER, "VISUAL", 4,
-      { TOOL_WAVEFORM_STYLE, TOOL_VIS_BOOMBOX, TOOL_VIS_EQ,
-        TOOL_VIS_TURNTABLE } },
-    { MODE_VISUALIZER_TWO, "REACTR", 4,
-      { TOOL_VIS_CANYON, TOOL_VIS_ORBIT, TOOL_VIS_PHRASE,
+        TOOL_FAVORITE_ONE, TOOL_FAVORITE_TWO } },
+    { MODE_CUES, "HOTCUE", 4,
+      { TOOL_CUE_SLOT, TOOL_CUE_DELETE, TOOL_CUE_COLOR, TOOL_CUE_MOVE } },
+    { MODE_METADATA, "DETAIL", 5,
+      { TOOL_META_RATING, TOOL_META_COLOR, TOOL_META_YEAR, TOOL_META_GENRE,
+        TOOL_META_KEY } },
+    { MODE_VISUALIZER, "VIZ", 4,
+      { TOOL_WAVEFORM_STYLE, TOOL_VIS_EQ, TOOL_VIS_PHRASE,
         TOOL_VIS_HARMONIC } },
-    { MODE_MACRO, "MACROS", 2,
-      { TOOL_MACRO_ONE, TOOL_MACRO_TWO } }
+    { MODE_VISUALIZER_TWO, "MORVIZ", 4,
+      { TOOL_VIS_CANYON, TOOL_VIS_BOOMBOX, TOOL_VIS_ORBIT,
+        TOOL_VIS_TURNTABLE } },
+    { MODE_TEMPO, "TEMPO", 4,
+      { TOOL_PITCH_BEND, TOOL_TEMPO, TOOL_HOST_RPM, TOOL_PLAY_RPM } },
+    { MODE_LOOP, "LOOPS", 4,
+      { TOOL_LOOP_LENGTH, TOOL_LOOP_IN, TOOL_LOOP_OUT, TOOL_LOOP_ACTIVE } },
+    { MODE_MACRO, "LOCK", 4,
+      { TOOL_KEYLOCK, TOOL_GRID_QUANTIZE, TOOL_MACRO_ONE, TOOL_MACRO_TWO } }
 };
+
+static void update_player_tool_order(void)
+{
+    struct rbprep_tool_page *page = &tool_pages[0];
+
+    page->count = 5;
+    if (ipod_seek_first) {
+        page->tools[0] = TOOL_IPOD_SEEK;
+        page->tools[1] = TOOL_SEEK;
+        page->tools[2] = TOOL_SCRUB_STEP;
+        page->tools[3] = TOOL_ZOOM;
+        page->tools[4] = TOOL_GAIN;
+    } else {
+        page->tools[0] = TOOL_SEEK;
+        page->tools[1] = TOOL_SCRUB_STEP;
+        page->tools[2] = TOOL_ZOOM;
+        page->tools[3] = TOOL_GAIN;
+        page->tools[4] = TOOL_IPOD_SEEK;
+    }
+}
+
+static int player_tool_index(enum rbprep_tool tool)
+{
+    int index;
+
+    for (index = 0; index < tool_pages[0].count; index++)
+        if (tool_pages[0].tools[index] == tool)
+            return index;
+    return 0;
+}
 
 static int hsb_rgb(int hue, int saturation, int brightness)
 {
@@ -1203,6 +1289,9 @@ static int key_index_from_name(const char *name)
             !rb->strcasecmp(name, camelot_key_names[index]))
             return index;
     }
+    for (index = 0; index < (int)ARRAYLEN(key_aliases); index++)
+        if (!rb->strcasecmp(name, key_aliases[index].name))
+            return key_aliases[index].index;
 
     /* Accept enharmonic spellings not used by the canonical rekordbox list. */
     letter = name[0];
@@ -1233,13 +1322,19 @@ static int key_index_from_name(const char *name)
 
 static void format_key_name(const char *source, char *buffer, size_t size)
 {
-    int index = key_index_from_name(source);
+    int index;
+
+    if (key_notation == KEY_DISPLAY_ORIGINAL) {
+        rb->strlcpy(buffer, source && source[0] ? source : "--", size);
+        return;
+    }
+    index = key_index_from_name(source);
 
     if (index < 0) {
         rb->strlcpy(buffer, source && source[0] ? source : "--", size);
         return;
     }
-    rb->strlcpy(buffer, key_notation
+    rb->strlcpy(buffer, key_notation == KEY_DISPLAY_CAMELOT
                         ? camelot_key_names[index]
                         : chromatic_key_names[index], size);
 }
@@ -1564,6 +1659,36 @@ static void centered_text(int left, int width, int y,
     text(left + MAX(0, (width - text_width) / 2), y, s, color);
 }
 
+static void activity_ticker_ping(int progress)
+{
+    long now = *rb->current_tick;
+
+    activity_ticker_progress = MAX(0, MIN(1000, progress));
+    if (activity_ticker_last_update &&
+        !TIME_BEFORE(activity_ticker_last_update + MAX(1, HZ / 5), now))
+        activity_ticker_burst = MIN(12, activity_ticker_burst + 3);
+    activity_ticker_last_update = now;
+    activity_ticker_until = now + HZ;
+}
+
+static void draw_activity_ticker(void)
+{
+    int x;
+    int color;
+
+    if (TIME_BEFORE(activity_ticker_until, *rb->current_tick))
+        return;
+    x = activity_ticker_progress * (LCD_WIDTH - 13) / 1000;
+    color = activity_ticker_burst && ((*rb->current_tick & 1) != 0)
+          ? LCD_WHITE : theme_accent;
+    rb->lcd_set_drawmode(DRMODE_SOLID);
+    rb->lcd_set_foreground(color);
+    rb->lcd_fillrect(MAX(0, x - 10), 5, 12, 2);
+    rb->lcd_fillrect(x, 1, 3, 6);
+    if (activity_ticker_burst)
+        activity_ticker_burst--;
+}
+
 static void draw_status_bar(void)
 {
     struct tm *now = rb->get_time();
@@ -1607,6 +1732,7 @@ static void draw_status_bar(void)
         rb->lcd_putsxy(MAX(1, LCD_WIDTH - text_width - 2), 0, timecode);
     }
     rb->lcd_set_drawmode(DRMODE_SOLID);
+    draw_activity_ticker();
     rb->lcd_set_foreground(low ? LCD_RGBPACK(125, 20, 20)
                                : LCD_RGBPACK(72, 72, 72));
     rb->lcd_hline(0, LCD_WIDTH - 1, RBPREP_STATUS_HEIGHT - 1);
@@ -4455,27 +4581,39 @@ static void draw_phase_module(int cx, int cy, int angle)
     int ty = wheel_cosine[angle];
     int rx = wheel_cosine[angle];
     int ry = wheel_sine[angle];
-    int outer_x0 = cx - tx * 7 / 256;
-    int outer_y0 = cy - ty * 7 / 256;
-    int outer_x1 = cx + tx * 7 / 256;
-    int outer_y1 = cy + ty * 7 / 256;
-    int inner_x0 = cx - tx * 6 / 256;
-    int inner_y0 = cy - ty * 6 / 256;
-    int inner_x1 = cx + tx * 6 / 256;
-    int inner_y1 = cy + ty * 6 / 256;
-    int led_x0 = cx - tx * 4 / 256;
-    int led_y0 = cy - ty * 4 / 256;
-    int led_x1 = cx + tx * 4 / 256;
-    int led_y1 = cy + ty * 4 / 256;
+    int outer_x0 = cx - tx * 10 / 256;
+    int outer_y0 = cy - ty * 10 / 256;
+    int outer_x1 = cx + tx * 10 / 256;
+    int outer_y1 = cy + ty * 10 / 256;
+    int inner_x0 = cx - tx * 9 / 256;
+    int inner_y0 = cy - ty * 9 / 256;
+    int inner_x1 = cx + tx * 9 / 256;
+    int inner_y1 = cy + ty * 9 / 256;
+    int ring_x = cx - tx * 5 / 256;
+    int ring_y = cy - ty * 5 / 256;
+    int led_x0 = cx + tx * 2 / 256;
+    int led_y0 = cy + ty * 2 / 256;
+    int led_x1 = cx + tx * 7 / 256;
+    int led_y1 = cy + ty * 7 / 256;
 
-    /* Phase remote: white perimeter, solid black shell, and the familiar
-       white inner LED strip. It remains tangent to the spinning groove. */
-    fill_axis_quad(outer_x0, outer_y0, outer_x1, outer_y1, 3, LCD_WHITE);
-    fill_axis_quad(inner_x0, inner_y0, inner_x1, inner_y1, 2, LCD_BLACK);
+    /* Phase remote: the recognisable slim black wireless unit, with a metal
+       pickup ring near its crown and a luminous strip down its lower face.
+       The body stays tangent to the groove as the complete unit orbits. */
+    fill_axis_quad(outer_x0, outer_y0, outer_x1, outer_y1, 4, LCD_WHITE);
+    fill_axis_quad(inner_x0, inner_y0, inner_x1, inner_y1, 3, LCD_BLACK);
+    rb->lcd_set_foreground(LCD_RGBPACK(145, 153, 148));
+    xlcd_fillcircle(ring_x, ring_y, 3);
     rb->lcd_set_foreground(LCD_WHITE);
-    rb->lcd_drawline(led_x0, led_y0, led_x1, led_y1);
+    xlcd_fillcircle(ring_x, ring_y, 2);
+    rb->lcd_set_foreground(LCD_BLACK);
+    xlcd_fillcircle(ring_x, ring_y, 1);
+    rb->lcd_set_foreground(RBPREP_GREEN_DIM);
+    rb->lcd_drawline(led_x0 - rx / 256, led_y0 - ry / 256,
+                     led_x1 - rx / 256, led_y1 - ry / 256);
     rb->lcd_drawline(led_x0 + rx / 256, led_y0 + ry / 256,
                      led_x1 + rx / 256, led_y1 + ry / 256);
+    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_drawline(led_x0, led_y0, led_x1, led_y1);
 }
 
 static void draw_turntable_pitch_fader(void)
@@ -6085,6 +6223,7 @@ static bool burn_loaded_track_now(void)
     bool capture_was_active;
     bool success;
 
+    activity_ticker_ping(80);
     if (selected_track_id < 0)
         return false;
     if (!flush_deferred_edit()) {
@@ -6103,7 +6242,9 @@ static bool burn_loaded_track_now(void)
     capture_was_active = spectrum_capture_active;
     stop_spectrum_capture();
 
+    activity_ticker_ping(350);
     success = rbprep_burn_song((uint32_t)selected_track_id);
+    activity_ticker_ping(820);
     refresh_pending_summary();
     if (success && pending_snapshot_count == 0 &&
         pending_playlist_count == 0 && !pending_summary_overflow &&
@@ -6130,6 +6271,7 @@ static bool burn_loaded_track_now(void)
         uptime_tracks_burned++;
         rb->splash(HZ, "Track burn complete");
     }
+    activity_ticker_ping(1000);
     restore_black_canvas();
     return success;
 }
@@ -6148,6 +6290,7 @@ static bool burn_all_now(void)
     bool capture_was_active = spectrum_capture_active;
     bool success;
 
+    activity_ticker_ping(80);
     if (!flush_deferred_edit()) {
         rb->splash(HZ * 2, "Instant burn: journal write failed");
         restore_black_canvas();
@@ -6170,7 +6313,9 @@ static bool burn_all_now(void)
         rb->playlist_get_resume_info(&resume_index);
     stop_spectrum_capture();
 
+    activity_ticker_ping(350);
     success = rbprep_burn_all();
+    activity_ticker_ping(820);
     refresh_pending_summary();
     playlist_playback = saved_playlist_playback;
     if (success) {
@@ -6196,6 +6341,7 @@ static bool burn_all_now(void)
     force_full_redraw = true;
     if (success)
         rb->splash(HZ, "Instant burn complete");
+    activity_ticker_ping(1000);
     restore_black_canvas();
     return success;
 }
@@ -6267,6 +6413,7 @@ static void draw_waveform_preparation(int progress, const char *stage)
     int fill = width * MAX(0, MIN(100, progress)) / 100;
     char percent[16];
 
+    activity_ticker_ping(progress * 10);
     rb->lcd_set_background(LCD_BLACK);
     rb->lcd_clear_display();
     draw_status_bar();
@@ -6632,9 +6779,11 @@ static bool play_track_index(int index, int row,
     int old_resume_index = 0;
     int old_status;
 
+    activity_ticker_ping(40);
     if (!read_track_record(index, &track) ||
         !read_index_string(track.path_offset, path, sizeof(path)))
         return false;
+    activity_ticker_ping(140);
     if (!rb->file_exists(path)) {
         rb->splashf(HZ * 2, "Missing: %s", path);
         restore_black_canvas();
@@ -6687,6 +6836,7 @@ static bool play_track_index(int index, int row,
             apply_macro_step(&tool_macros[macro_active].steps[0]);
         reset_play_clock(playhead, *rb->current_tick);
         force_full_redraw = true;
+        activity_ticker_ping(1000);
         return true;
     }
 
@@ -6704,12 +6854,14 @@ static bool play_track_index(int index, int row,
         restore_black_canvas();
         return false;
     }
+    activity_ticker_ping(280);
     old_position = clamp_playhead(playhead);
     capture_was_active = spectrum_capture_active;
     stop_spectrum_capture();
     if (index != selected_track_index)
         save_rbprep_config();
     if (index != selected_track_index || force_reload) {
+        activity_ticker_ping(390);
         if (!service_deferred_burn()) {
             restore_failed_track_load(old_track_id, old_path, old_position,
                                       old_resume_index, old_had_audio,
@@ -6770,6 +6922,7 @@ static bool play_track_index(int index, int row,
     already_loaded = !force_reload && old_had_audio && old_path[0] &&
                      !rb->strcmp(old_path, path);
     analysis_changed = true;
+    activity_ticker_ping(520);
     if (!load_waveform(track.id)) {
         restore_failed_track_load(old_track_id, old_path, old_position,
                                   old_resume_index, old_had_audio,
@@ -6779,6 +6932,7 @@ static bool play_track_index(int index, int row,
         restore_black_canvas();
         return false;
     }
+    activity_ticker_ping(760);
     if (!already_loaded) {
         if (force_reload) {
             rb->audio_stop();
@@ -6843,6 +6997,7 @@ static bool play_track_index(int index, int row,
         selected_comments[0] = '\0';
     track_year = track.year;
     load_latest_edit(track.id);
+    activity_ticker_ping(880);
     track_edit_dirty = false;
     id3 = rb->audio_current_track();
     if (already_loaded) {
@@ -6873,6 +7028,7 @@ static bool play_track_index(int index, int row,
     if (macro_active >= 0 && tool_macros[macro_active].count > 0)
         apply_macro_step(&tool_macros[macro_active].steps[0]);
     force_full_redraw = true;
+    activity_ticker_ping(1000);
     return true;
 }
 
@@ -7004,23 +7160,33 @@ static void draw_blade_shell(const char *title, int accent)
 {
     rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
-    rb->lcd_set_foreground(LCD_RGBPACK(4, 13, 8));
-    rb->lcd_fillrect(0, RBPREP_STATUS_HEIGHT, LCD_WIDTH, 22);
+    rb->lcd_set_foreground(LCD_RGBPACK(18, 21, 19));
+    rb->lcd_fillrect(2, RBPREP_STATUS_HEIGHT + 1, LCD_WIDTH - 4,
+                     LCD_HEIGHT - RBPREP_STATUS_HEIGHT - 3);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(5, RBPREP_STATUS_HEIGHT + 3, LCD_WIDTH - 10,
+                     LCD_HEIGHT - RBPREP_STATUS_HEIGHT - 8);
+    rb->lcd_set_foreground(LCD_RGBPACK(5, 12, 8));
+    rb->lcd_fillrect(5, RBPREP_STATUS_HEIGHT + 3, LCD_WIDTH - 10, 19);
     rb->lcd_set_foreground(accent);
-    rb->lcd_fillrect(0, RBPREP_STATUS_HEIGHT, 5,
-                     LCD_HEIGHT - RBPREP_STATUS_HEIGHT);
-    rb->lcd_set_foreground(theme_wheel_outline);
-    xlcd_drawcircle(LCD_WIDTH - 10, RBPREP_STATUS_HEIGHT + 9, 27);
-    xlcd_drawcircle(LCD_WIDTH - 10, RBPREP_STATUS_HEIGHT + 9, 20);
-    rb->lcd_set_foreground(theme_wheel);
-    xlcd_fillcircle(LCD_WIDTH - 10, RBPREP_STATUS_HEIGHT + 9, 3);
+    rb->lcd_fillrect(5, RBPREP_STATUS_HEIGHT + 3, 3,
+                     LCD_HEIGHT - RBPREP_STATUS_HEIGHT - 8);
     text(10, RBPREP_STATUS_HEIGHT + 4, title, LCD_WHITE);
-    rb->lcd_set_foreground(LCD_RGBPACK(240, 100, 45));
-    rb->lcd_fillrect(272, RBPREP_STATUS_HEIGHT + 6, 5, 5);
-    rb->lcd_set_foreground(LCD_RGBPACK(80, 180, 245));
-    rb->lcd_fillrect(281, RBPREP_STATUS_HEIGHT + 6, 5, 5);
-    rb->lcd_set_foreground(accent);
-    rb->lcd_fillrect(290, RBPREP_STATUS_HEIGHT + 6, 5, 5);
+    {
+        static const char *tabs[] = { "BRS", "TAG", "INF", "MNU" };
+        int tab;
+
+        for (tab = 0; tab < 4; tab++) {
+            int x = 218 + tab * 24;
+            rb->lcd_set_foreground(LCD_RGBPACK(25, 31, 27));
+            rb->lcd_fillrect(x, RBPREP_STATUS_HEIGHT + 5, 21, 12);
+            rb->lcd_set_foreground(tab == 0 ? accent
+                                            : LCD_RGBPACK(72, 82, 76));
+            rb->lcd_drawrect(x, RBPREP_STATUS_HEIGHT + 5, 21, 12);
+            text(x + 2, RBPREP_STATUS_HEIGHT + 7, tabs[tab],
+                 tab == 0 ? LCD_WHITE : LCD_RGBPACK(140, 150, 144));
+        }
+    }
 }
 
 static void draw_blade_selection(int y, int height, int color)
@@ -7069,52 +7235,46 @@ static void draw_main_glyph(int cx, int cy, int item, bool selected)
     int color = selected ? LCD_WHITE : RBPREP_GREEN;
 
     rb->lcd_set_foreground(color);
-    xlcd_drawcircle(cx, cy, 7);
+    xlcd_drawcircle(cx, cy, 4);
     if (item == 0) {
-        xlcd_drawcircle(cx, cy, 4);
+        xlcd_drawcircle(cx, cy, 2);
         xlcd_fillcircle(cx, cy, 1);
     } else if (item == 1) {
-        rb->lcd_drawline(cx - 5, cy - 4, cx + 5, cy + 4);
-        rb->lcd_drawline(cx - 5, cy + 4, cx - 2, cy + 1);
-        rb->lcd_drawline(cx + 5, cy + 4, cx + 2, cy + 4);
-        rb->lcd_drawline(cx + 5, cy + 4, cx + 5, cy + 1);
-        rb->lcd_drawline(cx - 5, cy + 4, cx + 5, cy - 4);
-        rb->lcd_drawline(cx + 5, cy - 4, cx + 2, cy - 4);
-        rb->lcd_drawline(cx + 5, cy - 4, cx + 5, cy - 1);
+        rb->lcd_drawline(cx - 3, cy - 2, cx + 3, cy + 2);
+        rb->lcd_drawline(cx - 3, cy + 2, cx + 3, cy - 2);
     } else if (item == 2) {
-        draw_playlist_node_glyph(cx, cy, true, selected);
+        rb->lcd_fillrect(cx - 3, cy - 1, 7, 4);
+        rb->lcd_fillrect(cx - 2, cy - 3, 3, 2);
     } else if (item == 3) {
-        xlcd_drawcircle(cx - 1, cy, 4);
+        xlcd_drawcircle(cx - 1, cy, 2);
         xlcd_fillcircle(cx - 1, cy, 1);
-        rb->lcd_drawline(cx + 5, cy - 5, cx + 2, cy + 3);
+        rb->lcd_drawline(cx + 3, cy - 3, cx + 1, cy + 2);
     } else if (item == 4) {
-        rb->lcd_vline(cx, cy - 5, cy + 4);
-        rb->lcd_drawline(cx, cy - 3, cx - 4, cy - 1);
-        rb->lcd_drawline(cx, cy, cx + 4, cy - 2);
-        rb->lcd_fillrect(cx - 5, cy - 2, 2, 2);
-        xlcd_fillcircle(cx + 4, cy - 2, 1);
-        xlcd_fillcircle(cx, cy + 5, 1);
+        rb->lcd_vline(cx, cy - 3, cy + 2);
+        rb->lcd_drawline(cx, cy - 2, cx - 3, cy - 1);
+        rb->lcd_drawline(cx, cy, cx + 3, cy - 1);
+        rb->lcd_drawpixel(cx - 3, cy - 1);
+        rb->lcd_drawpixel(cx + 3, cy - 1);
+        rb->lcd_drawpixel(cx, cy + 3);
     } else if (item == 5) {
-        rb->lcd_vline(cx - 4, cy - 5, cy + 5);
-        rb->lcd_vline(cx, cy - 5, cy + 5);
-        rb->lcd_vline(cx + 4, cy - 5, cy + 5);
-        rb->lcd_fillrect(cx - 5, cy - 2, 3, 3);
-        rb->lcd_fillrect(cx - 1, cy + 1, 3, 3);
-        rb->lcd_fillrect(cx + 3, cy - 4, 3, 3);
+        rb->lcd_vline(cx - 2, cy - 3, cy + 3);
+        rb->lcd_vline(cx + 2, cy - 3, cy + 3);
+        rb->lcd_fillrect(cx - 3, cy - 1, 3, 2);
+        rb->lcd_fillrect(cx + 1, cy + 1, 3, 2);
     } else if (item == 6) {
-        rb->lcd_hline(cx - 4, cx + 4, cy - 4);
-        rb->lcd_hline(cx - 4, cx + 4, cy);
-        rb->lcd_hline(cx - 4, cx + 4, cy + 4);
-        rb->lcd_drawpixel(cx - 6, cy - 4);
-        rb->lcd_drawpixel(cx - 6, cy);
-        rb->lcd_drawpixel(cx - 6, cy + 4);
+        rb->lcd_hline(cx - 2, cx + 3, cy - 2);
+        rb->lcd_hline(cx - 2, cx + 3, cy);
+        rb->lcd_hline(cx - 2, cx + 3, cy + 2);
+        rb->lcd_drawpixel(cx - 3, cy - 2);
+        rb->lcd_drawpixel(cx - 3, cy);
+        rb->lcd_drawpixel(cx - 3, cy + 2);
     } else {
-        rb->lcd_vline(cx - 4, cy - 5, cy + 5);
-        rb->lcd_hline(cx - 4, cx + 1, cy - 5);
-        rb->lcd_hline(cx - 4, cx + 1, cy + 5);
-        rb->lcd_drawline(cx - 1, cy, cx + 5, cy);
-        rb->lcd_drawline(cx + 5, cy, cx + 2, cy - 3);
-        rb->lcd_drawline(cx + 5, cy, cx + 2, cy + 3);
+        rb->lcd_vline(cx - 3, cy - 3, cy + 3);
+        rb->lcd_hline(cx - 3, cx, cy - 3);
+        rb->lcd_hline(cx - 3, cx, cy + 3);
+        rb->lcd_drawline(cx, cy, cx + 3, cy);
+        rb->lcd_drawline(cx + 3, cy, cx + 1, cy - 2);
+        rb->lcd_drawline(cx + 3, cy, cx + 1, cy + 2);
     }
 }
 
@@ -7430,6 +7590,9 @@ static enum rbprep_tool active_tool(void)
     int page;
     int selected;
 
+    if (macro_active >= 0 && macro_tool_override >= 0 &&
+        macro_tool_override < TOOL_COUNT)
+        return (enum rbprep_tool)macro_tool_override;
     for (page = 0; page < (int)ARRAYLEN(tool_pages); page++) {
         if (tool_pages[page].mode != mode)
             continue;
@@ -7499,7 +7662,13 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
     int y = cy - 4;
 
     rb->lcd_set_foreground(color);
-    if (tool == TOOL_SEEK) {
+    if (tool == TOOL_IPOD_SEEK) {
+        /* A tiny wheel iPod: deliberately unmistakable at 9 x 9 pixels. */
+        rb->lcd_drawrect(x + 1, y, 7, 9);
+        rb->lcd_drawrect(x + 2, y + 1, 5, 3);
+        xlcd_drawcircle(cx, y + 6, 2);
+        rb->lcd_drawpixel(cx, y + 6);
+    } else if (tool == TOOL_SEEK) {
         rb->lcd_drawline(x, cy, x + 3, y + 1);
         rb->lcd_drawline(x, cy, x + 3, y + 7);
         rb->lcd_drawline(x + 4, cy, x + 7, y + 1);
@@ -7552,6 +7721,19 @@ static void draw_tool_icon(int cx, int cy, enum rbprep_tool tool, int color)
         rb->lcd_hline(x, x + 4, y + 7);
         rb->lcd_hline(x + 5, x + 9, y + 5);
         rb->lcd_vline(x + 7, y + 3, y + 7);
+    } else if (tool == TOOL_FAVORITE_ONE ||
+               tool == TOOL_FAVORITE_TWO) {
+        int digit = tool == TOOL_FAVORITE_ONE ? 1 : 2;
+
+        rb->lcd_drawline(cx, y, cx + 2, cy - 1);
+        rb->lcd_drawline(cx + 2, cy - 1, x + 8, cy - 1);
+        rb->lcd_drawline(x + 8, cy - 1, cx + 3, cy + 1);
+        rb->lcd_drawline(cx + 3, cy + 1, cx + 4, y + 8);
+        rb->lcd_drawline(cx + 4, y + 8, cx, cy + 3);
+        rb->lcd_drawline(cx, cy + 3, x, y + 8);
+        rb->lcd_drawline(x, y + 8, x + 1, cy + 1);
+        rb->lcd_drawline(x + 1, cy + 1, x - 1, cy - 1);
+        rb->lcd_drawpixel(cx + digit - 2, cy);
     } else if (tool == TOOL_PLAYLIST_PREVIOUS ||
                tool == TOOL_PLAYLIST_NEXT) {
         bool previous = tool == TOOL_PLAYLIST_PREVIOUS;
@@ -7896,11 +8078,16 @@ static void format_macro_value(char *buffer, size_t size,
     } else if (tool == TOOL_META_KEY) {
         value = MAX(0, MIN((int)ARRAYLEN(chromatic_key_names) - 1, value));
         rb->snprintf(buffer, size, "KEY %s",
-                     key_notation ? camelot_key_names[value]
-                                  : chromatic_key_names[value]);
+                     key_notation == KEY_DISPLAY_CAMELOT
+                     ? camelot_key_names[value]
+                     : chromatic_key_names[value]);
     } else if (tool == TOOL_KEY_NOTATION) {
+        value = MAX(0, MIN((int)ARRAYLEN(key_notation_styles) - 1,
+                           value));
         rb->snprintf(buffer, size, "KEY DISPLAY %s",
-                     value ? "CAMELOT" : "CHROMATIC");
+                     value == KEY_DISPLAY_ORIGINAL ? "ORIGINAL" :
+                     value == KEY_DISPLAY_CAMELOT ? "CAMELOT" :
+                                                    "CHROMATIC");
     } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE ||
                tool == TOOL_CUE_COLOR || tool == TOOL_CUE_DELETE) {
         rb->snprintf(buffer, size, "CUE %02d", value + 1);
@@ -8274,7 +8461,26 @@ static bool pnav_tool_available(enum rbprep_tool tool)
                playing_track_row + 1 < track_row_count;
     if (tool == TOOL_RESTART_PLAYBACK || tool == TOOL_RELOAD_TRACK)
         return selected_track_index >= 0;
+    if (tool == TOOL_FAVORITE_ONE)
+        return selected_track_id >= 0 && favorite_playlist_nodes[0] >= 0;
+    if (tool == TOOL_FAVORITE_TWO)
+        return selected_track_id >= 0 && favorite_playlist_nodes[1] >= 0;
     return true;
+}
+
+static void format_favorite_tool_status(int slot, char *buffer, size_t size)
+{
+    struct rbprep_node_record node;
+    char name[48];
+
+    if (slot < 0 || slot > 1 || favorite_playlist_nodes[slot] < 0 ||
+        !read_node_record(favorite_playlist_nodes[slot], &node) ||
+        !read_index_string(node.name_offset, name, sizeof(name))) {
+        rb->snprintf(buffer, size, "FAVLIST%d  NOT SET", slot + 1);
+        return;
+    }
+    rb->snprintf(buffer, size, "FAVLIST%d  %.28s%s", slot + 1, name,
+                 node.kind == 0 ? " /" : "");
 }
 
 static void draw_tool_orbs(void)
@@ -8288,7 +8494,7 @@ static void draw_tool_orbs(void)
          tool_menu_active ? LCD_WHITE : RBPREP_GREEN);
     for (i = 0; i < count; i++) {
         enum rbprep_tool tool = tool_pages[page].tools[i];
-        int cx = 51 + i * 18;
+        int cx = 49 + i * 16;
         bool enabled = pnav_tool_available(tool);
         int color = !enabled ? LCD_RGBPACK(8, 10, 9) : i == selected
                   ? (tool_menu_active ? LCD_WHITE : RBPREP_GREEN)
@@ -8311,10 +8517,12 @@ static void draw_tool_status(void)
     char fitted[96];
     enum rbprep_tool tool = active_tool();
     int color = tool_menu_active ? LCD_WHITE : RBPREP_GREEN;
-    int status_x = 116;
+    int status_x = 123;
 
     if (tool == TOOL_SEEK)
         rb->snprintf(line, sizeof(line), "SEEK  %dms/tick", scrub_step_ms());
+    else if (tool == TOOL_IPOD_SEEK)
+        rb->snprintf(line, sizeof(line), "IPOD SEEK  WHEEL:GAIN  < >:SEEK");
     else if (tool == TOOL_SCRUB_STEP)
         rb->snprintf(line, sizeof(line), "SCRUB  %dms/tick", scrub_step_ms());
     else if (tool == TOOL_ZOOM)
@@ -8345,6 +8553,10 @@ static void draw_tool_status(void)
                      playlist_playback ? "ON" : "OFF");
     else if (tool == TOOL_ADD_PLAYLIST)
         rb->snprintf(line, sizeof(line), "ADD TO PLAYLIST");
+    else if (tool == TOOL_FAVORITE_ONE)
+        format_favorite_tool_status(0, line, sizeof(line));
+    else if (tool == TOOL_FAVORITE_TWO)
+        format_favorite_tool_status(1, line, sizeof(line));
     else if (tool == TOOL_BURN_SONG)
         rb->snprintf(line, sizeof(line), "BURN TRACK  NOW");
     else if (tool == TOOL_BURN_ALL)
@@ -8371,7 +8583,8 @@ static void draw_tool_status(void)
         if (index < 0)
             rb->strlcpy(alternate, "--", sizeof(alternate));
         else
-            rb->strlcpy(alternate, key_notation
+            rb->strlcpy(alternate,
+                        key_notation == KEY_DISPLAY_CAMELOT
                         ? chromatic_key_names[index]
                         : camelot_key_names[index], sizeof(alternate));
         rb->snprintf(line, sizeof(line), "KEY  %s  [%s]",
@@ -8379,7 +8592,9 @@ static void draw_tool_status(void)
     }
     else if (tool == TOOL_KEY_NOTATION)
         rb->snprintf(line, sizeof(line), "KEY DISPLAY  %s",
-                     key_notation ? "CAMELOT" : "CHROMATIC");
+                     key_notation == KEY_DISPLAY_ORIGINAL ? "ORIGINAL" :
+                     key_notation == KEY_DISPLAY_CAMELOT ? "CAMELOT" :
+                                                          "CHROMATIC");
     else if (tool == TOOL_VIS_BOOMBOX)
         rb->snprintf(line, sizeof(line), "BOOMBOX  BASS");
     else if (tool == TOOL_VIS_EQ)
@@ -8494,16 +8709,20 @@ static void draw_settings(void)
     int value_x;
     const char *names[] = {
         "AUTOBOOT REKORDPOD", "AUTO-NEXT DEFAULT", "WAVEFORM SHAPE",
-        "TRACK EXIT", "COMMIT POLICY", "WHEEL CLICK", "ACCENT COLOR",
-        "IPOD BODY COLOR", "WHEEL / VINYL COLOR", "TURNTABLE ARM",
-        "HEADSHELL DESIGN", "PLATTER WHEEL MODE"
+        "IPOD SEEK ORB", "KEY DISPLAY", "TRACK EXIT", "COMMIT POLICY",
+        "WHEEL CLICK", "ACCENT COLOR", "IPOD BODY COLOR",
+        "WHEEL / VINYL COLOR", "TURNTABLE ARM", "HEADSHELL DESIGN",
+        "PLATTER WHEEL MODE"
     };
     const char *values[] = {
         autoboot_enabled ? "ON" : "OFF",
         autoplay_enabled ? "ON" : "OFF",
         waveform_half ? "HALF" : "FULL",
-        "ASK EACH TIME", "SAVE & LOAD",
-        click_sound ? "ON" : "OFF", "HSB", "HSB", "HSB",
+        ipod_seek_first ? "FIRST" : "LAST",
+        key_notation == KEY_DISPLAY_ORIGINAL ? "ORIGINAL" :
+        key_notation == KEY_DISPLAY_CAMELOT ? "CAMELOT" : "CHROMATIC",
+        "ASK EACH TIME", "SAVE & LOAD", click_sound ? "ON" : "OFF",
+        "HSB", "HSB", "HSB",
         turntable_arm_style ? "S-SHAPED" : "STRAIGHT",
         turntable_headshell_styles[turntable_headshell_style],
         platter_wheel_mode ? "ON" : "OFF"
@@ -8514,23 +8733,23 @@ static void draw_settings(void)
     text(10, 29, "PLAYBACK  /  WORKFLOW  /  DISPLAY",
          LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < (int)ARRAYLEN(names); row++) {
-        int y = 34 + row * 13;
+        int y = 33 + row * 11;
         if (row == settings_selection)
-            draw_blade_selection(y - 1, 12, RBPREP_GREEN);
+            draw_blade_selection(y - 1, 11, RBPREP_GREEN);
         rb->lcd_set_foreground(row == settings_selection
                                ? LCD_WHITE : RBPREP_GREEN);
-        xlcd_fillcircle(17, y + 6, row == settings_selection ? 4 : 3);
+        xlcd_fillcircle(17, y + 5, row == settings_selection ? 4 : 3);
         rb->lcd_set_foreground(row == settings_selection
                                ? LCD_BLACK : LCD_RGBPACK(10, 38, 23));
-        xlcd_fillcircle(17, y + 6, 1);
-        text(30, y + 1, names[row], LCD_WHITE);
+        xlcd_fillcircle(17, y + 5, 1);
+        text(30, y, names[row], LCD_WHITE);
         rb->lcd_getstringsize(values[row], &value_width, NULL);
         value_x = MAX(192, LCD_WIDTH - value_width - 13);
         rb->lcd_set_foreground(row == settings_selection
                                ? LCD_RGBPACK(7, 25, 15)
                                : LCD_RGBPACK(17, 25, 20));
-        rb->lcd_fillrect(value_x - 5, y, value_width + 10, 12);
-        text(value_x, y + 1, values[row], RBPREP_GREEN);
+        rb->lcd_fillrect(value_x - 5, y, value_width + 10, 11);
+        text(value_x, y, values[row], RBPREP_GREEN);
     }
     description = settings_selection == 0
          ? (autoboot_enabled ? "Launch Rekordpod automatically after boot"
@@ -8541,21 +8760,31 @@ static void draw_settings(void)
          : settings_selection == 2
          ? (waveform_half ? "One-sided RGB waveform" : "Mirrored RGB waveform")
          : settings_selection == 3
-         ? "Choose Save, Discard or Stay before another track loads"
+         ? (ipod_seek_first
+            ? "Traditional iPod seek appears first on PLAYER"
+            : "Traditional iPod seek appears last on PLAYER")
          : settings_selection == 4
-         ? "Save verifies the PDB + Rekordpod index before loading"
+         ? (key_notation == KEY_DISPLAY_ORIGINAL
+            ? "Show rekordbox key text exactly as imported"
+            : key_notation == KEY_DISPLAY_CAMELOT
+            ? "Show Camelot equivalent; unknown keys stay original"
+            : "Show flat chromatic equivalent; unknown keys stay original")
          : settings_selection == 5
+         ? "Choose Save, Discard or Stay before another track loads"
+         : settings_selection == 6
+         ? "Save verifies the PDB + Rekordpod index before loading"
+         : settings_selection == 7
          ? (click_sound ? "Audible feedback on clickwheel scroll"
                         : "Silent clickwheel navigation")
-         : settings_selection == 6
-         ? "Color used for controls, selections and accents"
-         : settings_selection == 7
-         ? "Color of the iPod body in the boot animation"
          : settings_selection == 8
-         ? "Color of the boot record, wheel and record motifs"
+         ? "Color used for controls, selections and accents"
          : settings_selection == 9
-         ? "Choose a straight or classic S-shaped pickup arm"
+         ? "Color of the iPod body in the boot animation"
          : settings_selection == 10
+         ? "Color of the boot record, wheel and record motifs"
+         : settings_selection == 11
+         ? "Choose a straight or classic S-shaped pickup arm"
+         : settings_selection == 12
          ? "Technics, Concorde, M44, iPod shell, or wireless Phase"
          : (platter_wheel_mode
             ? "Touch, drag + momentum drive platter and seek"
@@ -8608,6 +8837,7 @@ static void draw_accent_picker(void)
 
 static void apply_usb_choice(int choice)
 {
+    activity_ticker_ping(choice == 0 ? 850 : 240);
     if (choice == 2 && !capabilities.usb_audio)
         choice = 0;
     usb_selection = MAX(0, MIN(capabilities.usb_audio ? 2 : 1, choice));
@@ -8629,6 +8859,7 @@ static void apply_usb_choice(int choice)
     rb->usb_set_mode(rb->global_settings->usb_mode);
 #endif
     rb->settings_save();
+    activity_ticker_ping(1000);
 }
 
 static void draw_usb_mode(void)
@@ -8636,24 +8867,16 @@ static void draw_usb_mode(void)
     int row;
     int count = capabilities.usb_audio ? 3 : 2;
     const char *names[] = { "POWER ONLY", "DATA TRANSFER", "USB DAC" };
-    const char *details[] = {
-        "Charge safely; data, DAC and HID stay hidden",
-        "Rekordbox FAT volume over USB; audio class disabled",
-        "Mac audio to iPod headphone output; storage hidden"
-    };
 
     draw_blade_shell("USB MODE", RBPREP_GREEN);
-    text(9, 34, "TAKES EFFECT ON NEXT USB CONNECTION",
-         LCD_RGBPACK(105, 125, 112));
     for (row = 0; row < count; row++) {
-        int y = 54 + row * 44;
+        int y = 61 + row * 42;
         if (row == usb_selection)
-            draw_blade_selection(y - 5, 45, RBPREP_GREEN);
-        text(12, y, names[row], LCD_WHITE);
-        text(12, y + 18, details[row], LCD_RGBPACK(135, 155, 141));
+            draw_blade_selection(y - 8, 28, RBPREP_GREEN);
+        centered_text(12, LCD_WIDTH - 24, y, names[row],
+                      row == usb_selection ? LCD_WHITE
+                                           : LCD_RGBPACK(150, 164, 155));
     }
-    text(7, 193, "USB HID IS ALWAYS KEPT OFF", RBPREP_GREEN);
-    text(7, 226, "WHEEL: CHOOSE   SELECT: SAVE   MENU: BACK", LCD_WHITE);
 }
 
 static void draw_genre_picker(void)
@@ -8696,7 +8919,8 @@ static void wrap_main_wheel_phase(void)
 
 static bool main_wheel_motion_active(void)
 {
-    if (ABS(main_blade_shift_fp) >= 64)
+    if (main_launch_active || main_return_active ||
+        !TIME_BEFORE(activity_ticker_until, *rb->current_tick))
         return true;
 #ifdef HAVE_WHEEL_POSITION
     return platter_wheel_mode &&
@@ -8705,23 +8929,6 @@ static bool main_wheel_motion_active(void)
 #else
     return false;
 #endif
-}
-
-static void update_main_blade_motion(void)
-{
-    long now = *rb->current_tick;
-    long elapsed = now - main_blade_motion_tick;
-    int decay;
-
-    if (elapsed <= 0)
-        return;
-    elapsed = MIN(elapsed, MAX(1, HZ / 4));
-    decay = MAX(1, (int)((long long)elapsed * 280 * 256 / MAX(1, HZ)));
-    if (main_blade_shift_fp > 0)
-        main_blade_shift_fp = MAX(0, main_blade_shift_fp - decay);
-    else if (main_blade_shift_fp < 0)
-        main_blade_shift_fp = MIN(0, main_blade_shift_fp + decay);
-    main_blade_motion_tick = now;
 }
 
 static void update_main_wheel_motion(void)
@@ -8782,7 +8989,7 @@ static void update_main_wheel_motion(void)
 static void draw_main_menu_fx(void)
 {
     int cx = LCD_WIDTH / 2;
-    int cy = 158;
+    int cy = 169;
     int phase;
     int point;
 
@@ -8792,22 +8999,22 @@ static void draw_main_menu_fx(void)
     /* A centered platter anchors the carousel. Its motion remains a trace of
        real wheel energy rather than a synthetic selection-position dial. */
     rb->lcd_set_foreground(LCD_BLACK);
-    xlcd_fillcircle(cx, cy, 63);
+    xlcd_fillcircle(cx, cy, 54);
     rb->lcd_set_foreground(RBPREP_GREEN_DIM);
-    xlcd_drawcircle(cx, cy, 62);
+    xlcd_drawcircle(cx, cy, 53);
     rb->lcd_set_foreground(theme_wheel_outline);
-    xlcd_drawcircle(cx, cy, 59);
+    xlcd_drawcircle(cx, cy, 51);
     rb->lcd_set_foreground(theme_wheel);
-    xlcd_fillcircle(cx, cy, 55);
+    xlcd_fillcircle(cx, cy, 48);
     rb->lcd_set_foreground(LCD_RGBPACK(40, 48, 43));
-    xlcd_drawcircle(cx, cy, 52);
-    xlcd_drawcircle(cx, cy, 47);
+    xlcd_drawcircle(cx, cy, 45);
+    xlcd_drawcircle(cx, cy, 40);
     rb->lcd_set_foreground(RBPREP_GREEN_DIM);
-    xlcd_drawcircle(cx, cy, 38);
+    xlcd_drawcircle(cx, cy, 32);
     for (point = 0; point < 16; point++) {
         int angle = (point * 4 + phase) & 63;
-        int x = cx + wheel_cosine[angle] * 57 / 256;
-        int y = cy + wheel_sine[angle] * 57 / 256;
+        int x = cx + wheel_cosine[angle] * 49 / 256;
+        int y = cy + wheel_sine[angle] * 49 / 256;
 
         rb->lcd_set_foreground(point % 4 == 0 ? LCD_WHITE
                                               : RBPREP_GREEN);
@@ -8820,8 +9027,8 @@ static void draw_main_menu_fx(void)
     if (platter_wheel_mode && rb->wheel_status() >= 0) {
         /* Align the hardware wheel origin with the drawing table. */
         int touch_angle = (rb->wheel_status() * 64 / 96 + 48) & 63;
-        int touch_x = cx + wheel_cosine[touch_angle] * 50 / 256;
-        int touch_y = cy + wheel_sine[touch_angle] * 50 / 256;
+        int touch_x = cx + wheel_cosine[touch_angle] * 43 / 256;
+        int touch_y = cy + wheel_sine[touch_angle] * 43 / 256;
 
         rb->lcd_set_foreground(LCD_BLACK);
         xlcd_fillcircle(touch_x, touch_y, 3);
@@ -8834,14 +9041,14 @@ static void draw_main_menu_fx(void)
     point = phase;
     rb->lcd_set_foreground(LCD_WHITE);
     rb->lcd_drawline(cx, cy,
-        cx + wheel_cosine[point] * 44 / 256,
-        cy + wheel_sine[point] * 44 / 256);
+        cx + wheel_cosine[point] * 37 / 256,
+        cy + wheel_sine[point] * 37 / 256);
     rb->lcd_set_foreground(LCD_RGBPACK(5, 14, 10));
-    xlcd_fillcircle(cx, cy, 20);
+    xlcd_fillcircle(cx, cy, 17);
     rb->lcd_set_foreground(RBPREP_GREEN);
-    xlcd_drawcircle(cx, cy, 20);
+    xlcd_drawcircle(cx, cy, 17);
     rb->lcd_set_foreground(LCD_RGBPACK(35, 205, 255));
-    xlcd_drawcircle(cx, cy, 14);
+    xlcd_drawcircle(cx, cy, 12);
     {
         char marquee[9];
         int length = rb->strlen(device_usb_name);
@@ -8871,44 +9078,69 @@ static void draw_main_menu_fx(void)
     main_name_scroll_deadline = *rb->current_tick + MAX(1, HZ / 5);
 }
 
-static void draw_main_blade(int item, int relative, const char *top_label,
-                            const char *bottom_label)
-{
-    const int width = 118;
-    const int step = 57;
-    int distance = ABS(relative);
-    bool selected = relative == 0;
-    int x = (LCD_WIDTH - width) / 2 + relative * step +
-            main_blade_shift_fp / 256;
-    int y = 39 + MIN(3, distance) * 4;
-    int height = 55 - MIN(3, distance) * 4;
-    int fill = selected
-             ? hsb_rgb(accent_hue, MIN(100, accent_saturation + 10),
-                       MAX(13, accent_brightness * 35 / 100))
-             : LCD_RGBPACK(MAX(4, 14 - distance * 3),
-                           MAX(10, 35 - distance * 6),
-                           MAX(7, 23 - distance * 4));
-    int border = selected ? theme_accent
-                          : LCD_RGBPACK(47, 75, 58);
-    char fitted[28];
+static const char * const main_menu_items[] = {
+    "COLLECTION", "SHUFFLE COLLECTION", "PLAYLISTS", "PREP DECK",
+    "USB MODE", "REKORDPOD SETTINGS", "INDEX STATUS", "EXIT TO ROCKBOX"
+};
 
-    rb->lcd_set_foreground(LCD_BLACK);
-    rb->lcd_fillrect(x + 3, y + 3, width, height);
-    rb->lcd_set_foreground(fill);
+static void draw_cdj_face_button(int x, int y, int width, int height,
+                                 const char *label, int color, bool lit)
+{
+    rb->lcd_set_foreground(lit ? LCD_RGBPACK(32, 36, 33)
+                               : LCD_RGBPACK(15, 18, 16));
     rb->lcd_fillrect(x, y, width, height);
-    rb->lcd_set_foreground(border);
+    rb->lcd_set_foreground(lit ? color : LCD_RGBPACK(66, 72, 68));
     rb->lcd_drawrect(x, y, width, height);
-    rb->lcd_hline(x + 2, x + width - 3, y + 2);
-    draw_main_glyph(x + width / 2, y + 14, item, selected);
-    fit_text(fitted, sizeof(fitted), top_label, width - 8);
-    centered_text(x + 4, width - 8, y + 26, fitted,
-                  selected ? LCD_WHITE : LCD_RGBPACK(155, 178, 163));
-    if (bottom_label && bottom_label[0]) {
-        fit_text(fitted, sizeof(fitted), bottom_label, width - 8);
-        centered_text(x + 4, width - 8, y + 38, fitted,
-                      selected ? LCD_RGBPACK(180, 255, 213)
-                               : LCD_RGBPACK(90, 115, 98));
+    centered_text(x, width, y + MAX(1, (height - 8) / 2), label,
+                  lit ? LCD_WHITE : LCD_RGBPACK(126, 133, 129));
+}
+
+static void draw_main_cdj_screen(void)
+{
+    const int screen_x = 32;
+    const int screen_y = 16;
+    const int screen_w = 256;
+    const int screen_h = 84;
+    int top = MAX(0, MIN((int)ARRAYLEN(main_menu_items) - 5,
+                         selection - 2));
+    int row;
+
+    rb->lcd_set_foreground(LCD_RGBPACK(34, 37, 35));
+    rb->lcd_fillrect(screen_x - 5, screen_y - 4,
+                     screen_w + 10, screen_h + 8);
+    rb->lcd_set_foreground(LCD_RGBPACK(105, 112, 108));
+    rb->lcd_drawrect(screen_x - 5, screen_y - 4,
+                     screen_w + 10, screen_h + 8);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(screen_x, screen_y, screen_w, screen_h);
+    rb->lcd_set_foreground(LCD_RGBPACK(20, 30, 24));
+    rb->lcd_fillrect(screen_x + 1, screen_y + 1, screen_w - 2, 12);
+    text(screen_x + 6, screen_y + 3, "BROWSE", LCD_WHITE);
+    text(screen_x + screen_w - 37, screen_y + 3, "MENU",
+         LCD_RGBPACK(155, 168, 159));
+    for (row = 0; row < 5; row++) {
+        int item = top + row;
+        int y = screen_y + 15 + row * 13;
+        bool selected_row = item == selection;
+        char fitted[38];
+
+        if (selected_row) {
+            rb->lcd_set_foreground(hsb_rgb(
+                accent_hue, MIN(100, accent_saturation + 10),
+                MAX(16, accent_brightness * 34 / 100)));
+            rb->lcd_fillrect(screen_x + 2, y - 1, screen_w - 4, 12);
+            rb->lcd_set_foreground(theme_accent);
+            rb->lcd_fillrect(screen_x + 2, y - 1, 3, 12);
+        }
+        draw_main_glyph(screen_x + 14, y + 4, item, selected_row);
+        fit_text(fitted, sizeof(fitted), main_menu_items[item], screen_w - 42);
+        text(screen_x + 29, y, fitted,
+             selected_row ? LCD_WHITE : LCD_RGBPACK(146, 160, 151));
+        if (selected_row)
+            text(screen_x + screen_w - 14, y, ">", theme_accent);
     }
+    rb->lcd_set_foreground(theme_accent_dim);
+    rb->lcd_drawrect(screen_x, screen_y, screen_w, screen_h);
 }
 
 static void navigate_main_menu(int direction)
@@ -8925,67 +9157,119 @@ static void navigate_main_menu(int direction)
         wrap_main_wheel_phase();
     }
     if (next != selection) {
-        main_blade_shift_fp += direction > 0 ? 57 * 256 : -57 * 256;
-        main_blade_shift_fp = MAX(-114 * 256,
-                                  MIN(114 * 256, main_blade_shift_fp));
-        main_blade_motion_tick = *rb->current_tick;
         selection = next;
+        main_name_scroll_deadline = *rb->current_tick;
+    }
+}
+
+static void draw_scaled_return_thumbnail(int x, int y, int width, int height)
+{
+    int dy;
+
+    if (!main_viewport || width <= 0 || height <= 0)
+        return;
+    for (dy = 0; dy < height; dy++) {
+        int sy = dy * RBPREP_RETURN_THUMB_H / height;
+        int dx;
+
+        for (dx = 0; dx < width; dx++) {
+            int sx = dx * RBPREP_RETURN_THUMB_W / width;
+
+            *FBADDRBUF(main_viewport->buffer, x + dx, y + dy) =
+                main_return_thumbnail[sy * RBPREP_RETURN_THUMB_W + sx];
+        }
+    }
+}
+
+static void capture_main_return_thumbnail(void)
+{
+    int y;
+
+    if (!main_viewport)
+        return;
+    for (y = 0; y < RBPREP_RETURN_THUMB_H; y++) {
+        int sy = y * LCD_HEIGHT / RBPREP_RETURN_THUMB_H;
+        int x;
+
+        for (x = 0; x < RBPREP_RETURN_THUMB_W; x++) {
+            int sx = x * LCD_WIDTH / RBPREP_RETURN_THUMB_W;
+
+            main_return_thumbnail[y * RBPREP_RETURN_THUMB_W + x] =
+                *FBADDRBUF(main_viewport->buffer, sx, sy);
+        }
+    }
+    main_return_active = true;
+    main_return_tick = *rb->current_tick;
+    activity_ticker_ping(0);
+}
+
+static void draw_main_transition_overlay(void)
+{
+    long now = *rb->current_tick;
+    int progress;
+
+    if (main_return_active) {
+        int x;
+        int y;
+        int width;
+        int height;
+
+        progress = MIN(1000, (int)((long long)(now - main_return_tick) *
+                                   1000 / RBPREP_MAIN_TRANSITION_TICKS));
+        x = 32 * progress / 1000;
+        y = 16 * progress / 1000;
+        width = LCD_WIDTH - (LCD_WIDTH - 256) * progress / 1000;
+        height = LCD_HEIGHT - (LCD_HEIGHT - 84) * progress / 1000;
+        draw_scaled_return_thumbnail(x, y, width, height);
+        rb->lcd_set_foreground(theme_accent);
+        rb->lcd_drawrect(x, y, width, height);
+        activity_ticker_ping(progress);
+    } else if (main_launch_active) {
+        int x;
+        int y;
+        int width;
+        int height;
+
+        progress = MIN(1000, (int)((long long)(now - main_launch_tick) *
+                                   1000 / RBPREP_MAIN_TRANSITION_TICKS));
+        x = 32 * (1000 - progress) / 1000;
+        y = 16 * (1000 - progress) / 1000;
+        width = 256 + (LCD_WIDTH - 256) * progress / 1000;
+        height = 84 + (LCD_HEIGHT - 84) * progress / 1000;
+        rb->lcd_set_foreground(LCD_BLACK);
+        rb->lcd_fillrect(x, y, width, height);
+        rb->lcd_set_foreground(theme_accent);
+        rb->lcd_drawrect(x, y, width, height);
+        centered_text(x, width, y + MAX(4, height / 2 - 4),
+                      main_menu_items[main_launch_item], LCD_WHITE);
+        activity_ticker_ping(progress);
     }
 }
 
 static void draw_main_menu(void)
 {
-    static const char *items[] = {
-        "COLLECTION", "SHUFFLE COLLECTION", "PLAYLISTS", "PREP DECK",
-        "USB MODE", "REKORDPOD SETTINGS", "INDEX STATUS",
-        "EXIT TO ROCKBOX"
-    };
-    static const char *blade_top[] = {
-        "COLLECTION", "SHUFFLE", "PLAYLISTS", "PREP DECK",
-        "USB MODE", "REKORDPOD", "INDEX STATUS", "EXIT TO"
-    };
-    static const char *blade_bottom[] = {
-        "", "COLLECTION", "", "", "", "SETTINGS", "", "ROCKBOX"
-    };
-    char line[80];
-    int line_width;
-    int panel_width;
-    int distance;
+    int glow = (*rb->current_tick / MAX(1, HZ / 5)) & 7;
 
-    draw_blade_shell("REKORDPOD  /  PERFORMANCE LIBRARY",
-                     RBPREP_GREEN);
-    update_main_blade_motion();
+    rb->lcd_set_foreground(LCD_RGBPACK(7, 8, 8));
+    rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+    rb->lcd_set_foreground(LCD_RGBPACK(25, 28, 26));
+    rb->lcd_drawrect(2, 9, LCD_WIDTH - 4, LCD_HEIGHT - 12);
+    draw_main_cdj_screen();
     draw_main_menu_fx();
-    if (library_fd >= 0)
-        rb->snprintf(line, sizeof(line), "%lu TRACKS / INDEX ONLINE",
-                     (unsigned long)library_track_count);
-    else
-        rb->snprintf(line, sizeof(line), "INDEX OFFLINE");
-    rb->lcd_getstringsize(line, &line_width, NULL);
-    panel_width = MIN(190, line_width + 8);
-    rb->lcd_set_foreground(LCD_BLACK);
-    rb->lcd_fillrect(5, 22, panel_width, 16);
-    text(7, 21, line, library_fd >= 0
-         ? LCD_RGBPACK(105, 178, 139) : LCD_RGBPACK(255, 90, 70));
-
-    for (distance = 3; distance > 0; distance--) {
-        int left = selection - distance;
-        int right = selection + distance;
-
-        if (left >= 0)
-            draw_main_blade(left, -distance, blade_top[left],
-                            blade_bottom[left]);
-        if (right < (int)ARRAYLEN(items))
-            draw_main_blade(right, distance, blade_top[right],
-                            blade_bottom[right]);
-    }
-    draw_main_blade(selection, 0, blade_top[selection],
-                    blade_bottom[selection]);
-    rb->snprintf(line, sizeof(line), "%02d / %02d",
-                 selection + 1, (int)ARRAYLEN(items));
-    text(266, 22, line, LCD_RGBPACK(105, 125, 112));
-    text(7, 229, "WHEEL  NAVIGATE       SELECT  OPEN",
-         LCD_RGBPACK(105, 125, 112));
+    draw_cdj_face_button(9, 117, 39, 13, "LOOP", LCD_WHITE, glow == 0);
+    draw_cdj_face_button(9, 136, 39, 18, "CUE",
+                         LCD_RGBPACK(255, 145, 35), glow == 2);
+    draw_cdj_face_button(9, 160, 39, 18, "PLAY", theme_accent, glow == 4);
+    draw_cdj_face_button(272, 117, 38, 13, "BROWSE", LCD_WHITE, glow == 1);
+    draw_cdj_face_button(272, 136, 38, 13, "TAG", LCD_WHITE, glow == 3);
+    draw_cdj_face_button(272, 155, 38, 13, "INFO", LCD_WHITE, glow == 5);
+    draw_cdj_face_button(272, 174, 38, 13, "MENU", theme_accent, glow == 7);
+    rb->lcd_set_foreground(LCD_RGBPACK(60, 65, 62));
+    rb->lcd_vline(295, 196, 224);
+    rb->lcd_hline(290, 300, 210);
+    rb->lcd_set_foreground(theme_accent);
+    rb->lcd_fillrect(288, 207, 15, 5);
+    draw_main_transition_overlay();
 }
 
 static void draw_pending_edits(void)
@@ -9298,6 +9582,35 @@ static bool append_playlist_journal(int node_index)
     }
     return append_playlist_operation(PLAYLIST_OP_ADD, selected_track_id,
                                      playlist_id, 0, 1, name);
+}
+
+static void add_track_to_favorite(int slot)
+{
+    struct rbprep_node_record node;
+    char name[48];
+    int node_index = slot >= 0 && slot < 2
+                   ? favorite_playlist_nodes[slot] : -1;
+
+    if (selected_track_id < 0 || node_index < 0 ||
+        !read_node_record(node_index, &node) ||
+        !read_index_string(node.name_offset, name, sizeof(name))) {
+        rb->splash(HZ, slot ? "Favorite 2 is not set"
+                            : "Favorite 1 is not set");
+        restore_black_canvas();
+        return;
+    }
+    playlist_add_mode = true;
+    if (node.kind == 0) {
+        tree_selection = tree_top = 0;
+        refresh_tree_children(node_index);
+        mode = MODE_PLAYLISTS;
+        force_full_redraw = true;
+        return;
+    }
+    confirm_playlist_node = node_index;
+    rb->snprintf(confirm_message, sizeof(confirm_message),
+                 "ADD TO %.28s?", name);
+    begin_confirmation(CONFIRM_ADD_PLAYLIST);
 }
 
 static uint32_t playlist_parent_source_id(int node_index)
@@ -10571,42 +10884,80 @@ static void choose_collection_sort(int sort_key)
     force_full_redraw = true;
 }
 
+static void activate_main_selection(int item)
+{
+    if (item == 0 && library_fd >= 0) {
+        collection_shuffle_active = false;
+        open_track_browser(-1);
+    } else if (item == 1 && library_fd >= 0) {
+        start_shuffled_collection();
+    } else if (item == 2 && library_fd >= 0) {
+        tree_selection = tree_top = 0;
+        refresh_tree_children(RBPREP_ROOT_NODE);
+        mode = MODE_PLAYLISTS;
+        force_full_redraw = true;
+    } else if (item == 3) {
+        if (library_fd >= 0)
+            open_loaded_track();
+        else {
+            rb->splash(HZ * 2, "RBPrep index is offline");
+            restore_black_canvas();
+        }
+    } else if (item == 4) {
+        mode = MODE_USB;
+        force_full_redraw = true;
+    } else if (item == 5) {
+        settings_selection = 0;
+        mode = MODE_SETTINGS;
+        force_full_redraw = true;
+    } else if (item == 6) {
+        refresh_pending_summary();
+        mode = MODE_INDEX;
+        force_full_redraw = true;
+    } else if (item == 7) {
+        rb->snprintf(confirm_message, sizeof(confirm_message),
+                     "EXIT TO ROCKBOX?");
+        begin_confirmation(CONFIRM_EXIT);
+    }
+}
+
+static void begin_main_launch(int item)
+{
+    if (main_launch_active || main_return_active)
+        return;
+    main_launch_item = MAX(0, MIN((int)ARRAYLEN(main_menu_items) - 1,
+                                      item));
+    main_launch_tick = *rb->current_tick;
+    main_launch_active = true;
+    activity_ticker_ping(0);
+    force_full_redraw = true;
+}
+
+static void service_main_transitions(void)
+{
+    long now = *rb->current_tick;
+
+    if (main_return_active &&
+        !TIME_BEFORE(now, main_return_tick + RBPREP_MAIN_TRANSITION_TICKS)) {
+        main_return_active = false;
+        activity_ticker_ping(1000);
+        force_full_redraw = true;
+    }
+    if (main_launch_active &&
+        !TIME_BEFORE(now, main_launch_tick + RBPREP_MAIN_TRANSITION_TICKS)) {
+        int item = main_launch_item;
+
+        main_launch_active = false;
+        activity_ticker_ping(1000);
+        activate_main_selection(item);
+        force_full_redraw = true;
+    }
+}
+
 static void short_select(void)
 {
     if (mode == MODE_LIBRARY) {
-        if (selection == 0 && library_fd >= 0) {
-            collection_shuffle_active = false;
-            open_track_browser(-1);
-        } else if (selection == 1 && library_fd >= 0) {
-            start_shuffled_collection();
-        } else if (selection == 2 && library_fd >= 0) {
-            tree_selection = tree_top = 0;
-            refresh_tree_children(RBPREP_ROOT_NODE);
-            mode = MODE_PLAYLISTS;
-            force_full_redraw = true;
-        } else if (selection == 3) {
-            if (library_fd >= 0)
-                open_loaded_track();
-            else {
-                rb->splash(HZ * 2, "RBPrep index is offline");
-                restore_black_canvas();
-            }
-        } else if (selection == 4) {
-            mode = MODE_USB;
-            force_full_redraw = true;
-        } else if (selection == 5) {
-            settings_selection = 0;
-            mode = MODE_SETTINGS;
-            force_full_redraw = true;
-        } else if (selection == 6) {
-            refresh_pending_summary();
-            mode = MODE_INDEX;
-            force_full_redraw = true;
-        } else if (selection == 7) {
-            rb->snprintf(confirm_message, sizeof(confirm_message),
-                         "EXIT TO ROCKBOX?");
-            begin_confirmation(CONFIRM_EXIT);
-        }
+        begin_main_launch(selection);
     } else if (mode == MODE_PLAYLISTS) {
         struct rbprep_node_record node;
         int index;
@@ -10690,20 +11041,30 @@ static void short_select(void)
         } else if (settings_selection == 2)
             waveform_half = !waveform_half;
         else if (settings_selection == 3) {
+            enum rbprep_tool previous = tool_pages[0].tools[
+                MAX(0, MIN(tool_pages[0].count - 1, deck_tool))];
+
+            ipod_seek_first = !ipod_seek_first;
+            update_player_tool_order();
+            deck_tool = player_tool_index(previous);
+        } else if (settings_selection == 4) {
+            key_notation = (key_notation + 1) %
+                           ARRAYLEN(key_notation_styles);
+        } else if (settings_selection == 5) {
             rb->splash(HZ, "Track exit always asks");
             restore_black_canvas();
-        } else if (settings_selection == 4) {
+        } else if (settings_selection == 6) {
             rb->splash(HZ, "Save & Load commits safely");
             restore_black_canvas();
-        } else if (settings_selection == 5) {
+        } else if (settings_selection == 7) {
             click_sound = !click_sound;
-        } else if (settings_selection <= 8) {
-            color_picker_target = settings_selection - 6;
+        } else if (settings_selection <= 10) {
+            color_picker_target = settings_selection - 8;
             accent_component = 0;
             mode = MODE_ACCENT;
-        } else if (settings_selection == 9) {
+        } else if (settings_selection == 11) {
             turntable_arm_style = !turntable_arm_style;
-        } else if (settings_selection == 10) {
+        } else if (settings_selection == 12) {
             turntable_headshell_style =
                 (turntable_headshell_style + 1) %
                 ARRAYLEN(turntable_headshell_styles);
@@ -10953,7 +11314,8 @@ static void short_select(void)
             mark_rbprep_config_dirty();
             force_full_redraw = true;
         } else if (tool == TOOL_KEY_NOTATION) {
-            key_notation = !key_notation;
+            key_notation = (key_notation + 1) %
+                           ARRAYLEN(key_notation_styles);
             mark_rbprep_config_dirty();
             force_full_redraw = true;
         } else if (tool == TOOL_META_KEY && staged_tool == tool) {
@@ -10973,6 +11335,10 @@ static void short_select(void)
                 mode = MODE_PLAYLISTS;
                 force_full_redraw = true;
             }
+        } else if (tool == TOOL_FAVORITE_ONE) {
+            add_track_to_favorite(0);
+        } else if (tool == TOOL_FAVORITE_TWO) {
+            add_track_to_favorite(1);
         } else if (tool == TOOL_BURN_SONG) {
             if (selected_track_id >= 0)
                 burn_loaded_track_now();
@@ -11031,7 +11397,17 @@ static void short_select(void)
         force_full_redraw = true;
     } else if (mode == MODE_MACRO) {
         enum rbprep_tool tool = active_tool();
-        if (tool == TOOL_MACRO_ONE) {
+        if (tool == TOOL_KEYLOCK) {
+            keylock_enabled = !keylock_enabled;
+            apply_playback_rate();
+            mark_rbprep_config_dirty();
+        } else if (tool == TOOL_GRID_QUANTIZE) {
+            quantize = !quantize;
+        } else if (tool == TOOL_KEY_NOTATION) {
+            key_notation = (key_notation + 1) %
+                           ARRAYLEN(key_notation_styles);
+            mark_rbprep_config_dirty();
+        } else if (tool == TOOL_MACRO_ONE) {
             activate_macro(0);
         } else if (tool == TOOL_MACRO_TWO) {
             activate_macro(1);
@@ -11190,7 +11566,7 @@ static void adjust_active_tool(int direction)
     }
     else if (tool == TOOL_ZOOM)
         change_zoom(direction > 0);
-    else if (tool == TOOL_GAIN)
+    else if (tool == TOOL_GAIN || tool == TOOL_IPOD_SEEK)
         change_volume(direction);
     else if (tool == TOOL_HOST_RPM) {
         host_rpm_index = (host_rpm_index +
@@ -11234,7 +11610,9 @@ static void adjust_active_tool(int direction)
         force_full_redraw = true;
     }
     else if (tool == TOOL_KEY_NOTATION) {
-        key_notation = direction > 0;
+        key_notation = (key_notation +
+            (direction > 0 ? 1 : ARRAYLEN(key_notation_styles) - 1)) %
+            ARRAYLEN(key_notation_styles);
         mark_rbprep_config_dirty();
         force_full_redraw = true;
     }
@@ -11322,7 +11700,9 @@ static void adjust_active_tool_coarse(int direction)
             seek_by(direction * 1000, false);
         return;
     }
-    if (tool == TOOL_SEEK && quantize)
+    if (tool == TOOL_IPOD_SEEK)
+        seek_by(direction * 5000, false);
+    else if (tool == TOOL_SEEK && quantize)
         beat_jump(direction);
     else if (tool == TOOL_SEEK || tool == TOOL_CUE_MOVE ||
              tool == TOOL_GRID_ORIGIN)
@@ -11743,7 +12123,8 @@ static void apply_macro_step(const struct rbprep_macro_step *step)
         stage_active_edit();
         set_selected_key_index(value);
     } else if (tool == TOOL_KEY_NOTATION) {
-        key_notation = !!value;
+        key_notation = MAX(0,
+            MIN((int)ARRAYLEN(key_notation_styles) - 1, value));
         mark_rbprep_config_dirty();
     } else if (tool == TOOL_GRID_BPM) {
         stage_active_edit();
@@ -11838,9 +12219,62 @@ static void select_tool(enum rbprep_tool tool)
             else if (mode == MODE_VISUALIZER_TWO)
                 visualizer_two_tool = index;
             else macro_tool = index;
+            macro_tool_override = -1;
             return;
         }
     }
+
+    /* Old saved workflows may still contain tools removed from the visible
+       page layout. Keep those cells executable without putting legacy orbs
+       back into the streamlined public-beta pages. */
+    if (tool == TOOL_BURN_SONG || tool == TOOL_BURN_ALL)
+        mode = MODE_LIST;
+    else if (tool == TOOL_RELOAD_TRACK)
+        mode = MODE_PNAV;
+    else if (tool == TOOL_KEY_NOTATION)
+        mode = MODE_MACRO;
+    else
+        return;
+    macro_tool_override = tool;
+}
+
+static void toggle_seek_portal(void)
+{
+    if (!seek_portal_active) {
+        seek_return_mode = mode;
+        seek_return_tool = *tool_selection();
+        seek_return_macro_active = macro_active;
+        seek_return_macro_position = macro_position;
+        seek_return_macro_lock = macro_wheel_locked;
+        seek_return_macro_override = macro_tool_override;
+        seek_portal_active = true;
+        macro_active = -1;
+        macro_wheel_locked = false;
+        macro_tool_override = -1;
+        select_tool(TOOL_SEEK);
+    } else {
+        seek_portal_active = false;
+        mode = seek_return_mode;
+        *tool_selection() = MAX(0, MIN(tool_count() - 1,
+                                      seek_return_tool));
+        macro_active = seek_return_macro_active;
+        macro_position = seek_return_macro_position;
+        macro_wheel_locked = seek_return_macro_lock;
+        macro_tool_override = seek_return_macro_override;
+    }
+    finish_cue_audition();
+    overview_dirty = true;
+    force_full_redraw = true;
+}
+
+static void service_pending_select_click(void)
+{
+    if (!select_click_pending ||
+        TIME_BEFORE(*rb->current_tick, select_click_deadline))
+        return;
+    select_click_pending = false;
+    short_select();
+    force_full_redraw = true;
 }
 
 static void browse_tool_menu(int direction)
@@ -11850,6 +12284,7 @@ static void browse_tool_menu(int direction)
 
     discard_staged_edit();
     finish_cue_audition();
+    macro_tool_override = -1;
     *selected = (*selected + (direction > 0 ? 1 : count - 1)) % count;
     force_full_redraw = true;
 }
@@ -11863,6 +12298,7 @@ static void bank_tool_page(int direction)
 
     discard_staged_edit();
     finish_cue_audition();
+    macro_tool_override = -1;
     mode = tool_pages[next].mode;
     *tool_selection() = MIN(selected, tool_pages[next].count - 1);
     force_full_redraw = true;
@@ -11870,10 +12306,16 @@ static void bank_tool_page(int direction)
 
 static void handle_escape_once(void)
 {
+    enum rbprep_mode old_mode = mode;
+
     if (tool_menu_active) {
         select_tool(tool_menu_original);
         tool_menu_active = false;
         force_full_redraw = true;
+        return;
+    }
+    if (seek_portal_active) {
+        toggle_seek_portal();
         return;
     }
     if (mode == MODE_MACRO_PICKER) {
@@ -11966,6 +12408,8 @@ static void handle_escape_once(void)
     } else {
         mode = MODE_LIBRARY;
     }
+    if (old_mode != MODE_LIBRARY && mode == MODE_LIBRARY)
+        capture_main_return_thumbnail();
     force_full_redraw = true;
 }
 
@@ -12309,6 +12753,7 @@ static void resume_rekordpod_after_usb(void)
        place afterwards: restarting through PLUGIN_GOTO_PLUGIN is dependent
        on the caller's menu context and can fall through to Rockbox. */
     rb->lcd_setfont(FONT_SYSFIXED);
+    main_viewport = rb->lcd_set_viewport(NULL);
     restore_dac_gain();
     apply_usb_choice(0);
     recent_tracks_ready = false;
@@ -12495,9 +12940,13 @@ enum plugin_status plugin_start(const void *parameter)
     main_wheel_velocity_fp = 0;
     main_wheel_touch_position = -1;
     main_wheel_motion_tick = *rb->current_tick;
-    main_blade_shift_fp = 0;
-    main_blade_motion_tick = *rb->current_tick;
     main_name_scroll_deadline = *rb->current_tick;
+    main_launch_active = false;
+    main_return_active = false;
+    activity_ticker_progress = 0;
+    activity_ticker_until = 0;
+    activity_ticker_last_update = 0;
+    activity_ticker_burst = 0;
     playhead = 0;
     zoom = 1;
     grid_offset = 0;
@@ -12548,8 +12997,12 @@ enum plugin_status plugin_start(const void *parameter)
     macro_picker_page = 0;
     macro_picker_tool = 0;
     macro_wheel_locked = false;
+    macro_tool_override = -1;
     burn_request = BURN_REQUEST_NONE;
     select_pressed_time = 0;
+    select_click_pending = false;
+    select_double_consumed = false;
+    seek_portal_active = false;
     menu_button_down = false;
     menu_hold_fired = false;
     force_full_redraw = true;
@@ -12592,7 +13045,10 @@ enum plugin_status plugin_start(const void *parameter)
     auto_burn = false;
     click_sound = !!click_sound;
     keylock_enabled = !!keylock_enabled;
-    key_notation = !!key_notation;
+    key_notation = MAX(0,
+        MIN((int)ARRAYLEN(key_notation_styles) - 1, key_notation));
+    ipod_seek_first = !!ipod_seek_first;
+    update_player_tool_order();
     scrub_step_index = MAX(0, MIN((int)ARRAYLEN(scrub_steps) - 1,
                                   scrub_step_index));
     host_rpm_index = MAX(0, MIN((int)ARRAYLEN(rpm_styles) - 1,
@@ -12637,6 +13093,7 @@ enum plugin_status plugin_start(const void *parameter)
             redraw = true;
         update_deck_cpu_boost();
         update_spectrum_capture_state();
+        service_main_transitions();
         service_storage_keepalive();
         if (selected_track_id >= 0 && id3 && id3->length > 0) {
             track_length = id3->length;
@@ -12653,6 +13110,7 @@ enum plugin_status plugin_start(const void *parameter)
             redraw = true;
         service_play_statistics();
         service_config_persistence();
+        service_pending_select_click();
         if (service_loop_playback())
             redraw = true;
         if (service_playlist_playback())
@@ -12703,6 +13161,21 @@ enum plugin_status plugin_start(const void *parameter)
         button = rb->button_get_w_tmo(display_locked ? MAX(1, HZ / 20) : 1);
         if (button != BUTTON_NONE)
             redraw = true;
+        if ((main_launch_active || main_return_active) &&
+            button != BUTTON_NONE) {
+            if (handle_usb_system_event(button))
+                force_full_redraw = true;
+            continue;
+        }
+        if (select_click_pending && button != BUTTON_NONE &&
+            button != BUTTON_SELECT) {
+            /* Keep a single click attached to the tool on which it began.
+               A different control commits it before that control is handled. */
+            select_click_pending = false;
+            short_select();
+            if (confirm_active)
+                continue;
+        }
         if (macro_chord_button != BUTTON_NONE) {
             int chord_status = rb->button_status();
             int chord_button = macro_chord_button;
@@ -12798,6 +13271,17 @@ enum plugin_status plugin_start(const void *parameter)
             }
             break;
         case BUTTON_SELECT:
+            if (select_click_pending && mode >= MODE_DECK &&
+                !tool_menu_active &&
+                TIME_BEFORE(*rb->current_tick, select_click_deadline)) {
+                select_click_pending = false;
+                select_double_consumed = true;
+                pressed = BUTTON_NONE;
+                if (cue_audition_active)
+                    finish_cue_audition();
+                toggle_seek_portal();
+                break;
+            }
             select_hold_fired = false;
             update_play_clock();
             select_pressed_time = live_playhead_now();
@@ -12900,6 +13384,12 @@ enum plugin_status plugin_start(const void *parameter)
             }
             break;
         case BUTTON_SELECT | BUTTON_REL:
+            if (select_double_consumed) {
+                select_double_consumed = false;
+                select_hold_fired = false;
+                pressed = BUTTON_NONE;
+                break;
+            }
             if (pressed != BUTTON_SELECT)
                 break;
             pressed = BUTTON_NONE;
@@ -12916,8 +13406,19 @@ enum plugin_status plugin_start(const void *parameter)
                 force_full_redraw = true;
             } else if (cue_audition_active) {
                 finish_cue_audition();
+                if (!select_hold_fired && mode >= MODE_DECK) {
+                    select_click_pending = true;
+                    select_click_deadline = *rb->current_tick +
+                                            RBPREP_SELECT_DOUBLE_TICKS;
+                }
             } else if (!select_hold_fired) {
-                short_select();
+                if (mode >= MODE_DECK) {
+                    select_click_pending = true;
+                    select_click_deadline = *rb->current_tick +
+                                            RBPREP_SELECT_DOUBLE_TICKS;
+                } else {
+                    short_select();
+                }
             }
             select_hold_fired = false;
             break;
@@ -13036,7 +13537,8 @@ enum plugin_status plugin_start(const void *parameter)
                 usb_selection = MIN(capabilities.usb_audio ? 2 : 1,
                                     usb_selection + 1);
             else if (mode == MODE_SETTINGS)
-                settings_selection = MIN(11, settings_selection + 1);
+                settings_selection = MIN(RBPREP_SETTINGS_LAST,
+                                         settings_selection + 1);
             else if (mode == MODE_ACCENT)
                 adjust_active_color(1);
             else if (mode == MODE_PLAYLIST_ACTIONS)
