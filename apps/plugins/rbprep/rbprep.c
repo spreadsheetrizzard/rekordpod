@@ -13737,7 +13737,12 @@ enum plugin_status plugin_start(const void *parameter)
         case BUTTON_SCROLL_FWD | BUTTON_REPEAT:
             if (click_sound)
                 rb->system_sound_play(SOUND_KEYCLICK);
-            if (tool_menu_active && mode >= MODE_DECK)
+            if (seek_portal_active) {
+                /* The double-SELECT portal borrows SEEK temporarily; never
+                   route its wheel events through the remembered tool/page. */
+                if (!seek_wheel_event_owned())
+                    seek_by(scrub_step_ms(), false);
+            } else if (tool_menu_active && mode >= MODE_DECK)
                 browse_tool_menu(1);
             else if (mode == MODE_MACRO_VALUE)
                 adjust_macro_value(1, false);
@@ -13795,7 +13800,10 @@ enum plugin_status plugin_start(const void *parameter)
         case BUTTON_SCROLL_BACK | BUTTON_REPEAT:
             if (click_sound)
                 rb->system_sound_play(SOUND_KEYCLICK);
-            if (tool_menu_active && mode >= MODE_DECK)
+            if (seek_portal_active) {
+                if (!seek_wheel_event_owned())
+                    seek_by(-scrub_step_ms(), false);
+            } else if (tool_menu_active && mode >= MODE_DECK)
                 browse_tool_menu(-1);
             else if (mode == MODE_MACRO_VALUE)
                 adjust_macro_value(-1, false);
