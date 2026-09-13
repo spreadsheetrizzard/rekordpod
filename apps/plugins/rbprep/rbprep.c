@@ -98,7 +98,8 @@
 #define RBPREP_TOOL_PAGE_MAX 5
 #define RBPREP_SELECT_DOUBLE_TICKS MAX(1, HZ * 3 / 10)
 #define RBPREP_SETTINGS_LAST 13
-#define RBPREP_MAIN_TRANSITION_TICKS MAX(1, HZ * 3 / 10)
+#define RBPREP_MAIN_TRANSITION_FRAMES 10
+#define RBPREP_MAIN_TRANSITION_FRAME_TICKS MAX(1, HZ / 30)
 #define RBPREP_MAIN_SCREEN_X 101
 #define RBPREP_MAIN_SCREEN_Y 26
 #define RBPREP_MAIN_SCREEN_W 118
@@ -386,17 +387,7 @@ static int main_wheel_velocity_fp;
 static int main_wheel_touch_position;
 static long main_wheel_motion_tick;
 static long main_name_scroll_deadline;
-enum rbprep_main_transition {
-    MAIN_TRANSITION_NONE = 0,
-    MAIN_TRANSITION_LAUNCH,
-    MAIN_TRANSITION_RETURN
-};
-static enum rbprep_main_transition main_transition;
-static bool main_transition_started;
-static bool main_transition_final_frame_seen;
 static bool main_transition_thumbnail_valid;
-static int main_transition_item;
-static long main_transition_tick;
 static fb_data main_transition_thumbnail[RBPREP_RETURN_THUMB_W *
                                          RBPREP_RETURN_THUMB_H];
 static struct viewport *main_viewport;
@@ -8927,15 +8918,9 @@ static void wrap_main_wheel_phase(void)
         main_wheel_phase_fp += cycle;
 }
 
-static bool main_transition_active(void)
-{
-    return main_transition != MAIN_TRANSITION_NONE;
-}
-
 static bool main_wheel_motion_active(void)
 {
-    if (main_transition_active() ||
-        !TIME_BEFORE(activity_ticker_until, *rb->current_tick))
+    if (!TIME_BEFORE(activity_ticker_until, *rb->current_tick))
         return true;
 #ifdef HAVE_WHEEL_POSITION
     return platter_wheel_mode &&
@@ -9218,71 +9203,18 @@ static void draw_booth_outline_knob(int cx, int cy, int radius)
     rb->lcd_drawline(cx, cy - radius + 1, cx + 1, cy - 2);
 }
 
-static void draw_partial_booth_platter(int cx, int cy)
-{
-    static const int radii[] = { 39, 47, 53 };
-    int ring;
-    int point;
-
-    rb->lcd_set_foreground(LCD_RGBPACK(55, 60, 57));
-    for (ring = 0; ring < (int)ARRAYLEN(radii); ring++) {
-        for (point = 0; point < 64; point++) {
-            int x = cx + wheel_cosine[point] * radii[ring] / 256;
-            int y = cy + wheel_sine[point] * radii[ring] / 256;
-
-            if (x >= 0 && x < 55 && y >= 9 && y < LCD_HEIGHT)
-                rb->lcd_drawpixel(x, y);
-        }
-    }
-}
-
 static void draw_main_booth_shell(void)
 {
-    int y;
-
-    /* The outer devices are intentionally incomplete grey wireframes. They
-       establish a two-deck-and-mixer booth without competing with the active
-       center CDJ or spending color on noninteractive controls. */
+    /* One coherent center chassis on black. Keeping the neighboring hardware
+       out of this 320-pixel canvas lets the menu screen and real clickwheel
+       trace remain the only visual anchors. */
     rb->lcd_set_foreground(LCD_RGBPACK(10, 11, 11));
-    rb->lcd_fillrect(0, 9, 55, LCD_HEIGHT - 9);
     rb->lcd_fillrect(56, 9, 209, LCD_HEIGHT - 9);
-    rb->lcd_fillrect(266, 9, LCD_WIDTH - 266, LCD_HEIGHT - 9);
-
     rb->lcd_set_foreground(LCD_RGBPACK(67, 72, 69));
-    rb->lcd_drawrect(0, 9, 55, LCD_HEIGHT - 9);
     rb->lcd_drawrect(56, 9, 209, LCD_HEIGHT - 9);
-    rb->lcd_drawrect(266, 9, LCD_WIDTH - 266, LCD_HEIGHT - 9);
     rb->lcd_hline(58, 262, 12);
     rb->lcd_vline(59, 13, LCD_HEIGHT - 2);
     rb->lcd_vline(262, 13, LCD_HEIGHT - 2);
-
-    /* Cropped companion CDJ at left. */
-    rb->lcd_drawrect(0, RBPREP_MAIN_SCREEN_Y, 45, RBPREP_MAIN_SCREEN_H);
-    rb->lcd_drawrect(4, 11, 31, 10);
-    rb->lcd_drawrect(39, 11, 14, 10);
-    draw_partial_booth_platter(0, 169);
-    rb->lcd_vline(44, 129, 220);
-    rb->lcd_fillrect(40, 169, 10, 3);
-
-    /* Cropped DJM-900NXS2 channel at right: input trim, three-band EQ,
-       channel color, cue, meter and fader are enough to read as the mixer. */
-    centered_text(267, 52, 13, "DJM 900", LCD_RGBPACK(94, 99, 96));
-    rb->lcd_vline(274, 24, 226);
-    rb->lcd_vline(311, 24, 226);
-    draw_booth_outline_knob(293, 35, 7);
-    for (y = 48; y <= 118; y += 7) {
-        rb->lcd_drawrect(278, y, 3, 4);
-        rb->lcd_drawrect(283, y, 3, 4);
-    }
-    draw_booth_outline_knob(298, 64, 8);
-    draw_booth_outline_knob(298, 89, 8);
-    draw_booth_outline_knob(298, 114, 8);
-    draw_booth_outline_knob(298, 143, 8);
-    rb->lcd_drawrect(284, 159, 28, 10);
-    centered_text(284, 28, 160, "CUE", LCD_RGBPACK(105, 110, 107));
-    rb->lcd_vline(298, 181, 225);
-    rb->lcd_hline(288, 308, 202);
-    rb->lcd_fillrect(291, 199, 15, 5);
 }
 
 static void draw_main_cdj_controls(int glow)
@@ -9494,93 +9426,61 @@ static void capture_main_transition_thumbnail(void)
     }
 }
 
-static void begin_main_return_transition(void)
+static int main_transition_ease(int frame)
 {
-    main_transition = MAIN_TRANSITION_RETURN;
-    main_transition_started = false;
-    main_transition_final_frame_seen = false;
-    main_transition_tick = *rb->current_tick;
-    activity_ticker_ping(0);
-    force_full_redraw = true;
+    int t = frame * 1024 / RBPREP_MAIN_TRANSITION_FRAMES;
+
+    return (long long)t * t * (3072 - 2 * t) / (1024 * 1024);
 }
 
-static void draw_main_transition_overlay(void)
+static void draw_main_launch_transition_frame(int eased)
 {
-    long now = *rb->current_tick;
-    int progress;
-    int eased;
-    int x;
-    int y;
-    int width;
-    int height;
-    int source_x = 0;
-    int source_y = 0;
-    int source_width = RBPREP_RETURN_THUMB_W;
-    int source_height = RBPREP_RETURN_THUMB_H;
-
-    if (!main_transition_active())
-        return;
-    if (!main_transition_started) {
-        /* Transition time belongs to rendered frames, never to the settings,
-           USB, journal or transport work that happens before the first one. */
-        main_transition_started = true;
-        main_transition_tick = now;
-    }
-    progress = MIN(1000, (int)((long long)(now - main_transition_tick) *
-                               1000 / RBPREP_MAIN_TRANSITION_TICKS));
-    eased = (int)((long long)progress * progress *
-                  (3000 - progress * 2) / 1000000000LL);
-
-    if (main_transition == MAIN_TRANSITION_RETURN) {
-        x = RBPREP_MAIN_SCREEN_X * eased / 1000;
-        y = RBPREP_MAIN_SCREEN_Y * eased / 1000;
-        width = LCD_WIDTH - (LCD_WIDTH - RBPREP_MAIN_SCREEN_W) *
-                eased / 1000;
-        height = LCD_HEIGHT - (LCD_HEIGHT - RBPREP_MAIN_SCREEN_H) *
-                 eased / 1000;
-        /* Crop the departing 4:3 screenshot as its destination becomes the
-           wide CDJ screen. This reads as a camera pull-back instead of a
-           vertically squashed rubber sheet. */
-        source_height = MAX(1, RBPREP_RETURN_THUMB_W * height / width);
-        source_height = MIN(RBPREP_RETURN_THUMB_H, source_height);
-        source_y = (RBPREP_RETURN_THUMB_H - source_height) / 2;
-    } else {
-        int target_x = RBPREP_MAIN_SCREEN_X *
-                       RBPREP_RETURN_THUMB_W / LCD_WIDTH;
-        int target_y = RBPREP_MAIN_SCREEN_Y *
-                       RBPREP_RETURN_THUMB_H / LCD_HEIGHT;
-        int target_width = MAX(1, RBPREP_MAIN_SCREEN_W *
-                              RBPREP_RETURN_THUMB_W / LCD_WIDTH);
-        int target_height = MAX(1, RBPREP_MAIN_SCREEN_H *
-                               RBPREP_RETURN_THUMB_H / LCD_HEIGHT);
-
-        x = 0;
-        y = 0;
-        width = LCD_WIDTH;
-        height = LCD_HEIGHT;
-        source_x = target_x * eased / 1000;
-        source_y = target_y * eased / 1000;
-        source_width = RBPREP_RETURN_THUMB_W -
+    int target_x = RBPREP_MAIN_SCREEN_X *
+                   RBPREP_RETURN_THUMB_W / LCD_WIDTH;
+    int target_y = RBPREP_MAIN_SCREEN_Y *
+                   RBPREP_RETURN_THUMB_H / LCD_HEIGHT;
+    int target_width = MAX(1, RBPREP_MAIN_SCREEN_W *
+                           RBPREP_RETURN_THUMB_W / LCD_WIDTH);
+    int target_height = MAX(1, RBPREP_MAIN_SCREEN_H *
+                            RBPREP_RETURN_THUMB_H / LCD_HEIGHT);
+    int source_x = target_x * eased / 1024;
+    int source_y = target_y * eased / 1024;
+    int source_width = RBPREP_RETURN_THUMB_W -
                        (RBPREP_RETURN_THUMB_W - target_width) *
-                       eased / 1000;
-        source_height = RBPREP_RETURN_THUMB_H -
+                       eased / 1024;
+    int source_height = RBPREP_RETURN_THUMB_H -
                         (RBPREP_RETURN_THUMB_H - target_height) *
-                        eased / 1000;
-    }
+                        eased / 1024;
 
+    rb->lcd_clear_display();
     if (main_transition_thumbnail_valid)
-        draw_scaled_transition_thumbnail(x, y, width, height,
+        draw_scaled_transition_thumbnail(0, 0, LCD_WIDTH, LCD_HEIGHT,
                                          source_x, source_y,
                                          source_width, source_height);
-    else {
-        rb->lcd_set_foreground(LCD_BLACK);
-        rb->lcd_fillrect(x, y, width, height);
-    }
+    rb->lcd_set_foreground(LCD_RGBPACK(150, 155, 152));
+    rb->lcd_drawrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+}
+
+static void draw_main_return_transition_frame(int eased)
+{
+    int x = RBPREP_MAIN_SCREEN_X * eased / 1024;
+    int y = RBPREP_MAIN_SCREEN_Y * eased / 1024;
+    int width = LCD_WIDTH - (LCD_WIDTH - RBPREP_MAIN_SCREEN_W) *
+                eased / 1024;
+    int height = LCD_HEIGHT - (LCD_HEIGHT - RBPREP_MAIN_SCREEN_H) *
+                 eased / 1024;
+    int source_height = MAX(1, RBPREP_RETURN_THUMB_W * height / width);
+    int source_y;
+
+    source_height = MIN(RBPREP_RETURN_THUMB_H, source_height);
+    source_y = (RBPREP_RETURN_THUMB_H - source_height) / 2;
+    if (main_transition_thumbnail_valid)
+        draw_scaled_transition_thumbnail(x, y, width, height,
+                                         0, source_y,
+                                         RBPREP_RETURN_THUMB_W,
+                                         source_height);
     rb->lcd_set_foreground(LCD_RGBPACK(150, 155, 152));
     rb->lcd_drawrect(x, y, width, height);
-    if (progress >= 1000)
-        main_transition_final_frame_seen = true;
-    activity_ticker_ping(progress);
 }
 
 static void draw_main_menu(void)
@@ -9595,6 +9495,44 @@ static void draw_main_menu(void)
     /* The jog artwork is deliberately isolated from the CDJ face revision.
        Its center, radius, touch marker and momentum rendering stay unchanged. */
     draw_main_menu_fx();
+}
+
+static void animate_main_launch_transition(void)
+{
+    int frame;
+
+    capture_main_transition_thumbnail();
+    for (frame = 0; frame <= RBPREP_MAIN_TRANSITION_FRAMES; frame++) {
+        int progress = frame * 1000 / RBPREP_MAIN_TRANSITION_FRAMES;
+
+        draw_main_launch_transition_frame(main_transition_ease(frame));
+        activity_ticker_ping(progress);
+        draw_activity_ticker();
+        rb->lcd_update();
+        if (frame < RBPREP_MAIN_TRANSITION_FRAMES)
+            rb->sleep(RBPREP_MAIN_TRANSITION_FRAME_TICKS);
+    }
+    main_transition_thumbnail_valid = false;
+}
+
+static void animate_main_return_transition(void)
+{
+    int frame;
+
+    for (frame = 0; frame <= RBPREP_MAIN_TRANSITION_FRAMES; frame++) {
+        int progress = frame * 1000 / RBPREP_MAIN_TRANSITION_FRAMES;
+
+        rb->lcd_clear_display();
+        draw_main_menu();
+        draw_status_bar();
+        draw_main_return_transition_frame(main_transition_ease(frame));
+        activity_ticker_ping(progress);
+        draw_activity_ticker();
+        rb->lcd_update();
+        if (frame < RBPREP_MAIN_TRANSITION_FRAMES)
+            rb->sleep(RBPREP_MAIN_TRANSITION_FRAME_TICKS);
+    }
+    main_transition_thumbnail_valid = false;
 }
 
 static void draw_pending_edits(void)
@@ -10236,13 +10174,6 @@ static void draw_screen(void)
         if (confirm_active)
             draw_confirmation();
         draw_status_bar();
-        if (main_transition_active()) {
-            /* The transition owns the complete framebuffer. Draw it after the
-               status bar so the captured page is one coherent camera image,
-               then restore only the progress ticker above that image. */
-            draw_main_transition_overlay();
-            draw_activity_ticker();
-        }
         rb->lcd_update();
         force_full_redraw = false;
         return;
@@ -11255,39 +11186,9 @@ static void activate_main_selection(int item)
 
 static void begin_main_launch(int item)
 {
-    if (main_transition_active())
-        return;
-    capture_main_transition_thumbnail();
-    main_transition_item = MAX(0,
-        MIN((int)ARRAYLEN(main_menu_items) - 1, item));
-    main_transition = MAIN_TRANSITION_LAUNCH;
-    main_transition_started = false;
-    main_transition_final_frame_seen = false;
-    main_transition_tick = *rb->current_tick;
-    activity_ticker_ping(0);
-    force_full_redraw = true;
-}
-
-static void service_main_transitions(void)
-{
-    long now = *rb->current_tick;
-
-    if (!main_transition_active() || !main_transition_started ||
-        TIME_BEFORE(now, main_transition_tick + RBPREP_MAIN_TRANSITION_TICKS) ||
-        !main_transition_final_frame_seen)
-        return;
-    if (main_transition == MAIN_TRANSITION_LAUNCH) {
-        int item = main_transition_item;
-
-        main_transition = MAIN_TRANSITION_NONE;
-        main_transition_thumbnail_valid = false;
-        activity_ticker_ping(1000);
-        activate_main_selection(item);
-    } else {
-        main_transition = MAIN_TRANSITION_NONE;
-        main_transition_thumbnail_valid = false;
-        activity_ticker_ping(1000);
-    }
+    item = MAX(0, MIN((int)ARRAYLEN(main_menu_items) - 1, item));
+    animate_main_launch_transition();
+    activate_main_selection(item);
     force_full_redraw = true;
 }
 
@@ -12748,7 +12649,7 @@ static void handle_escape_once(void)
         mode = MODE_LIBRARY;
     }
     if (old_mode != MODE_LIBRARY && mode == MODE_LIBRARY)
-        begin_main_return_transition();
+        animate_main_return_transition();
     force_full_redraw = true;
 }
 
@@ -13280,9 +13181,6 @@ enum plugin_status plugin_start(const void *parameter)
     main_wheel_touch_position = -1;
     main_wheel_motion_tick = *rb->current_tick;
     main_name_scroll_deadline = *rb->current_tick;
-    main_transition = MAIN_TRANSITION_NONE;
-    main_transition_started = false;
-    main_transition_final_frame_seen = false;
     main_transition_thumbnail_valid = false;
     activity_ticker_progress = 0;
     activity_ticker_until = 0;
@@ -13434,7 +13332,6 @@ enum plugin_status plugin_start(const void *parameter)
             redraw = true;
         update_deck_cpu_boost();
         update_spectrum_capture_state();
-        service_main_transitions();
         service_storage_keepalive();
         if (selected_track_id >= 0 && id3 && id3->length > 0) {
             track_length = id3->length;
@@ -13502,12 +13399,6 @@ enum plugin_status plugin_start(const void *parameter)
         button = rb->button_get_w_tmo(display_locked ? MAX(1, HZ / 20) : 1);
         if (button != BUTTON_NONE)
             redraw = true;
-        if (main_transition_active() &&
-            button != BUTTON_NONE) {
-            if (handle_usb_system_event(button))
-                force_full_redraw = true;
-            continue;
-        }
         if (select_click_pending && button != BUTTON_NONE &&
             button != BUTTON_SELECT) {
             /* Keep a single click attached to the tool on which it began.
