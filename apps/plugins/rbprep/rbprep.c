@@ -270,7 +270,9 @@ enum rbprep_confirm_action {
     CONFIRM_BURN_ALL_NOW,
     CONFIRM_TRACK_LOAD,
     CONFIRM_PLAYLIST_SEED,
-    CONFIRM_PLAYLIST_REORDER
+    CONFIRM_PLAYLIST_REORDER,
+    CONFIRM_FAVORITE_ONE,
+    CONFIRM_FAVORITE_TWO
 };
 
 enum rbprep_burn_request {
@@ -426,6 +428,7 @@ static int main_wheel_touch_position;
 static long main_wheel_motion_tick;
 static long main_name_scroll_deadline;
 static bool main_transition_thumbnail_valid;
+static bool waveform_preparation_visible;
 static fb_data main_transition_thumbnail[RBPREP_RETURN_THUMB_W *
                                          RBPREP_RETURN_THUMB_H];
 static unsigned short main_transition_x_lut[LCD_WIDTH];
@@ -441,6 +444,9 @@ static long activity_ticker_until;
 static long activity_ticker_last_update;
 static unsigned char activity_ticker_burst;
 static char device_usb_name[32] = "REKORDPOD";
+
+static void capture_main_transition_thumbnail(void);
+static void animate_context_dissolve(bool reveal, int frames);
 static int scrub_step_index = 4;
 static int settings_selection;
 static int usb_selection;
@@ -728,6 +734,8 @@ static int playlist_carousel_offset_fp;
 static int tree_child_count;
 static int tree_children[RBPREP_TREE_NODES];
 static int favorite_playlist_nodes[2] = { -1, -1 };
+static unsigned char favorite_playlist_kinds[2];
+static char favorite_playlist_names[2][48];
 static struct rbprep_playlist_cache_row
     playlist_cache[RBPREP_PLAYLIST_CACHE_ROWS];
 static unsigned playlist_cache_generation;
@@ -979,7 +987,7 @@ static const char * const tool_names[TOOL_COUNT] = {
     "GRID BPM", "DOWNBEAT", "QUANTIZE", "CUE SLOT", "CUE MOVE",
     "CUE COLOR", "CUE DELETE", "LOOP SIZE", "LOOP IN", "LOOP OUT",
     "LOOP ACTIVE", "RATING", "TRACK COLOR", "YEAR", "GENRE",
-    "BURN TRACK", "BURN ALL", "PREV TRACK", "NEXT TRACK",
+    "SAVE TRACK", "SAVE ALL", "PREV TRACK", "NEXT TRACK",
     "RESTART", "RELOAD", "SPECTRAL CANYON", "STEREO ORBIT",
     "PHRASE MAP", "HARMONIC CONSTELLATION", "KEY EDITOR",
     "KEY NOTATION", "FAVLIST1", "FAVLIST2", "IPOD SEEK"
@@ -1853,7 +1861,9 @@ static void restore_black_canvas(void)
     rb->lcd_set_background(LCD_BLACK);
     rb->lcd_set_foreground(LCD_WHITE);
     rb->lcd_set_drawmode(DRMODE_SOLID);
-    rb->lcd_clear_display();
+    /* Keep the currently presented frame intact until draw_screen replaces
+       it.  Clearing the backing buffer here made the next dissolve begin
+       with an abrupt black jump, especially after a popup or splash. */
     force_full_redraw = true;
 }
 
@@ -2809,6 +2819,11 @@ static void refresh_tree_children(uint32_t parent)
     tree_child_count = 0;
     tree_parent_name[0] = '\0';
     favorite_playlist_nodes[0] = favorite_playlist_nodes[1] = -1;
+    favorite_playlist_names[0][0] = favorite_playlist_names[1][0] = '\0';
+    favorite_playlist_kinds[0] = favorite_playlist_kinds[1] = 0;
+    /* A rebuilt tree is a new carousel anchor.  In-flight easing from the
+       previous folder or management screen must never move the new list. */
+    playlist_carousel_offset_fp = 0;
     invalidate_playlist_cache();
     if (library_fd < 0 || library_node_record_size <= 0 ||
         rb->lseek(library_fd, library_node_offset, SEEK_SET) < 0)
@@ -2839,6 +2854,14 @@ static void refresh_tree_children(uint32_t parent)
                 tree_children[tree_child_count++] = node_index;
         }
         index += count;
+    }
+    for (index = 0; index < 2; index++) {
+        if (favorite_playlist_nodes[index] >= 0 &&
+            read_node_record(favorite_playlist_nodes[index], &node) &&
+            read_index_string(node.name_offset,
+                              favorite_playlist_names[index],
+                              sizeof(favorite_playlist_names[index])))
+            favorite_playlist_kinds[index] = node.kind;
     }
     if (parent != RBPREP_ROOT_NODE && read_node_record(parent, &node))
         read_index_string(node.name_offset, tree_parent_name,
@@ -4575,7 +4598,7 @@ static void draw_stereo_orbit(void)
 
     if (pcm_snapshot_frames < 2) {
         centered_text(0, RBPREP_DECK_WIDTH, cy - 4,
-                      "WAITING FOR AUDIO", LCD_LIGHTGRAY);
+                      "PLAY A TRACK", LCD_LIGHTGRAY);
     } else {
         for (point = 0; point < 96; point++) {
             int frame = (long long)point * (pcm_snapshot_frames - 1) / 95;
@@ -4624,34 +4647,44 @@ static void draw_stereo_orbit(void)
 static void draw_phrase_map(void)
 {
     const int cells = 32;
+    const int bars = 8;
     const int left = 5;
     const int cell_width = 9;
-    const int top = RBPREP_WAVE_TOP + 25;
-    const int bottom = RBPREP_WAVE_BOTTOM - 28;
+    const int top = RBPREP_WAVE_TOP + 24;
+    const int bottom = RBPREP_WAVE_BOTTOM - 49;
+    const int section_high_y = RBPREP_WAVE_BOTTOM - 30;
+    const int section_low_y = RBPREP_WAVE_BOTTOM - 22;
+    int cell_start[32];
+    int cell_end[32];
+    unsigned char cell_valid[32];
+    unsigned short bar_energy[8];
+    unsigned char bar_samples[8];
+    unsigned char section_high[8];
     int period = beat_period_ms();
     int base = grid_phase_ms + grid_offset;
     int current;
     int beat_number;
     int first;
-    int phase = visual_beat_phase(&beat_number);
-    int first_beat = 1;
-    int bar = 1;
     int cell;
-    char line[48];
+    int slot;
+    int energy_total = 0;
+    int energy_bars = 0;
+    int energy_mean;
+    int threshold;
     bool imported = imported_grid_resident();
 
+    rb->memset(cell_valid, 0, sizeof(cell_valid));
+    rb->memset(bar_energy, 0, sizeof(bar_energy));
+    rb->memset(bar_samples, 0, sizeof(bar_samples));
     if (imported) {
         current = current_beat_index(playhead);
         if (current < 0)
             current = 0;
-        first_beat = adjusted_beat_number(0);
         beat_number = adjusted_beat_number(current);
-        bar = (current + first_beat - 1) / 4 + 1;
         first = current - beat_number + 1 - 12;
     } else {
         current = MAX(0, (playhead - base) / MAX(1, period));
         beat_number = (current & 3) + 1;
-        bar = current / 4 + 1;
         first = current - beat_number + 1 - 12;
     }
 
@@ -4673,6 +4706,7 @@ static void draw_phrase_map(void)
         int x = left + cell * cell_width;
         int height;
         int color;
+        int bar_index = cell / 4;
         bool valid = !imported || (beat >= 0 && beat < beat_count);
         bool downbeat;
 
@@ -4697,6 +4731,9 @@ static void draw_phrase_map(void)
             rb->lcd_fillrect(x, bottom - 3, cell_width - 2, 4);
             continue;
         }
+        cell_start[cell] = start_time;
+        cell_end[cell] = end_time;
+        cell_valid[cell] = 1;
         sample_begin = MAX(0, MIN(RBPREP_OVERVIEW_WIDTH - 1,
             (long long)start_time * RBPREP_OVERVIEW_WIDTH /
             MAX(1, track_length)));
@@ -4721,20 +4758,83 @@ static void draw_phrase_map(void)
         rb->lcd_set_foreground(downbeat ? LCD_WHITE
                                        : LCD_RGBPACK(42, 72, 57));
         rb->lcd_vline(x, top - (downbeat ? 3 : 0), bottom + 2);
+        bar_energy[bar_index] += peak;
+        bar_samples[bar_index]++;
         if (beat == current) {
-            int cursor = x + phase * (cell_width - 3) / 255;
+            int cursor = x + (long long)(playhead - start_time) *
+                         (cell_width - 3) /
+                         MAX(1, end_time - start_time);
 
             rb->lcd_set_foreground(LCD_WHITE);
-            rb->lcd_drawrect(x - 1, top - 3, cell_width,
-                             bottom - top + 6);
+            cursor = MAX(x, MIN(x + cell_width - 3, cursor));
             rb->lcd_vline(cursor, top, bottom);
         }
     }
 
-    rb->snprintf(line, sizeof(line), "BAR %d.%d   -3 < NOW > +4",
-                 MIN(999, bar), beat_number);
-    centered_text(0, RBPREP_DECK_WIDTH, RBPREP_WAVE_BOTTOM - 18,
-                  line, LCD_WHITE);
+    /* Phrase sections are deliberately inferred from dynamics already in
+       memory.  A small hysteresis keeps adjacent bars together instead of
+       turning every transient into a new section. */
+    for (cell = 0; cell < bars; cell++) {
+        if (bar_samples[cell]) {
+            bar_energy[cell] /= bar_samples[cell];
+            energy_total += bar_energy[cell];
+            energy_bars++;
+        }
+    }
+    energy_mean = energy_bars ? energy_total / energy_bars : 0;
+    threshold = MAX(10, energy_mean / 8);
+    for (cell = 0; cell < bars; cell++) {
+        int energy = bar_energy[cell];
+
+        if (!bar_samples[cell])
+            section_high[cell] = cell ? section_high[cell - 1] : 0;
+        else if (energy >= energy_mean + threshold)
+            section_high[cell] = 1;
+        else if (energy <= MAX(0, energy_mean - threshold))
+            section_high[cell] = 0;
+        else
+            section_high[cell] = cell ? section_high[cell - 1]
+                                      : energy >= energy_mean;
+    }
+    for (cell = 1; cell + 1 < bars; cell++)
+        if (section_high[cell - 1] == section_high[cell + 1] &&
+            section_high[cell] != section_high[cell - 1])
+            section_high[cell] = section_high[cell - 1];
+    for (cell = 0; cell < bars; cell++) {
+        int x1 = left + cell * 4 * cell_width;
+        int x2 = x1 + 4 * cell_width - 3;
+        int y = section_high[cell] ? section_high_y : section_low_y;
+
+        rb->lcd_set_foreground(section_high[cell] ? RBPREP_GREEN
+                                                   : theme_accent_dim);
+        rb->lcd_hline(x1, x2, y);
+        rb->lcd_hline(x1, x2, y + 1);
+        if (cell && section_high[cell] != section_high[cell - 1]) {
+            int previous_y = section_high[cell - 1]
+                           ? section_high_y : section_low_y;
+
+            rb->lcd_vline(x1, MIN(y, previous_y), MAX(y, previous_y) + 1);
+        }
+    }
+
+    /* Hot cues sit above their exact time inside the same beat cells. */
+    for (slot = 0; slot < 16; slot++) {
+        if (hotcues[slot] < 0)
+            continue;
+        for (cell = 0; cell < cells; cell++) {
+            int x;
+
+            if (!cell_valid[cell] || hotcues[slot] < cell_start[cell] ||
+                hotcues[slot] >= cell_end[cell])
+                continue;
+            x = left + cell * cell_width +
+                (long long)(hotcues[slot] - cell_start[cell]) *
+                (cell_width - 2) / MAX(1, cell_end[cell] - cell_start[cell]);
+            draw_micro_cue_marker(x, top - 2, slot,
+                                  cue_palette[hotcue_colors[slot] & 7]);
+            break;
+        }
+    }
 }
 
 static int track_key_pitch_class(void)
@@ -5209,23 +5309,24 @@ static void draw_turntable(void)
            through the rest hook instead of collapsing back into the pivot. */
         arm_end_x = 211;
         arm_end_y = RBPREP_WAVE_BOTTOM - 18;
-        arm_mid1_x = 200;
-        arm_mid1_y = RBPREP_WAVE_TOP + 62;
-        arm_mid2_x = 208;
-        arm_mid2_y = RBPREP_WAVE_TOP + 101;
     } else {
         /* The headshell connector is behind the stylus along the tangent;
            the tonearm ends at that collar, not at the needle itself. */
         arm_end_x = stylus_x + 10;
         arm_end_y = stylus_y - 17;
-        arm_mid1_x = (192 * 2 + arm_end_x) / 3;
-        arm_mid1_y = ((RBPREP_WAVE_TOP + 30) * 2 + arm_end_y) / 3;
-        arm_mid2_x = (192 + arm_end_x * 2) / 3;
-        arm_mid2_y = (RBPREP_WAVE_TOP + 30 + arm_end_y * 2) / 3;
-        if (turntable_arm_style) {
-            arm_mid1_x += 5;
-            arm_mid2_x -= 5;
-        }
+    }
+    /* STRAIGHT is mathematically collinear from pivot to collar. S-SHAPED
+       uses opposing normal offsets, including while parked, so the setting
+       always describes the arm that is actually visible. */
+    arm_mid1_x = (192 * 2 + arm_end_x) / 3;
+    arm_mid1_y = ((RBPREP_WAVE_TOP + 30) * 2 + arm_end_y) / 3;
+    arm_mid2_x = (192 + arm_end_x * 2) / 3;
+    arm_mid2_y = (RBPREP_WAVE_TOP + 30 + arm_end_y * 2) / 3;
+    if (turntable_arm_style) {
+        arm_mid1_x += 7;
+        arm_mid1_y -= 2;
+        arm_mid2_x -= 7;
+        arm_mid2_y += 2;
     }
     draw_turntable_counterweight(192, RBPREP_WAVE_TOP + 30,
                                  arm_mid1_x - 192,
@@ -7003,7 +7104,7 @@ static bool service_deferred_burn(void)
         uptime_tracks_burned += track_burns;
         burn_request = BURN_REQUEST_NONE;
         refresh_active_playlist_context(active_source_id);
-        rb->splash(HZ, "Burn all complete");
+        rb->splash(HZ, "All changes saved");
     } else {
         rb->splash(HZ * 2, "Automatic burn remains pending");
     }
@@ -7068,7 +7169,7 @@ static bool burn_loaded_track_now(void)
     force_full_redraw = true;
     if (success) {
         uptime_tracks_burned++;
-        rb->splash(HZ, "Track burn complete");
+        rb->splash(HZ, "Track saved");
     }
     activity_ticker_ping(1000);
     restore_black_canvas();
@@ -7097,7 +7198,7 @@ static bool burn_all_now(void)
     }
     refresh_pending_summary();
     if (pending_snapshot_count == 0 && pending_playlist_count == 0) {
-        rb->splash(HZ, "Nothing to burn");
+        rb->splash(HZ, "No changes to save");
         restore_black_canvas();
         return true;
     }
@@ -7139,7 +7240,7 @@ static bool burn_all_now(void)
     overview_dirty = true;
     force_full_redraw = true;
     if (success)
-        rb->splash(HZ, "Instant burn complete");
+        rb->splash(HZ, "All changes saved");
     activity_ticker_ping(1000);
     restore_black_canvas();
     return success;
@@ -7211,12 +7312,15 @@ static void draw_waveform_preparation(int progress, const char *stage)
     int width = LCD_WIDTH - 56;
     int fill = width * MAX(0, MIN(100, progress)) / 100;
     char percent[16];
+    bool first_frame = !waveform_preparation_visible && !display_locked;
 
+    if (first_frame)
+        animate_context_dissolve(false, 2);
     activity_ticker_ping(progress * 10);
     rb->lcd_set_background(LCD_BLACK);
     rb->lcd_clear_display();
     draw_status_bar();
-    centered_text(0, LCD_WIDTH, 72, "PREPARING WAVEFORM", LCD_WHITE);
+    centered_text(0, LCD_WIDTH, 72, "LOADING TRACK", LCD_WHITE);
     centered_text(0, LCD_WIDTH, 91, stage, LCD_RGBPACK(145, 165, 151));
     rb->lcd_set_foreground(LCD_RGBPACK(22, 35, 27));
     rb->lcd_fillrect(28, 118, width, 12);
@@ -7228,9 +7332,18 @@ static void draw_waveform_preparation(int progress, const char *stage)
     rb->snprintf(percent, sizeof(percent), "%d%%", progress);
     centered_text(0, LCD_WIDTH, 143, percent, LCD_WHITE);
     centered_text(0, LCD_WIDTH, 176,
-                  "AUDIO WAITS UNTIL THE DECK IS RESIDENT",
+                  "PLAYBACK WILL RESUME WHEN READY",
                   LCD_RGBPACK(95, 120, 103));
-    rb->lcd_update();
+    if (first_frame) {
+        capture_main_transition_thumbnail();
+        waveform_preparation_visible = true;
+        animate_context_dissolve(true, 2);
+        /* Restore the native-resolution loading screen after the thumbnail
+           dissolve without exposing a softened final frame. */
+        draw_waveform_preparation(progress, stage);
+    } else {
+        rb->lcd_update();
+    }
 }
 
 static bool finish_waveform_index_preparation(void)
@@ -7248,11 +7361,11 @@ static bool finish_waveform_index_preparation(void)
         if (progress != shown_progress &&
             !TIME_BEFORE(now, draw_deadline)) {
             const char *stage = wave_index.stage == RBPREP_WAVE_INDEX_SCAN
-                              ? "BUILDING RESIDENT PEAKS"
+                              ? "PREPARING WAVEFORM"
                               : wave_index.stage == RBPREP_WAVE_INDEX_WRITE ||
                                 wave_index.stage == RBPREP_WAVE_INDEX_OPEN_WRITE
-                              ? "SAVING DEVICE INDEX"
-                              : "VERIFYING DEVICE INDEX";
+                              ? "SAVING WAVEFORM"
+                              : "CHECKING WAVEFORM";
 
             draw_waveform_preparation(progress, stage);
             shown_progress = progress;
@@ -7282,6 +7395,7 @@ static bool load_waveform(int track_id)
     char index_filename[MAX_PATH];
     unsigned char header[40];
 
+    waveform_preparation_visible = false;
     clear_analysis();
     rb->snprintf(filename, sizeof(filename), "%s/%06d.rbw",
                  RBPREP_TRACK_DIR, track_id);
@@ -7328,7 +7442,7 @@ static bool load_waveform(int track_id)
         rb->close(fd);
         return false;
     }
-    draw_waveform_preparation(8, "LOADING RGB WAVEFORM");
+    draw_waveform_preparation(8, "LOADING WAVEFORM");
     /* Classic has enough plugin RAM for the complete source waveform.  Video
        may decline this preload and will use its resident peak index instead. */
     if (!rbprep_wave_cache_all(&wave_reader) &&
@@ -7337,7 +7451,7 @@ static bool load_waveform(int track_id)
         clear_analysis();
         return false;
     }
-    draw_waveform_preparation(20, "LOADING DEVICE INDEX");
+    draw_waveform_preparation(20, "CHECKING WAVEFORM");
 
     source_fingerprint = rbprep_wave_index_fingerprint(
         header, sizeof(header), source_size);
@@ -7403,7 +7517,7 @@ static bool load_waveform(int track_id)
     }
     beat_search_hint = 0;
     rb->close(fd);
-    draw_waveform_preparation(100, "DECK READY");
+    draw_waveform_preparation(100, "READY");
     overview_dirty = true;
     return true;
 }
@@ -8049,7 +8163,7 @@ static bool open_loaded_track(void)
             !rb->strcmp(path, id3->path))
             return play_track_index(index, -1, MODE_LIBRARY);
     }
-    rb->splash(HZ * 2, "Loaded track is not in RBPrep index");
+    rb->splash(HZ * 2, "Loaded track is not in the Rekordpod library");
     restore_black_canvas();
     return false;
 }
@@ -8454,7 +8568,7 @@ static void draw_playlist_order_menu(void)
     static const char * const items[] = {
         "ORIGINAL ORDER", "SHUFFLE VIEW", "SORT BY TITLE",
         "SORT BY BPM", "SORT BY KEY", "SORT BY YEAR",
-        "SORT BY IMPORT DATE", "EDIT / REORDER", "COMMIT CURRENT ORDER"
+        "SORT BY IMPORT DATE", "EDIT / REORDER", "SAVE THIS ORDER"
     };
     char line[96];
     int row;
@@ -9311,7 +9425,7 @@ static void draw_macro_value_editor(void)
          LCD_RGBPACK(130, 151, 136));
     rb->lcd_set_foreground(LCD_RGBPACK(17, 24, 20));
     rb->lcd_fillrect(9, 78, LCD_WIDTH - 18, 54);
-    rb->lcd_set_foreground(macro_value_choose ? LCD_RGBPACK(80, 180, 245)
+    rb->lcd_set_foreground(macro_value_choose ? LCD_WHITE
                                               : RBPREP_GREEN);
     rb->lcd_drawrect(9, 78, LCD_WIDTH - 18, 54);
     format_macro_value(value, sizeof(value), macro_value_tool,
@@ -9319,8 +9433,7 @@ static void draw_macro_value_editor(void)
                                           : macro_value_draft);
     centered_text(9, LCD_WIDTH - 18, 91, value, LCD_WHITE);
     centered_text(9, LCD_WIDTH - 18, 112, choice,
-                  macro_value_choose ? LCD_RGBPACK(80, 180, 245)
-                                     : RBPREP_GREEN);
+                  macro_value_choose ? LCD_WHITE : RBPREP_GREEN);
 
     rb->lcd_set_foreground(LCD_RGBPACK(24, 30, 27));
     rb->lcd_fillrect(9, 145, LCD_WIDTH - 18, 27);
@@ -9445,11 +9558,11 @@ static void draw_track_header(bool advance_scroll)
     if (track_year > 0)
         rb->snprintf(identity, sizeof(identity), "[%04d] %s - %s",
                      track_year,
-                     selected_artist[0] ? selected_artist : "RBPREP",
+                     selected_artist[0] ? selected_artist : "REKORDPOD",
                      selected_title[0] ? selected_title : mode_names[mode]);
     else
         rb->snprintf(identity, sizeof(identity), "%s - %s",
-                     selected_artist[0] ? selected_artist : "RBPREP",
+                     selected_artist[0] ? selected_artist : "REKORDPOD",
                      selected_title[0] ? selected_title : mode_names[mode]);
     if (selected_comments[0]) {
         if (extension[0])
@@ -9530,17 +9643,14 @@ static bool pnav_tool_available(enum rbprep_tool tool)
 
 static void format_favorite_tool_status(int slot, char *buffer, size_t size)
 {
-    struct rbprep_node_record node;
-    char name[48];
-
     if (slot < 0 || slot > 1 || favorite_playlist_nodes[slot] < 0 ||
-        !read_node_record(favorite_playlist_nodes[slot], &node) ||
-        !read_index_string(node.name_offset, name, sizeof(name))) {
-        rb->snprintf(buffer, size, "FAVLIST%d  NOT SET", slot + 1);
+        !favorite_playlist_names[slot][0]) {
+        rb->snprintf(buffer, size, "FAV%d NOT SET", slot + 1);
         return;
     }
-    rb->snprintf(buffer, size, "FAVLIST%d  %.28s%s", slot + 1, name,
-                 node.kind == 0 ? " /" : "");
+    rb->snprintf(buffer, size, "FAV%d %.28s%s", slot + 1,
+                 favorite_playlist_names[slot],
+                 favorite_playlist_kinds[slot] == 0 ? " /" : "");
 }
 
 static void draw_tool_orbs(void)
@@ -9600,37 +9710,35 @@ static void draw_tool_status(void)
 
     if (tool == TOOL_SEEK)
         rb->snprintf(line, sizeof(line), seek_portal_active
-                     ? "TEMP SEEK  %dms/tick  DBL SELECT:RETURN"
-                     : "SEEK  %dms/tick", scrub_step_ms());
+                     ? "SEEK %dMS  DBL:BACK"
+                     : "SEEK STEP %dMS", scrub_step_ms());
     else if (tool == TOOL_IPOD_SEEK)
-        rb->snprintf(line, sizeof(line), "IPOD SEEK  WHEEL:GAIN  < >:SEEK");
+        rb->snprintf(line, sizeof(line), "IPOD-STYLE SEEK");
     else if (tool == TOOL_SCRUB_STEP)
-        rb->snprintf(line, sizeof(line), "SCRUB  %dms/tick", scrub_step_ms());
+        rb->snprintf(line, sizeof(line), "SCRUB STEP %dMS", scrub_step_ms());
     else if (tool == TOOL_ZOOM)
-        rb->snprintf(line, sizeof(line), "ZOOM  %dx", zoom);
+        rb->snprintf(line, sizeof(line), "ZOOM %dX", zoom);
     else if (tool == TOOL_GAIN)
-        rb->snprintf(line, sizeof(line), "GAIN  %d %s",
+        rb->snprintf(line, sizeof(line), "GAIN %d %s",
                      rb->sound_val2phys(SOUND_VOLUME,
                                         rb->global_status->volume),
                      rb->sound_unit(SOUND_VOLUME));
     else if (tool == TOOL_HOST_RPM)
-        rb->snprintf(line, sizeof(line), "HOST RPM  %s  PLAY %s",
-                     rpm_styles[host_rpm_index],
-                     rpm_styles[played_rpm_index]);
+        rb->snprintf(line, sizeof(line), "HOST RPM %s",
+                     rpm_styles[host_rpm_index]);
     else if (tool == TOOL_PLAY_RPM)
-        rb->snprintf(line, sizeof(line), "PLAY RPM %s  HOST %s",
-                     rpm_styles[played_rpm_index], rpm_styles[host_rpm_index]);
+        rb->snprintf(line, sizeof(line), "PLAY RPM %s",
+                     rpm_styles[played_rpm_index]);
     else if (tool == TOOL_PITCH_BEND) {
         char delta[16];
         format_percent_delta(delta, sizeof(delta), pitch_bend_x100);
         rb->snprintf(line, sizeof(line), "PITCH BEND %s%%", delta);
     }
     else if (tool == TOOL_TEMPO)
-        rb->snprintf(line, sizeof(line), "TEMPO  %d.%02d%%  RATE %d.%02d%%",
-                     tempo_x100 / 100, tempo_x100 % 100,
-                     deck_speed_x100() / 100, deck_speed_x100() % 100);
+        rb->snprintf(line, sizeof(line), "TEMPO %d.%02d%%",
+                     tempo_x100 / 100, tempo_x100 % 100);
     else if (tool == TOOL_PLAYLIST_MODE)
-        rb->snprintf(line, sizeof(line), "AUTO-NEXT  %s",
+        rb->snprintf(line, sizeof(line), "AUTO-NEXT %s",
                      playlist_playback ? "ON" : "OFF");
     else if (tool == TOOL_ADD_PLAYLIST)
         rb->snprintf(line, sizeof(line), "ADD TO PLAYLIST");
@@ -9639,21 +9747,21 @@ static void draw_tool_status(void)
     else if (tool == TOOL_FAVORITE_TWO)
         format_favorite_tool_status(1, line, sizeof(line));
     else if (tool == TOOL_BURN_SONG)
-        rb->snprintf(line, sizeof(line), "BURN TRACK  NOW");
+        rb->snprintf(line, sizeof(line), "SAVE TRACK NOW");
     else if (tool == TOOL_BURN_ALL)
-        rb->snprintf(line, sizeof(line), "BURN ALL  INSTANT");
+        rb->snprintf(line, sizeof(line), "SAVE ALL NOW");
     else if (tool == TOOL_PLAYLIST_PREVIOUS)
-        rb->snprintf(line, sizeof(line), "PREV TRACK IN PLAYLIST");
+        rb->snprintf(line, sizeof(line), "PREVIOUS TRACK");
     else if (tool == TOOL_PLAYLIST_NEXT)
-        rb->snprintf(line, sizeof(line), "NEXT TRACK IN PLAYLIST");
+        rb->snprintf(line, sizeof(line), "NEXT TRACK");
     else if (tool == TOOL_RESTART_PLAYBACK)
-        rb->snprintf(line, sizeof(line), "RESTART  PLAYBACK");
+        rb->snprintf(line, sizeof(line), "RESTART TRACK");
     else if (tool == TOOL_RELOAD_TRACK)
-        rb->snprintf(line, sizeof(line), "RELOAD  CURRENT TRACK");
+        rb->snprintf(line, sizeof(line), "RELOAD TRACK");
     else if (tool == TOOL_WAVEFORM_STYLE)
         rb->snprintf(line, sizeof(line), "RGB WAVEFORM");
     else if (tool == TOOL_KEYLOCK)
-        rb->snprintf(line, sizeof(line), "PITCH LOCK  %s",
+        rb->snprintf(line, sizeof(line), "PITCH LOCK %s",
                      keylock_enabled ? "ON" : "OFF");
     else if (tool == TOOL_META_KEY) {
         char primary[24];
@@ -9668,16 +9776,16 @@ static void draw_tool_status(void)
                         key_notation == KEY_DISPLAY_CAMELOT
                         ? chromatic_key_names[index]
                         : camelot_key_names[index], sizeof(alternate));
-        rb->snprintf(line, sizeof(line), "KEY  %s  [%s]",
+        rb->snprintf(line, sizeof(line), "KEY %s [%s]",
                      primary, alternate);
     }
     else if (tool == TOOL_KEY_NOTATION)
-        rb->snprintf(line, sizeof(line), "KEY DISPLAY  %s",
+        rb->snprintf(line, sizeof(line), "KEY DISPLAY %s",
                      key_notation == KEY_DISPLAY_ORIGINAL ? "ORIGINAL" :
                      key_notation == KEY_DISPLAY_CAMELOT ? "CAMELOT" :
                                                           "CHROMATIC");
     else if (tool == TOOL_VIS_BOOMBOX)
-        rb->snprintf(line, sizeof(line), "BOOMBOX  BASS");
+        rb->snprintf(line, sizeof(line), "BOOMBOX");
     else if (tool == TOOL_VIS_EQ)
         rb->snprintf(line, sizeof(line), "20-BAND EQ");
     else if (tool == TOOL_VIS_TURNTABLE)
@@ -9687,7 +9795,7 @@ static void draw_tool_status(void)
     else if (tool == TOOL_VIS_ORBIT)
         rb->snprintf(line, sizeof(line), "STEREO ORBIT");
     else if (tool == TOOL_VIS_PHRASE)
-        rb->snprintf(line, sizeof(line), "PHRASE MAP  8 BARS");
+        rb->snprintf(line, sizeof(line), "PHRASE MAP");
     else if (tool == TOOL_VIS_HARMONIC)
         rb->snprintf(line, sizeof(line), "HARMONIC CONSTELLATION");
     else if (tool == TOOL_MACRO_ONE || tool == TOOL_MACRO_TWO) {
@@ -9696,56 +9804,56 @@ static void draw_tool_status(void)
                      tool_macros[slot].name, tool_macros[slot].count);
     }
     else if (tool == TOOL_GRID_NUDGE)
-        rb->snprintf(line, sizeof(line), "GRID NUDGE  %+dms", grid_offset);
+        rb->snprintf(line, sizeof(line), "GRID %+dMS", grid_offset);
     else if (tool == TOOL_GRID_BPM)
-        rb->snprintf(line, sizeof(line), "GRID BPM  %d.%02d",
+        rb->snprintf(line, sizeof(line), "GRID BPM %d.%02d",
                      grid_bpm_x100 / 100, grid_bpm_x100 % 100);
     else if (tool == TOOL_GRID_ORIGIN)
-        rb->snprintf(line, sizeof(line), "DOWNBEAT  SET");
+        rb->snprintf(line, sizeof(line), "SET DOWNBEAT");
     else if (tool == TOOL_GRID_QUANTIZE)
-        rb->snprintf(line, sizeof(line), "QUANTIZE  %s",
+        rb->snprintf(line, sizeof(line), "QUANTIZE %s",
                      quantize ? "ON" : "OFF");
     else if (tool == TOOL_CUE_SLOT) {
-        rb->snprintf(line, sizeof(line), "CUE %02d  SLOT %s", cue_slot + 1,
-                     hotcues[cue_slot] >= 0 ? "SET" : "EMPTY");
+        rb->snprintf(line, sizeof(line), "%s CUE",
+                     hotcues[cue_slot] >= 0 ? "JUMP TO" : "SET");
     } else if (tool == TOOL_CUE_MOVE)
-        rb->snprintf(line, sizeof(line), "CUE %02d  MOVE", cue_slot + 1);
+        rb->snprintf(line, sizeof(line), "MOVE CUE");
     else if (tool == TOOL_CUE_COLOR)
-        rb->snprintf(line, sizeof(line), "CUE %02d  COLOR %s", cue_slot + 1,
+        rb->snprintf(line, sizeof(line), "CUE COLOR %s",
                      cue_color_names[hotcue_colors[cue_slot] & 7]);
     else if (tool == TOOL_CUE_DELETE) {
-        rb->snprintf(line, sizeof(line), "CUE %02d  DELETE", cue_slot + 1);
+        rb->snprintf(line, sizeof(line), "DELETE CUE");
         color = LCD_RGBPACK(255, 90, 70);
     } else if (tool == TOOL_LOOP_LENGTH)
-        rb->snprintf(line, sizeof(line), "LOOP SIZE  %s BEAT%s",
+        rb->snprintf(line, sizeof(line), "LOOP SIZE %s BEAT%s",
                      loop_length_names[loop_length_index],
                      loop_length_index == 5 ? "" : "S");
     else if (tool == TOOL_LOOP_IN) {
         if (loop_in >= 0)
-            rb->snprintf(line, sizeof(line), "IN  %dms", loop_in);
+            rb->snprintf(line, sizeof(line), "LOOP IN %dMS", loop_in);
         else
-            rb->snprintf(line, sizeof(line), "IN  --");
+            rb->snprintf(line, sizeof(line), "LOOP IN --");
     } else if (tool == TOOL_LOOP_OUT) {
         if (loop_out >= 0)
-            rb->snprintf(line, sizeof(line), "OUT  %dms", loop_out);
+            rb->snprintf(line, sizeof(line), "LOOP OUT %dMS", loop_out);
         else
-            rb->snprintf(line, sizeof(line), "OUT  --");
+            rb->snprintf(line, sizeof(line), "LOOP OUT --");
     } else if (tool == TOOL_LOOP_ACTIVE)
-        rb->snprintf(line, sizeof(line), "LOOP ACTIVE  %s",
-                     loop_active ? "ACTIVE" : "EXIT");
+        rb->snprintf(line, sizeof(line), "LOOP %s",
+                     loop_active ? "ON" : "OFF");
     else if (tool == TOOL_META_RATING)
-        rb->snprintf(line, sizeof(line), "RATING  %d/5", rating);
+        rb->snprintf(line, sizeof(line), "RATING %d/5", rating);
     else if (tool == TOOL_META_COLOR)
-        rb->snprintf(line, sizeof(line), "TRACK COLOR  %s",
+        rb->snprintf(line, sizeof(line), "TRACK COLOR %s",
                      color_labels[color_index]);
     else if (tool == TOOL_META_YEAR)
-        rb->snprintf(line, sizeof(line), "YEAR  %04d", track_year);
+        rb->snprintf(line, sizeof(line), "YEAR %04d", track_year);
     else if (tool == TOOL_META_GENRE)
-        rb->snprintf(line, sizeof(line), "GENRE  %.30s", selected_genre);
+        rb->snprintf(line, sizeof(line), "GENRE %.30s", selected_genre);
     else
         rb->snprintf(line, sizeof(line), "%s", tool_names[tool]);
     if (macro_wheel_locked)
-        rb->strlcat(line, " [LOCK/SEEK]", sizeof(line));
+        rb->strlcat(line, " [LOCKED]", sizeof(line));
     if (!pnav_tool_available(tool))
         color = LCD_RGBPACK(38, 43, 40);
     fit_text(fitted, sizeof(fitted), line, 232 - status_x);
@@ -9790,7 +9898,7 @@ static void draw_settings(void)
     int value_x;
     const char *names[] = {
         "AUTOBOOT REKORDPOD", "AUTO-NEXT DEFAULT", "WAVEFORM SHAPE",
-        "IPOD SEEK ORB", "KEY DISPLAY", "TRACK EXIT", "COMMIT POLICY",
+        "IPOD SEEK ORB", "KEY DISPLAY", "TRACK CHANGES", "AUTO SAVE",
         "WHEEL CLICK", "ACCENT COLOR", "IPOD BODY COLOR",
         "WHEEL / VINYL COLOR", "TURNTABLE ARM", "HEADSHELL DESIGN",
         "PLATTER WHEEL MODE"
@@ -9802,7 +9910,7 @@ static void draw_settings(void)
         ipod_seek_first ? "FIRST" : "LAST",
         key_notation == KEY_DISPLAY_ORIGINAL ? "ORIGINAL" :
         key_notation == KEY_DISPLAY_CAMELOT ? "CAMELOT" : "CHROMATIC",
-        "ASK EACH TIME", "SAVE & LOAD", click_sound ? "ON" : "OFF",
+        "ASK EACH TIME", "SAVE FIRST", click_sound ? "ON" : "OFF",
         "HSB", "HSB", "HSB",
         turntable_arm_style ? "S-SHAPED" : "STRAIGHT",
         turntable_headshell_styles[turntable_headshell_style],
@@ -9851,9 +9959,9 @@ static void draw_settings(void)
             ? "Show Camelot equivalent; unknown keys stay original"
             : "Show flat chromatic equivalent; unknown keys stay original")
          : settings_selection == 5
-         ? "Choose Save, Discard or Stay before another track loads"
+         ? "Ask what to do before another track loads"
          : settings_selection == 6
-         ? "Save verifies the PDB + Rekordpod index before loading"
+         ? "Save changes before loading the next track"
          : settings_selection == 7
          ? (click_sound ? "Audible feedback on clickwheel scroll"
                         : "Silent clickwheel navigation")
@@ -10642,8 +10750,7 @@ static void present_transition_destination(void)
     main_transition_thumbnail_valid = false;
     transition_render_only = false;
     transition_running = false;
-    context_change_serial = 0;
-    presented_context_serial = 0;
+    presented_context_serial = context_change_serial;
     presented_mode = mode;
     force_full_redraw = true;
     draw_screen();
@@ -10661,32 +10768,6 @@ static void draw_main_menu(void)
     /* The jog artwork is deliberately isolated from the CDJ face revision.
        Its center, radius, touch marker and momentum rendering stay unchanged. */
     draw_main_menu_fx();
-}
-
-static enum rbprep_transition_style transition_style_for(
-    enum rbprep_mode new_mode)
-{
-    if (new_mode == MODE_LIBRARY)
-        return TRANSITION_HOME;
-    if (new_mode == MODE_TRACKS)
-        return TRANSITION_CRATE;
-    if (new_mode == MODE_PLAYLISTS || new_mode == MODE_PLAYLIST_ACTIONS ||
-        new_mode == MODE_PLAYLIST_ORDER)
-        return TRANSITION_BLADES;
-    if (new_mode == MODE_USB)
-        return TRANSITION_USB;
-    if (new_mode == MODE_SETTINGS || new_mode == MODE_ACCENT)
-        return TRANSITION_CONTROLS;
-    if (new_mode == MODE_INDEX || new_mode == MODE_PENDING)
-        return TRANSITION_DATABASE;
-    if (new_mode == MODE_FILTER || new_mode == MODE_GENRES)
-        return TRANSITION_FILTER;
-    if (new_mode == MODE_MACRO_ACTIONS || new_mode == MODE_MACRO_EDITOR ||
-        new_mode == MODE_MACRO_PICKER || new_mode == MODE_MACRO_VALUE)
-        return TRANSITION_MACRO;
-    if (new_mode >= MODE_DECK)
-        return TRANSITION_DECK;
-    return TRANSITION_HOMING;
 }
 
 static void service_transition_destination(void)
@@ -10900,29 +10981,25 @@ static void draw_context_transition_motif(enum rbprep_transition_style style,
 
 static void animate_context_transition(enum rbprep_mode new_mode)
 {
-    enum rbprep_transition_style style =
-        transition_style_for(new_mode);
-    int motif_frames = capabilities.device_class == RBPREP_DEVICE_CLASSIC
-                       ? RBPREP_CONTEXT_TRANSITION_FRAMES : 5;
-    int dissolve_frames = 4;
-    int frame;
+    const int dissolve_frames = 2;
 
+    /* Keep the former destination motifs available for later diagnostics,
+       but public interaction uses only the continuous dissolve. */
+    (void)draw_context_transition_motif;
     if (transition_running || display_locked)
         return;
     transition_running = true;
     clear_transition_ticker();
     animate_context_dissolve(false, dissolve_frames);
-    for (frame = 0; frame <= motif_frames; frame++) {
-        service_transition_destination();
-        draw_context_transition_motif(style, frame, motif_frames);
-        rb->lcd_update();
-        if (frame < motif_frames)
-            rb->sleep(RBPREP_CONTEXT_TRANSITION_TICKS);
-    }
+    /* Populate one destination row while the screen is black.  Context art
+       used to add a second animation between screens; the short dissolve is
+       more continuous and never exposes an unloaded first frame. */
+    service_transition_destination();
     capture_transition_destination();
     animate_context_dissolve(true, dissolve_frames);
     present_transition_destination();
     transition_running = false;
+    (void)new_mode;
 }
 
 static void draw_pending_edits(void)
@@ -10932,13 +11009,13 @@ static void draw_pending_edits(void)
 
     draw_blade_shell("PENDING EDITS", RBPREP_GREEN);
     if (pending_summary_overflow || pending_journal_invalid) {
-        rb->snprintf(line, sizeof(line), "BURN BLOCKED: %s",
+        rb->snprintf(line, sizeof(line), "SAVE BLOCKED: %s",
                      pending_summary_overflow ? "TOO MANY CHANGES"
                                               : "JOURNAL INCOMPLETE");
         text(7, 34, line, LCD_RGBPACK(255, 90, 70));
     } else {
         rb->snprintf(line, sizeof(line),
-                     "%d SAVED STATES   %d PLAYLIST OPS",
+                     "%d TRACK CHANGES   %d PLAYLIST CHANGES",
                      pending_snapshot_count, pending_playlist_count);
         text(7, 34, line, LCD_RGBPACK(145, 165, 151));
     }
@@ -11000,8 +11077,8 @@ static void draw_pending_edits(void)
         }
     }
     if (pending_visible_count == 0 && pending_playlist_count == 0)
-        text(7, 62, "NO CONFIRMED DEVICE EDITS YET", LCD_DARKGRAY);
-    text(7, 210, "SELECT: OPEN   HOLD: DELETE   PLAY: BURN", LCD_WHITE);
+        text(7, 62, "NO CHANGES WAITING TO BE SAVED", LCD_DARKGRAY);
+    text(7, 210, "SELECT: OPEN   HOLD: DELETE   PLAY: SAVE", LCD_WHITE);
     text(7, 226, "WHEEL: BROWSE                         MENU: BACK",
          LCD_LIGHTGRAY);
 }
@@ -11012,7 +11089,7 @@ static void draw_index_status(void)
     int row;
 
     draw_blade_shell("INDEX STATUS", RBPREP_GREEN);
-    text(9, 30, library_fd >= 0 ? "DEVICE INDEX ONLINE" : "INDEX NOT FOUND",
+    text(9, 30, library_fd >= 0 ? "MUSIC LIBRARY READY" : "MUSIC LIBRARY NOT FOUND",
          library_fd >= 0 ? RBPREP_GREEN
                          : LCD_RGBPACK(255, 90, 70));
     for (row = 0; row < 4; row++) {
@@ -11023,7 +11100,7 @@ static void draw_index_status(void)
                                         : LCD_RGBPACK(45, 72, 55));
         rb->lcd_fillrect(8, y, 3, 20);
     }
-    text(17, 54, "TRACKS IN INDEX", LCD_RGBPACK(145, 165, 151));
+    text(17, 54, "TRACKS IN LIBRARY", LCD_RGBPACK(145, 165, 151));
     rb->snprintf(line, sizeof(line), "%lu",
                  (unsigned long)library_track_count);
     text(275, 54, line, LCD_WHITE);
@@ -11033,7 +11110,7 @@ static void draw_index_status(void)
     text(17, 104, "TOTAL PLAYS  (> 1 MIN)", LCD_RGBPACK(145, 165, 151));
     rb->snprintf(line, sizeof(line), "%d", total_plays);
     text(275, 104, line, LCD_WHITE);
-    text(17, 129, "TRACKS BURNED THIS UPTIME",
+    text(17, 129, "TRACKS SAVED THIS SESSION",
          LCD_RGBPACK(145, 165, 151));
     rb->snprintf(line, sizeof(line), "%d", uptime_tracks_burned);
     text(275, 129, line, LCD_WHITE);
@@ -11043,7 +11120,7 @@ static void draw_index_status(void)
     rb->snprintf(line, sizeof(line), "%lu PLAYLIST MEMBERS",
                  (unsigned long)library_member_count);
     text(9, 178, line, LCD_WHITE);
-    text(9, 204, "PLAYLIST CHANGES BURN LIVE", RBPREP_GREEN);
+    text(9, 204, "PLAYLIST CHANGES SAVE IMMEDIATELY", RBPREP_GREEN);
     text(7, 226, "MENU: BACK", LCD_LIGHTGRAY);
 }
 
@@ -11112,6 +11189,7 @@ static void begin_confirmation(enum rbprep_confirm_action action)
     confirm_choice = 1;
     confirm_wait_release = !!(rb->button_status() & BUTTON_SELECT);
     force_full_redraw = true;
+    context_change_serial++;
 }
 
 static void begin_track_load_confirmation(int index, int row,
@@ -11123,13 +11201,14 @@ static void begin_track_load_confirmation(int index, int row,
     deferred_track_return_mode = return_mode;
     deferred_track_force_reload = force_reload;
     rb->snprintf(confirm_message, sizeof(confirm_message),
-                 "CURRENT TRACK HAS CHANGES");
+                 "SAVE CHANGES BEFORE LOADING?");
     confirm_action = CONFIRM_TRACK_LOAD;
     confirm_active = true;
     confirm_choice = 0;
     confirm_ok = true;
     confirm_wait_release = !!(rb->button_status() & BUTTON_SELECT);
     force_full_redraw = true;
+    context_change_serial++;
 }
 
 static bool append_playlist_operation(unsigned char operation,
@@ -11269,16 +11348,33 @@ static bool append_playlist_journal(int node_index)
                                      playlist_id, 0, 1, name);
 }
 
-static void add_track_to_favorite(int slot)
+static void begin_favorite_confirmation(int slot)
 {
-    struct rbprep_node_record node;
-    char name[48];
     int node_index = slot >= 0 && slot < 2
                    ? favorite_playlist_nodes[slot] : -1;
 
     if (selected_track_id < 0 || node_index < 0 ||
-        !read_node_record(node_index, &node) ||
-        !read_index_string(node.name_offset, name, sizeof(name))) {
+        !favorite_playlist_names[slot][0]) {
+        rb->splash(HZ, slot ? "Favorite 2 is not set"
+                            : "Favorite 1 is not set");
+        restore_black_canvas();
+        return;
+    }
+    rb->snprintf(confirm_message, sizeof(confirm_message),
+                 "ADD TO FAV%d %.22s?", slot + 1,
+                 favorite_playlist_names[slot]);
+    begin_confirmation(slot ? CONFIRM_FAVORITE_TWO
+                            : CONFIRM_FAVORITE_ONE);
+}
+
+static void perform_favorite_action(int slot)
+{
+    struct rbprep_node_record node;
+    int node_index = slot >= 0 && slot < 2
+                   ? favorite_playlist_nodes[slot] : -1;
+
+    if (selected_track_id < 0 || node_index < 0 ||
+        !read_node_record(node_index, &node)) {
         rb->splash(HZ, slot ? "Favorite 2 is not set"
                             : "Favorite 1 is not set");
         restore_black_canvas();
@@ -11292,10 +11388,16 @@ static void add_track_to_favorite(int slot)
         force_full_redraw = true;
         return;
     }
+    playlist_add_mode = false;
     confirm_playlist_node = node_index;
-    rb->snprintf(confirm_message, sizeof(confirm_message),
-                 "ADD TO %.28s?", name);
-    begin_confirmation(CONFIRM_ADD_PLAYLIST);
+    if (append_playlist_journal(confirm_playlist_node)) {
+        mode = MODE_DECK;
+        if (!burn_playlist_changes_now())
+            rb->splash(HZ * 2,
+                       "Playlist add saved; device burn failed");
+    } else {
+        rb->splash(HZ * 2, "Could not add track to favorite");
+    }
 }
 
 static uint32_t playlist_parent_source_id(int node_index)
@@ -11349,6 +11451,7 @@ static void finish_confirmation(bool apply)
 
     confirm_active = false;
     confirm_action = CONFIRM_NONE;
+    context_change_serial++;
     if (action == CONFIRM_TRACK_LOAD) {
         bool success;
         bool resume_on_failure = false;
@@ -11438,6 +11541,9 @@ static void finish_confirmation(bool apply)
         } else {
             rb->splash(HZ * 2, "Could not queue playlist add");
         }
+    } else if (action == CONFIRM_FAVORITE_ONE ||
+               action == CONFIRM_FAVORITE_TWO) {
+        perform_favorite_action(action == CONFIRM_FAVORITE_TWO ? 1 : 0);
     } else if (action == CONFIRM_PLAYLIST_SEED) {
         if (append_playlist_seed_operation(playlist_action_id,
                                            playlist_action_parent_id,
@@ -11448,7 +11554,7 @@ static void finish_confirmation(bool apply)
                 rb->splash(HZ * 2,
                            "Playlist seed saved; device burn failed");
             else
-                rb->splash(HZ, "Playlist created and track added");
+                rb->splash(HZ, "Playlist created; track added");
         } else {
             rb->splash(HZ * 2, "Could not create playlist seed");
         }
@@ -11466,7 +11572,7 @@ static void finish_confirmation(bool apply)
             rb->splash(HZ * 2, "Playlist order burn failed");
             restore_black_canvas();
         } else {
-            rb->splash(HZ, "Playlist order committed");
+            rb->splash(HZ, "Playlist order saved");
             restore_black_canvas();
         }
     } else if (action == CONFIRM_MACRO_CLEAR) {
@@ -11528,17 +11634,19 @@ static void draw_confirmation(void)
     const int y = confirm_action == CONFIRM_TRACK_LOAD ? 72 : 83;
     const int width = LCD_WIDTH - 50;
     const int height = confirm_action == CONFIRM_TRACK_LOAD ? 96 : 76;
+    char fitted[64];
 
     rb->lcd_set_foreground(LCD_RGBPACK(4, 4, 4));
     rb->lcd_fillrect(x, y, width, height);
     rb->lcd_set_foreground(LCD_RGBPACK(105, 115, 108));
     rb->lcd_drawrect(x, y, width, height);
     text(x + 10, y + 9, "CONFIRM", RBPREP_GREEN);
-    text(x + 10, y + 29, confirm_message, LCD_WHITE);
+    fit_text(fitted, sizeof(fitted), confirm_message, width - 20);
+    text(x + 10, y + 29, fitted, LCD_WHITE);
 
     if (confirm_action == CONFIRM_TRACK_LOAD) {
         static const char * const choices[] = {
-            "BURN & LOAD", "KEEP LOCAL", "STAY"
+                "SAVE & LOAD", "SAVE LATER", "STAY"
         };
         static const int widths[] = { 88, 88, 52 };
         int left = x + 8;
@@ -12187,10 +12295,13 @@ static bool service_seek_wheel_physics(void)
 
 static void beat_jump(int direction)
 {
-    int index = current_beat_index(playhead);
+    int index = nearest_beat_index(playhead);
     int target;
 
     if (imported_grid_resident() && index >= 0) {
+        /* Snap to the closest grid line before stepping.  Using the beat
+           behind the playhead made a backward first press skip two beats
+           whenever the cursor was just short of the next marker. */
         index = MAX(0, MIN(beat_count - 1, index + direction));
         target = adjusted_beat_time(index);
     } else {
@@ -12318,10 +12429,15 @@ static void draw_rbprep_keyboard(const char *title, const char *value,
     keyboard_key_name(next, neighbor, sizeof(neighbor));
     centered_text(LCD_WIDTH - 90, 82, 88, neighbor,
                   LCD_RGBPACK(72, 91, 79));
-    draw_blade_selection(104, 30, RBPREP_GREEN);
-    rb->lcd_set_foreground(LCD_RGBPACK(240, 100, 45));
+    /* Editors use a neutral high-contrast selection field.  It stays
+       readable even when the user's accent itself is saturated blue. */
+    rb->lcd_set_foreground(LCD_RGBPACK(12, 16, 14));
+    rb->lcd_fillrect(8, 104, LCD_WIDTH - 16, 31);
+    rb->lcd_set_foreground(LCD_WHITE);
+    rb->lcd_drawrect(8, 104, LCD_WIDTH - 16, 31);
+    rb->lcd_set_foreground(RBPREP_GREEN);
     xlcd_drawcircle(LCD_WIDTH / 2, 119, 17);
-    rb->lcd_set_foreground(LCD_RGBPACK(80, 180, 245));
+    rb->lcd_set_foreground(LCD_WHITE);
     xlcd_drawcircle(LCD_WIDTH / 2, 119, 14);
     keyboard_key_name(selected_key, active, sizeof(active));
     centered_text(7, LCD_WIDTH - 14, 113, active, LCD_WHITE);
@@ -12518,9 +12634,9 @@ static void choose_playlist_action(void)
             return;
         }
         slot = macro_link_for(node.source_id);
-        rb->splash(HZ, slot < 0 ? "Workflow link off" :
-                   slot == 0 ? "Workflow M1 linked" :
-                               "Workflow M2 linked");
+        rb->splash(HZ, slot < 0 ? "Workflow removed" :
+                   slot == 0 ? "Workflow 1 linked" :
+                               "Workflow 2 linked");
         restore_black_canvas();
     }
 }
@@ -12628,7 +12744,7 @@ static void activate_main_selection(int item)
         if (library_fd >= 0)
             open_loaded_track();
         else {
-            rb->splash(HZ * 2, "RBPrep index is offline");
+            rb->splash(HZ * 2, "Music library is unavailable");
             restore_black_canvas();
         }
     } else if (item == 4) {
@@ -12700,7 +12816,7 @@ static void short_select(void)
                          "ADD TO %.28s?", name);
             begin_confirmation(CONFIRM_ADD_PLAYLIST);
         } else if (index >= 0 && playlist_move_mode) {
-            rb->splash(HZ, "PLAY chooses this folder");
+            rb->splash(HZ, "Press PLAY to choose this folder");
             restore_black_canvas();
         } else if (index >= 0) {
             open_track_browser(index);
@@ -12728,7 +12844,7 @@ static void short_select(void)
                    active_playlist_record_valid &&
                    active_playlist_record.kind == 1) {
             rb->snprintf(confirm_message, sizeof(confirm_message),
-                         "COMMIT THIS PLAYLIST ORDER?");
+                         "SAVE THIS PLAYLIST ORDER?");
             begin_confirmation(CONFIRM_PLAYLIST_REORDER);
         }
     } else if (mode == MODE_TRACKS) {
@@ -12755,8 +12871,8 @@ static void short_select(void)
             rb->splash(HZ * 2, "USB arm failed; power only");
         } else {
             apply_usb_choice(choice);
-            rb->splash(HZ, choice == 2 ? "USB DAC armed" :
-                           choice == 1 ? "Data transfer armed" :
+            rb->splash(HZ, choice == 2 ? "USB audio is ready" :
+                           choice == 1 ? "File transfer is ready" :
                                          "USB power only");
         }
         restore_black_canvas();
@@ -12779,10 +12895,10 @@ static void short_select(void)
             key_notation = (key_notation + 1) %
                            ARRAYLEN(key_notation_styles);
         } else if (settings_selection == 5) {
-            rb->splash(HZ, "Track exit always asks");
+            rb->splash(HZ, "Ask before changing tracks");
             restore_black_canvas();
         } else if (settings_selection == 6) {
-            rb->splash(HZ, "Save & Load commits safely");
+            rb->splash(HZ, "Save before changing tracks");
             restore_black_canvas();
         } else if (settings_selection == 7) {
             click_sound = !click_sound;
@@ -12972,7 +13088,7 @@ static void short_select(void)
                              "DELETE CUE %02d?", cue_slot + 1);
                 begin_confirmation(CONFIRM_CUE_DELETE);
             } else {
-                rb->splashf(HZ, "CUE %02d IS EMPTY", cue_slot + 1);
+                rb->splash(HZ, "This cue is empty");
                 restore_black_canvas();
             }
         } else if (tool == TOOL_CUE_MOVE && hotcues[cue_slot] >= 0) {
@@ -13064,15 +13180,15 @@ static void short_select(void)
                 force_full_redraw = true;
             }
         } else if (tool == TOOL_FAVORITE_ONE) {
-            add_track_to_favorite(0);
+            begin_favorite_confirmation(0);
         } else if (tool == TOOL_FAVORITE_TWO) {
-            add_track_to_favorite(1);
+            begin_favorite_confirmation(1);
         } else if (tool == TOOL_BURN_SONG) {
             if (selected_track_id >= 0)
                 burn_loaded_track_now();
         } else if (tool == TOOL_BURN_ALL) {
             rb->snprintf(confirm_message, sizeof(confirm_message),
-                         "INSTANT BURN ALL?");
+                         "SAVE ALL CHANGES NOW?");
             begin_confirmation(CONFIRM_BURN_ALL_NOW);
         }
     } else if (mode == MODE_PNAV) {
@@ -13205,7 +13321,7 @@ static void long_select(void)
                              "DELETE CUE %02d?", cue_slot + 1);
                 begin_confirmation(CONFIRM_CUE_DELETE);
             } else {
-                rb->splashf(HZ, "CUE %02d IS EMPTY", cue_slot + 1);
+                rb->splash(HZ, "This cue is empty");
                 restore_black_canvas();
             }
         } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE) {
@@ -13882,7 +13998,7 @@ static void activate_macro(int slot)
 {
     if (slot < 0 || slot >= RBPREP_MACRO_COUNT ||
         tool_macros[slot].count <= 0) {
-        rb->splash(HZ, "Hold SELECT to program this workflow");
+        rb->splash(HZ, "Hold SELECT to set up this workflow");
         restore_black_canvas();
         return;
     }
@@ -14868,6 +14984,8 @@ enum plugin_status plugin_start(const void *parameter)
             redraw = true;
         if (service_playlist_playback())
             redraw = true;
+        if (mode != MODE_PLAYLISTS || confirm_active)
+            playlist_carousel_offset_fp = 0;
         if (!display_locked && mode < MODE_DECK) {
             if (service_playlist_carousel_motion())
                 redraw = true;
@@ -14897,20 +15015,11 @@ enum plugin_status plugin_start(const void *parameter)
                navigation. */
             presented_mode = mode;
             presented_context_serial = context_change_serial;
-        } else if (!confirm_active &&
-                   (mode != presented_mode ||
-                    context_change_serial != presented_context_serial)) {
-            /* Prep Deck pages are one continuous instrument surface. Switch
-               their tool ribbon immediately without hiding the waveform or
-               spending frames on ornamental transition art. */
-            if (presented_mode >= MODE_DECK && mode >= MODE_DECK) {
-                force_full_redraw = true;
-                redraw = true;
-            } else {
-                animate_context_transition(mode);
-                redraw = false;
-                frame_deadline = *rb->current_tick + 1;
-            }
+        } else if (mode != presented_mode ||
+                   context_change_serial != presented_context_serial) {
+            animate_context_transition(mode);
+            redraw = false;
+            frame_deadline = *rb->current_tick + 1;
             presented_mode = mode;
             presented_context_serial = context_change_serial;
         }
@@ -15145,7 +15254,7 @@ enum plugin_status plugin_start(const void *parameter)
                     if (playlist_order_dirty) {
                         rb->snprintf(confirm_message,
                                      sizeof(confirm_message),
-                                     "COMMIT THIS PLAYLIST ORDER?");
+                                     "SAVE THIS PLAYLIST ORDER?");
                         begin_confirmation(CONFIRM_PLAYLIST_REORDER);
                     } else {
                         playlist_reorder_editing = false;
@@ -15181,7 +15290,7 @@ enum plugin_status plugin_start(const void *parameter)
                 int changes = pending_snapshot_count + pending_playlist_count;
                 if (changes > 0) {
                     rb->snprintf(confirm_message, sizeof(confirm_message),
-                                 "BURN %d DEVICE CHANGE%s?", changes,
+                                 "SAVE %d CHANGE%s?", changes,
                                  changes == 1 ? "" : "S");
                     begin_confirmation(CONFIRM_BURN);
                 }
