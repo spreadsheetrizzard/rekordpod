@@ -63,6 +63,7 @@
 #define RBPREP_STATUS_TICKS MAX(1, HZ)
 #define RBPREP_CONFIG_VERSION 4
 #define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
+#define RBPREP_SCREENSHOT_DIR "/.rockbox/rbprep/screenshots"
 #define RBPREP_DEVICE_NAME_FILE "/.rockbox/rbprep/device-name.txt"
 #define RBPREP_USB_STATUS "/.rockbox/rbprep/usb-status.rbs"
 #define RBPREP_AUTOBOOT_OFF "/.rockbox/rbprep/autoboot.off"
@@ -101,7 +102,6 @@
 #define RBPREP_SPECTRUM_HISTORY 16
 #define RBPREP_PCM_FRAMES 1024
 #define RBPREP_PHRASE_CELLS 32
-#define RBPREP_PHRASE_BARS 8
 #define RBPREP_GREEN theme_accent
 #define RBPREP_GREEN_DIM theme_accent_dim
 #define RBPREP_MENU_TEXT LCD_RGBPACK(188, 205, 193)
@@ -111,6 +111,7 @@
 #define RBPREP_MAIN_DISSOLVE_STEPS 16
 #define RBPREP_CONTEXT_TRANSITION_TICKS MAX(1, HZ / 50)
 #define RBPREP_CONTEXT_TRANSITION_FRAMES 7
+#define RBPREP_SCREENSHOT_ROW_BYTES ((LCD_WIDTH * 3 + 3) & ~3)
 #define RBPREP_MAIN_SCREEN_X 101
 #define RBPREP_MAIN_SCREEN_Y 26
 #define RBPREP_MAIN_SCREEN_W 118
@@ -343,7 +344,6 @@ struct rbprep_phrase_cache {
     unsigned char cell_height[RBPREP_PHRASE_CELLS];
     unsigned char cell_valid[RBPREP_PHRASE_CELLS];
     unsigned char cell_downbeat[RBPREP_PHRASE_CELLS];
-    unsigned char section_high[RBPREP_PHRASE_BARS];
     bool imported;
     bool valid;
 };
@@ -456,7 +456,9 @@ static fb_data main_transition_thumbnail[RBPREP_RETURN_THUMB_W *
                                          RBPREP_RETURN_THUMB_H];
 static unsigned short main_transition_x_lut[LCD_WIDTH];
 static unsigned short main_transition_y_lut[LCD_HEIGHT];
+static unsigned char screenshot_row[RBPREP_SCREENSHOT_ROW_BYTES];
 static struct viewport *main_viewport;
+static bool screenshot_hold_fired;
 static bool transition_render_only;
 static bool transition_running;
 static enum rbprep_mode presented_mode;
@@ -1952,6 +1954,86 @@ static bool write_exact(int fd, const void *buffer, size_t size)
         size -= count;
     }
     return true;
+}
+
+static bool save_rekordpod_screenshot(void)
+{
+    unsigned char header[54];
+    char filename[MAX_PATH];
+    uint32_t image_size = RBPREP_SCREENSHOT_ROW_BYTES * LCD_HEIGHT;
+    int fd;
+    int y;
+    bool ok;
+
+    if (!main_viewport || !main_viewport->buffer)
+        return false;
+    rbprep_store_ensure_state_dir(rb);
+    if (!rb->dir_exists(RBPREP_SCREENSHOT_DIR) &&
+        rb->mkdir(RBPREP_SCREENSHOT_DIR) < 0 &&
+        !rb->dir_exists(RBPREP_SCREENSHOT_DIR))
+        return false;
+    rb->create_numbered_filename(filename, RBPREP_SCREENSHOT_DIR,
+                                 "rekordpod_", ".bmp", 4
+                                 IF_CNFN_NUM_(, NULL));
+
+    rb->memset(header, 0, sizeof(header));
+    header[0] = 'B';
+    header[1] = 'M';
+    write_u32(header + 2, sizeof(header) + image_size);
+    write_u32(header + 10, sizeof(header));
+    write_u32(header + 14, 40);
+    write_u32(header + 18, LCD_WIDTH);
+    write_u32(header + 22, LCD_HEIGHT);
+    write_u16(header + 26, 1);
+    write_u16(header + 28, 24);
+    write_u32(header + 34, image_size);
+    write_u32(header + 38, 3780);
+    write_u32(header + 42, 3780);
+
+    fd = rb->open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0)
+        return false;
+    ok = write_exact(fd, header, sizeof(header));
+    for (y = LCD_HEIGHT - 1; ok && y >= 0; y--) {
+        int x;
+
+        rb->memset(screenshot_row, 0, sizeof(screenshot_row));
+        for (x = 0; x < LCD_WIDTH; x++) {
+            fb_data pixel = *FBADDRBUF(main_viewport->buffer, x, y);
+
+            screenshot_row[x * 3] = FB_UNPACK_BLUE(pixel);
+            screenshot_row[x * 3 + 1] = FB_UNPACK_GREEN(pixel);
+            screenshot_row[x * 3 + 2] = FB_UNPACK_RED(pixel);
+        }
+        ok = write_exact(fd, screenshot_row, sizeof(screenshot_row));
+    }
+    if (rb->close(fd) < 0)
+        ok = false;
+    if (!ok)
+        rb->remove(filename);
+    return ok;
+}
+
+static bool handle_screenshot_hold(int button)
+{
+    if (button == BUTTON_PLAY) {
+        screenshot_hold_fired = false;
+        return false;
+    }
+    if (button == (BUTTON_PLAY | BUTTON_REPEAT)) {
+        if (!screenshot_hold_fired) {
+            screenshot_hold_fired = true;
+            rb->splash(HZ / 2, save_rekordpod_screenshot()
+                       ? "Screenshot saved" : "Screenshot failed");
+            restore_black_canvas();
+        }
+        return true;
+    }
+    if (button == (BUTTON_PLAY | BUTTON_REL) && screenshot_hold_fired) {
+        screenshot_hold_fired = false;
+        return true;
+    }
+    return false;
 }
 
 static uint32_t macro_checksum(const unsigned char *data, size_t size)
@@ -4695,17 +4777,9 @@ static bool phrase_map_cache_matches(int first, bool imported)
 static void rebuild_phrase_map_cache(int first, bool imported, int period,
                                      int base, int top, int bottom)
 {
-    unsigned short bar_energy[RBPREP_PHRASE_BARS];
-    unsigned char bar_samples[RBPREP_PHRASE_BARS];
-    int energy_total = 0;
-    int energy_bars = 0;
-    int energy_mean;
-    int threshold;
     int cell;
 
     rb->memset(&phrase_map_cache, 0, sizeof(phrase_map_cache));
-    rb->memset(bar_energy, 0, sizeof(bar_energy));
-    rb->memset(bar_samples, 0, sizeof(bar_samples));
     for (cell = 0; cell < RBPREP_PHRASE_CELLS; cell++) {
         int beat = first + cell;
         int start_time;
@@ -4715,7 +4789,6 @@ static void rebuild_phrase_map_cache(int first, bool imported, int period,
         int sample;
         int peak = 0;
         int peak_sample = 0;
-        int bar_index = cell / 4;
         bool valid = !imported || (beat >= 0 && beat < beat_count);
 
         if (!valid)
@@ -4757,41 +4830,6 @@ static void rebuild_phrase_map_cache(int first, bool imported, int period,
                           overview_waveform[peak_sample][2],
                           overview_waveform[peak_sample][3])
             : LCD_RGBPACK(24, 45, 34);
-        bar_energy[bar_index] += peak;
-        bar_samples[bar_index]++;
-    }
-
-    for (cell = 0; cell < RBPREP_PHRASE_BARS; cell++) {
-        if (bar_samples[cell]) {
-            bar_energy[cell] /= bar_samples[cell];
-            energy_total += bar_energy[cell];
-            energy_bars++;
-        }
-    }
-    energy_mean = energy_bars ? energy_total / energy_bars : 0;
-    threshold = MAX(10, energy_mean / 8);
-    for (cell = 0; cell < RBPREP_PHRASE_BARS; cell++) {
-        int energy = bar_energy[cell];
-
-        if (!bar_samples[cell])
-            phrase_map_cache.section_high[cell] = cell
-                ? phrase_map_cache.section_high[cell - 1] : 0;
-        else if (energy >= energy_mean + threshold)
-            phrase_map_cache.section_high[cell] = 1;
-        else if (energy <= MAX(0, energy_mean - threshold))
-            phrase_map_cache.section_high[cell] = 0;
-        else
-            phrase_map_cache.section_high[cell] = cell
-                ? phrase_map_cache.section_high[cell - 1]
-                : energy >= energy_mean;
-    }
-    for (cell = 1; cell + 1 < RBPREP_PHRASE_BARS; cell++) {
-        if (phrase_map_cache.section_high[cell - 1] ==
-                phrase_map_cache.section_high[cell + 1] &&
-            phrase_map_cache.section_high[cell] !=
-                phrase_map_cache.section_high[cell - 1])
-            phrase_map_cache.section_high[cell] =
-                phrase_map_cache.section_high[cell - 1];
     }
 
     phrase_map_cache.first_beat = first;
@@ -4811,9 +4849,7 @@ static void draw_phrase_map(void)
     const int left = 5;
     const int cell_width = 9;
     const int top = RBPREP_WAVE_TOP + 24;
-    const int bottom = RBPREP_WAVE_BOTTOM - 49;
-    const int section_high_y = RBPREP_WAVE_BOTTOM - 30;
-    const int section_low_y = RBPREP_WAVE_BOTTOM - 22;
+    const int bottom = RBPREP_WAVE_BOTTOM - 4;
     int frame_playhead = live_playhead_now();
     int period = beat_period_ms();
     int base = grid_phase_ms + grid_offset;
@@ -4850,7 +4886,7 @@ static void draw_phrase_map(void)
 
         if (!phrase_map_cache.cell_valid[cell]) {
             rb->lcd_set_foreground(LCD_RGBPACK(13, 22, 17));
-            rb->lcd_fillrect(x, bottom - 3, cell_width - 2, 4);
+            rb->lcd_hline(x, x + cell_width - 3, bottom);
             continue;
         }
         rb->lcd_set_foreground(phrase_map_cache.cell_color[cell]);
@@ -4876,25 +4912,6 @@ static void draw_phrase_map(void)
         rb->lcd_set_foreground(LCD_WHITE);
         cursor = MAX(x, MIN(x + cell_width - 3, cursor));
         rb->lcd_vline(cursor, top, bottom);
-    }
-
-    for (cell = 0; cell < RBPREP_PHRASE_BARS; cell++) {
-        int x1 = left + cell * 4 * cell_width;
-        int x2 = x1 + 4 * cell_width - 3;
-        int y = phrase_map_cache.section_high[cell]
-              ? section_high_y : section_low_y;
-
-        rb->lcd_set_foreground(phrase_map_cache.section_high[cell]
-                               ? RBPREP_GREEN : theme_accent_dim);
-        rb->lcd_hline(x1, x2, y);
-        rb->lcd_hline(x1, x2, y + 1);
-        if (cell && phrase_map_cache.section_high[cell] !=
-                    phrase_map_cache.section_high[cell - 1]) {
-            int previous_y = phrase_map_cache.section_high[cell - 1]
-                           ? section_high_y : section_low_y;
-
-            rb->lcd_vline(x1, MIN(y, previous_y), MAX(y, previous_y) + 1);
-        }
     }
 
     /* Cue values can change independently of the cached waveform geometry. */
@@ -12557,6 +12574,7 @@ static bool rbprep_keyboard(char *value, size_t size, const char *title)
     int character_count = sizeof(characters) - 1;
     int key_count = character_count + 3;
     int selected_key = 0;
+    bool play_pressed = false;
 
     while (true) {
         int button;
@@ -12565,6 +12583,19 @@ static bool rbprep_keyboard(char *value, size_t size, const char *title)
 
         draw_rbprep_keyboard(title, value, selected_key);
         button = rb->button_get(true);
+        if (handle_screenshot_hold(button)) {
+            play_pressed = false;
+            continue;
+        }
+        if (button == BUTTON_PLAY) {
+            play_pressed = true;
+            continue;
+        }
+        if (button == (BUTTON_PLAY | BUTTON_REL)) {
+            if (play_pressed)
+                return true;
+            continue;
+        }
         if (button & BUTTON_REL)
             continue;
         base = button & ~BUTTON_REPEAT;
@@ -12580,8 +12611,6 @@ static bool rbprep_keyboard(char *value, size_t size, const char *title)
                 value[length] = ' ';
                 value[length + 1] = '\0';
             }
-        } else if (base == BUTTON_PLAY) {
-            return true;
         } else if (base == BUTTON_MENU) {
             return false;
         } else if (base == BUTTON_SELECT && !(button & BUTTON_REPEAT)) {
@@ -14834,6 +14863,8 @@ enum plugin_status plugin_start(const void *parameter)
     void *beat_workspace;
     void *index_workspace;
 
+    rb->lcd_set_viewport(NULL);
+    main_viewport = rb->lcd_set_viewport(NULL);
     rbprep_caps_detect(&capabilities, rb);
     rbprep_wave_init(&wave_reader, rb, capabilities.workspace,
                      capabilities.waveform_cache_bytes,
@@ -14965,6 +14996,7 @@ enum plugin_status plugin_start(const void *parameter)
     seek_portal_active = false;
     menu_button_down = false;
     menu_hold_fired = false;
+    screenshot_hold_fired = false;
     force_full_redraw = true;
     selected_title[0] = selected_artist[0] = selected_genre[0] = '\0';
     selected_key[0] = selected_extension[0] = '\0';
@@ -15161,6 +15193,11 @@ enum plugin_status plugin_start(const void *parameter)
         button = rb->button_get_w_tmo(display_locked ? MAX(1, HZ / 20) : 1);
         if (button != BUTTON_NONE)
             redraw = true;
+        if (handle_screenshot_hold(button)) {
+            pressed = BUTTON_NONE;
+            force_full_redraw = true;
+            continue;
+        }
         if (select_click_pending && button != BUTTON_NONE &&
             button != BUTTON_SELECT) {
             /* Keep a single click attached to the tool on which it began.
