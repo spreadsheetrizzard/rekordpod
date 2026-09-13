@@ -98,19 +98,12 @@
 #define RBPREP_TOOL_PAGE_MAX 5
 #define RBPREP_SELECT_DOUBLE_TICKS MAX(1, HZ * 3 / 10)
 #define RBPREP_SETTINGS_LAST 13
-#define RBPREP_MAIN_TRANSITION_FRAMES 20
-#define RBPREP_MAIN_TRANSITION_FRAME_TICKS MAX(1, HZ / 50)
+#define RBPREP_MAIN_DISSOLVE_STEPS 16
+#define RBPREP_MAIN_TRANSITION_FRAME_TICKS MAX(1, HZ / 30)
 #define RBPREP_MAIN_SCREEN_X 101
 #define RBPREP_MAIN_SCREEN_Y 26
 #define RBPREP_MAIN_SCREEN_W 118
 #define RBPREP_MAIN_SCREEN_H 55
-#define RBPREP_MAIN_APERTURE_H RBPREP_MAIN_SCREEN_H
-#define RBPREP_MAIN_APERTURE_W \
-    (RBPREP_MAIN_APERTURE_H * LCD_WIDTH / LCD_HEIGHT)
-#define RBPREP_MAIN_APERTURE_X \
-    (RBPREP_MAIN_SCREEN_X + \
-     (RBPREP_MAIN_SCREEN_W - RBPREP_MAIN_APERTURE_W) / 2)
-#define RBPREP_MAIN_APERTURE_Y RBPREP_MAIN_SCREEN_Y
 #define RBPREP_RETURN_THUMB_W 160
 #define RBPREP_RETURN_THUMB_H 120
 #define RBPREP_HIGH_RES_WINDOW_WIDTH 112
@@ -400,6 +393,7 @@ static fb_data main_transition_thumbnail[RBPREP_RETURN_THUMB_W *
 static unsigned short main_transition_x_lut[LCD_WIDTH];
 static unsigned short main_transition_y_lut[LCD_HEIGHT];
 static struct viewport *main_viewport;
+static bool transition_render_only;
 static int activity_ticker_progress;
 static long activity_ticker_until;
 static long activity_ticker_last_update;
@@ -723,6 +717,7 @@ static void save_macro_value(void);
 static void delete_macro_step(int slot, int position);
 static void clear_macro(int slot);
 static bool handle_usb_system_event(int button);
+static void draw_screen(void);
 static bool save_rbprep_config(void);
 static bool save_tool_macros(void);
 static bool persist_usb_arm_state(void);
@@ -9518,61 +9513,79 @@ static void capture_main_transition_thumbnail(void)
     }
 }
 
-static int main_transition_ease(int frame)
+static void clear_transition_ticker(void)
 {
-    int t = frame * 1024 / RBPREP_MAIN_TRANSITION_FRAMES;
-
-    return (long long)t * t * (3072 - 2 * t) / (1024 * 1024);
+    activity_ticker_until = 0;
+    activity_ticker_last_update = 0;
+    activity_ticker_burst = 0;
 }
 
-static void draw_main_launch_transition_frame(int eased)
+static void draw_main_dissolve_mask(int reveal)
 {
-    int target_x = RBPREP_MAIN_APERTURE_X *
-                   RBPREP_RETURN_THUMB_W / LCD_WIDTH;
-    int target_y = RBPREP_MAIN_APERTURE_Y *
-                   RBPREP_RETURN_THUMB_H / LCD_HEIGHT;
-    int target_width = MAX(1, RBPREP_MAIN_APERTURE_W *
-                           RBPREP_RETURN_THUMB_W / LCD_WIDTH);
-    int target_height = MAX(1, RBPREP_MAIN_APERTURE_H *
-                            RBPREP_RETURN_THUMB_H / LCD_HEIGHT);
-    int source_x = target_x * eased / 1024;
-    int source_y = target_y * eased / 1024;
-    int source_width = RBPREP_RETURN_THUMB_W -
-                       (RBPREP_RETURN_THUMB_W - target_width) *
-                       eased / 1024;
-    int source_height = RBPREP_RETURN_THUMB_H -
-                        (RBPREP_RETURN_THUMB_H - target_height) *
-                        eased / 1024;
+    /* This is the original menu fade pattern. On a display without alpha,
+       the ordered 4x4 threshold matrix produces a crisp, deterministic
+       dissolve without per-pixel color arithmetic or another framebuffer. */
+    static const unsigned char bayer[4][4] = {
+        { 0,  8,  2, 10 }, { 12, 4, 14, 6 },
+        { 3, 11,  1,  9 }, { 15, 7, 13, 5 }
+    };
+    int x;
+    int y;
 
-    rb->lcd_clear_display();
-    if (main_transition_thumbnail_valid)
-        draw_scaled_transition_thumbnail(0, 0, LCD_WIDTH, LCD_HEIGHT,
-                                         source_x, source_y,
-                                         source_width, source_height);
-    rb->lcd_set_foreground(LCD_RGBPACK(150, 155, 152));
-    rb->lcd_drawrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
+    reveal = MAX(0, MIN(RBPREP_MAIN_DISSOLVE_STEPS, reveal));
+    rb->lcd_set_foreground(LCD_BLACK);
+    for (y = 0; y < LCD_HEIGHT; y++)
+        for (x = 0; x < LCD_WIDTH; x++)
+            if (bayer[y & 3][x & 3] >= reveal)
+                rb->lcd_drawpixel(x, y);
 }
 
-static void draw_main_return_transition_frame(int eased)
+static void animate_main_dissolve(bool reveal)
 {
-    int x = RBPREP_MAIN_APERTURE_X * eased / 1024;
-    int y = RBPREP_MAIN_APERTURE_Y * eased / 1024;
-    int width = LCD_WIDTH - (LCD_WIDTH - RBPREP_MAIN_APERTURE_W) *
-                eased / 1024;
-    int height = LCD_HEIGHT - (LCD_HEIGHT - RBPREP_MAIN_APERTURE_H) *
-                 eased / 1024;
-    int source_height = MAX(1, RBPREP_RETURN_THUMB_W * height / width);
-    int source_y;
+    int frame;
 
-    source_height = MIN(RBPREP_RETURN_THUMB_H, source_height);
-    source_y = (RBPREP_RETURN_THUMB_H - source_height) / 2;
-    if (main_transition_thumbnail_valid)
-        draw_scaled_transition_thumbnail(x, y, width, height,
-                                         0, source_y,
-                                         RBPREP_RETURN_THUMB_W,
-                                         source_height);
-    rb->lcd_set_foreground(LCD_RGBPACK(150, 155, 152));
-    rb->lcd_drawrect(x, y, width, height);
+    for (frame = 0; frame <= RBPREP_MAIN_DISSOLVE_STEPS; frame++) {
+        int amount = reveal ? frame :
+                     RBPREP_MAIN_DISSOLVE_STEPS - frame;
+
+        /* Fade-out is monotonic, so preserve the exact live framebuffer and
+           add black pixels to it. Fade-in must restore newly revealed pixels
+           each step, so it redraws from the captured destination image. */
+        if (reveal) {
+            rb->lcd_clear_display();
+            if (main_transition_thumbnail_valid)
+                draw_scaled_transition_thumbnail(
+                    0, 0, LCD_WIDTH, LCD_HEIGHT, 0, 0,
+                    RBPREP_RETURN_THUMB_W, RBPREP_RETURN_THUMB_H);
+        }
+        draw_main_dissolve_mask(amount);
+        rb->lcd_update();
+        if (frame < RBPREP_MAIN_DISSOLVE_STEPS)
+            rb->sleep(RBPREP_MAIN_TRANSITION_FRAME_TICKS);
+    }
+}
+
+static void capture_transition_destination(void)
+{
+    /* Render the new mode into the framebuffer without submitting it first;
+       the dissolve owns the first visible presentation of that screen. */
+    clear_transition_ticker();
+    transition_render_only = true;
+    force_full_redraw = true;
+    draw_screen();
+    transition_render_only = false;
+    capture_main_transition_thumbnail();
+    force_full_redraw = true;
+}
+
+static void present_transition_destination(void)
+{
+    /* Replace the half-resolution dissolve source with the native render in
+       the same turn, so the final phase cannot linger as a softened frame. */
+    main_transition_thumbnail_valid = false;
+    transition_render_only = false;
+    force_full_redraw = true;
+    draw_screen();
 }
 
 static void draw_main_menu(void)
@@ -9591,38 +9604,17 @@ static void draw_main_menu(void)
 
 static void animate_main_launch_transition(void)
 {
-    int frame;
-
-    activity_ticker_until = 0;
-    activity_ticker_last_update = 0;
-    activity_ticker_burst = 0;
-    capture_main_transition_thumbnail();
-    for (frame = 0; frame <= RBPREP_MAIN_TRANSITION_FRAMES; frame++) {
-        draw_main_launch_transition_frame(main_transition_ease(frame));
-        rb->lcd_update();
-        if (frame < RBPREP_MAIN_TRANSITION_FRAMES)
-            rb->sleep(RBPREP_MAIN_TRANSITION_FRAME_TICKS);
-    }
-    main_transition_thumbnail_valid = false;
+    clear_transition_ticker();
+    animate_main_dissolve(false);
 }
 
 static void animate_main_return_transition(void)
 {
-    int frame;
-
-    activity_ticker_until = 0;
-    activity_ticker_last_update = 0;
-    activity_ticker_burst = 0;
-    for (frame = 0; frame <= RBPREP_MAIN_TRANSITION_FRAMES; frame++) {
-        rb->lcd_clear_display();
-        draw_main_menu();
-        draw_status_bar();
-        draw_main_return_transition_frame(main_transition_ease(frame));
-        rb->lcd_update();
-        if (frame < RBPREP_MAIN_TRANSITION_FRAMES)
-            rb->sleep(RBPREP_MAIN_TRANSITION_FRAME_TICKS);
-    }
-    main_transition_thumbnail_valid = false;
+    clear_transition_ticker();
+    animate_main_dissolve(false);
+    capture_transition_destination();
+    animate_main_dissolve(true);
+    present_transition_destination();
 }
 
 static void draw_pending_edits(void)
@@ -10269,7 +10261,8 @@ static void draw_screen(void)
         if (confirm_active)
             draw_confirmation();
         draw_status_bar();
-        rb->lcd_update();
+        if (!transition_render_only)
+            rb->lcd_update();
         force_full_redraw = false;
         return;
     }
@@ -10312,7 +10305,8 @@ static void draw_screen(void)
         draw_confirmation();
 
     if (force_full_redraw) {
-        rb->lcd_update();
+        if (!transition_render_only)
+            rb->lcd_update();
         force_full_redraw = false;
         overview_dirty = false;
         overview_deadline = now + RBPREP_OVERVIEW_TICKS;
@@ -10328,11 +10322,14 @@ static void draw_screen(void)
            on that buffer and visibly shear adjacent HUD regions. Submit one
            coalesced transfer per animation frame; occasionally refresh the
            complete static HUD in that same transfer. */
-        if (full_frame_update)
-            rb->lcd_update();
-        else
-            rb->lcd_update_rect(0, RBPREP_TOOL_TOP, LCD_WIDTH,
-                                RBPREP_WAVE_BOTTOM - RBPREP_TOOL_TOP + 1);
+        if (!transition_render_only) {
+            if (full_frame_update)
+                rb->lcd_update();
+            else
+                rb->lcd_update_rect(0, RBPREP_TOOL_TOP, LCD_WIDTH,
+                                    RBPREP_WAVE_BOTTOM -
+                                    RBPREP_TOOL_TOP + 1);
+        }
     }
 }
 
@@ -11284,7 +11281,9 @@ static void begin_main_launch(int item)
     item = MAX(0, MIN((int)ARRAYLEN(main_menu_items) - 1, item));
     animate_main_launch_transition();
     activate_main_selection(item);
-    force_full_redraw = true;
+    capture_transition_destination();
+    animate_main_dissolve(true);
+    present_transition_destination();
 }
 
 static void short_select(void)
@@ -12696,8 +12695,6 @@ static void handle_escape_once(void)
         return;
     }
 
-    if (old_mode != MODE_LIBRARY)
-        capture_main_transition_thumbnail();
     discard_staged_edit();
     stop_editor_audio();
     if (mode == MODE_LIBRARY) {
@@ -13277,6 +13274,7 @@ enum plugin_status plugin_start(const void *parameter)
     main_wheel_motion_tick = *rb->current_tick;
     main_name_scroll_deadline = *rb->current_tick;
     main_transition_thumbnail_valid = false;
+    transition_render_only = false;
     activity_ticker_progress = 0;
     activity_ticker_until = 0;
     activity_ticker_last_update = 0;
