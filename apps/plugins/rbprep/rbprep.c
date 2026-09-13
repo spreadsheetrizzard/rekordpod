@@ -176,7 +176,6 @@ enum rbprep_transition_style {
     TRANSITION_FILTER,
     TRANSITION_MACRO,
     TRANSITION_DECK,
-    TRANSITION_DECK_PAGE,
     TRANSITION_HOMING
 };
 
@@ -10386,7 +10385,7 @@ static void draw_main_menu(void)
 }
 
 static enum rbprep_transition_style transition_style_for(
-    enum rbprep_mode old_mode, enum rbprep_mode new_mode)
+    enum rbprep_mode new_mode)
 {
     if (new_mode == MODE_LIBRARY)
         return TRANSITION_HOME;
@@ -10407,8 +10406,7 @@ static enum rbprep_transition_style transition_style_for(
         new_mode == MODE_MACRO_PICKER || new_mode == MODE_MACRO_VALUE)
         return TRANSITION_MACRO;
     if (new_mode >= MODE_DECK)
-        return old_mode >= MODE_DECK ? TRANSITION_DECK_PAGE
-                                     : TRANSITION_DECK;
+        return TRANSITION_DECK;
     return TRANSITION_HOMING;
 }
 
@@ -10451,7 +10449,7 @@ static void draw_context_transition_motif(enum rbprep_transition_style style,
        related, while the rigid destination geometry below gives each
        context a distinct physical metaphor. */
     draw_transition_homing_rings(progress, LCD_WIDTH / 2, LCD_HEIGHT / 2,
-                                 style == TRANSITION_DECK_PAGE ? 34 : 92);
+                                 92);
     rb->lcd_set_foreground(LCD_RGBPACK(5, 15, 12));
     for (i = 8; i < LCD_HEIGHT; i += 16)
         rb->lcd_hline(0, LCD_WIDTH - 1, i);
@@ -10573,8 +10571,7 @@ static void draw_context_transition_motif(enum rbprep_transition_style style,
             previous_x = x;
             previous_y = y;
         }
-    } else if (style == TRANSITION_DECK ||
-               style == TRANSITION_DECK_PAGE) {
+    } else if (style == TRANSITION_DECK) {
         int span = progress * (LCD_WIDTH / 2 - 10) / 1024;
 
         rb->lcd_set_foreground(theme_accent_dim);
@@ -10622,15 +10619,13 @@ static void draw_context_transition_motif(enum rbprep_transition_style style,
                          progress * (LCD_WIDTH - 3) / 1024), 1, 3, 4);
 }
 
-static void animate_context_transition(enum rbprep_mode old_mode,
-                                       enum rbprep_mode new_mode)
+static void animate_context_transition(enum rbprep_mode new_mode)
 {
     enum rbprep_transition_style style =
-        transition_style_for(old_mode, new_mode);
-    int motif_frames = style == TRANSITION_DECK_PAGE ? 3 :
-                       capabilities.device_class == RBPREP_DEVICE_CLASSIC
+        transition_style_for(new_mode);
+    int motif_frames = capabilities.device_class == RBPREP_DEVICE_CLASSIC
                        ? RBPREP_CONTEXT_TRANSITION_FRAMES : 5;
-    int dissolve_frames = style == TRANSITION_DECK_PAGE ? 2 : 4;
+    int dissolve_frames = 4;
     int frame;
 
     if (transition_running || display_locked)
@@ -14623,11 +14618,19 @@ enum plugin_status plugin_start(const void *parameter)
         } else if (!confirm_active &&
                    (mode != presented_mode ||
                     context_change_serial != presented_context_serial)) {
-            animate_context_transition(presented_mode, mode);
+            /* Prep Deck pages are one continuous instrument surface. Switch
+               their tool ribbon immediately without hiding the waveform or
+               spending frames on ornamental transition art. */
+            if (presented_mode >= MODE_DECK && mode >= MODE_DECK) {
+                force_full_redraw = true;
+                redraw = true;
+            } else {
+                animate_context_transition(mode);
+                redraw = false;
+                frame_deadline = *rb->current_tick + 1;
+            }
             presented_mode = mode;
             presented_context_serial = context_change_serial;
-            redraw = false;
-            frame_deadline = *rb->current_tick + 1;
         }
 
         /* Rendering never owns the input rate. Coalesce rapid wheel/chord
