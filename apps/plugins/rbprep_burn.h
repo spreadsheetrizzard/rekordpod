@@ -1147,7 +1147,7 @@ static bool pdb_patch_snapshot(struct rbprep_pdb *pdb,
 {
     uint32_t track_id = read_u32(snapshot + 8);
     uint32_t genre_id;
-    uint32_t key_id;
+    uint32_t key_id = 0;
     unsigned char raw[4];
     unsigned char current_color;
     unsigned char desired_color;
@@ -1183,11 +1183,9 @@ static bool pdb_patch_snapshot(struct rbprep_pdb *pdb,
     write_u32(raw, read_u32(snapshot + 24));
     if (!burn_write_at(pdb->fd, track->row + 0x38, raw, 4))
         return false;
-    if (genre_id) {
-        write_u32(raw, genre_id);
-        if (!burn_write_at(pdb->fd, track->row + 0x3c, raw, 4))
-            return false;
-    }
+    write_u32(raw, genre_id);
+    if (!burn_write_at(pdb->fd, track->row + 0x3c, raw, 4))
+        return false;
     write_u16(raw, read_u16(snapshot + 20));
     if (!burn_write_at(pdb->fd, track->row + 0x50, raw, 2))
         return false;
@@ -1198,7 +1196,26 @@ static bool pdb_patch_snapshot(struct rbprep_pdb *pdb,
     if (current_color != desired_color)
         raw[0] = desired_color;
     raw[1] = MIN(5, snapshot[16]);
-    return burn_write_at(pdb->fd, track->row + 0x58, raw, 2);
+    if (!burn_write_at(pdb->fd, track->row + 0x58, raw, 2))
+        return false;
+
+    /* Never report a successful metadata burn merely because every write()
+       returned its byte count. Re-read all edited fields from the working
+       PDB before it can enter the commit transaction. */
+    if (!burn_read_at(pdb->fd, track->row + 0x38, raw, 4) ||
+        read_u32(raw) != read_u32(snapshot + 24) ||
+        !burn_read_at(pdb->fd, track->row + 0x3c, raw, 4) ||
+        read_u32(raw) != genre_id ||
+        !burn_read_at(pdb->fd, track->row + 0x50, raw, 2) ||
+        read_u16(raw) != read_u16(snapshot + 20) ||
+        !burn_read_at(pdb->fd, track->row + 0x58, raw, 2) ||
+        raw[0] != desired_color || raw[1] != MIN(5, snapshot[16]))
+        return false;
+    if (read_u16(snapshot + 6) >= 2 &&
+        (!burn_read_at(pdb->fd, track->row + 0x20, raw, 4) ||
+         read_u32(raw) != key_id))
+        return false;
+    return true;
 }
 
 static bool pdb_playlist_exists(struct rbprep_pdb *pdb, uint32_t playlist,
@@ -1827,6 +1844,8 @@ static bool burn_rewrite_track_cues(uint32_t track_id,
         goto done;
 
     write_u16(header + 12, new_cue_count);
+    header[32] = MIN(5, snapshot[16]);
+    header[33] = normalize_track_color(snapshot[17]);
     rb->remove(temporary);
     output = rb->open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (output < 0 ||
@@ -3398,10 +3417,8 @@ static bool rbprep_burn_transaction(int target_track, bool playlist_only)
             if (!write_burn_offsets(edit_offset, playlist_size))
                 rb->splash(HZ, "Burned; pending marker failed");
         } else if (target_track >= 0) {
-            if (!delete_pending_edit((uint32_t)target_track))
-                rb->splash(HZ, "Burned; song journal cleanup failed");
-            if (!write_burn_offsets(edit_offset, playlist_offset))
-                rb->splash(HZ, "Burned; pending marker failed");
+            if (!commit_pending_edit((uint32_t)target_track))
+                rb->splash(HZ, "Burned; song checkpoint failed");
         } else if (!write_burn_offsets(edit_size, playlist_size))
             rb->splash(HZ, "Burned; pending marker failed");
     }

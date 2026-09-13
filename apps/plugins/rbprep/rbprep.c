@@ -6364,6 +6364,100 @@ static bool delete_pending_edit(uint32_t track_id)
     return true;
 }
 
+static bool commit_pending_edit(uint32_t track_id)
+{
+    const char *temporary = RBPREP_EDIT_JOURNAL ".rbprep-new";
+    const char *previous = RBPREP_EDIT_JOURNAL ".rbprep-prev";
+    unsigned char data[RBPREP_EDIT_RECORD_SIZE];
+    unsigned char latest[RBPREP_EDIT_RECORD_SIZE];
+    uint32_t edit_offset;
+    uint32_t playlist_offset;
+    uint32_t committed_size = 0;
+    off_t size;
+    off_t position;
+    int input = -1;
+    int output = -1;
+    bool found = false;
+    bool ok = false;
+
+    read_burn_offsets(&edit_offset, &playlist_offset);
+    input = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
+    if (input < 0)
+        return false;
+    size = rb->filesize(input);
+    if (size < 0 || (uint32_t)size < edit_offset ||
+        edit_offset % RBPREP_EDIT_RECORD_SIZE ||
+        size % RBPREP_EDIT_RECORD_SIZE)
+        goto done;
+
+    /* Capture the exact snapshot that the just-completed transaction used.
+       Older committed snapshots are retained only for other tracks. */
+    if (rb->lseek(input, edit_offset, SEEK_SET) < 0)
+        goto done;
+    while (rb->read(input, data, sizeof(data)) == sizeof(data)) {
+        if (valid_edit_record(data) && read_u32(data + 8) == track_id) {
+            rb->memcpy(latest, data, sizeof(latest));
+            found = true;
+        }
+    }
+    if (!found)
+        goto done;
+
+    rb->remove(temporary);
+    output = rb->open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (output < 0 || rb->lseek(input, 0, SEEK_SET) < 0)
+        goto done;
+
+    position = 0;
+    while (position < (off_t)edit_offset &&
+           rb->read(input, data, sizeof(data)) == sizeof(data)) {
+        position += sizeof(data);
+        if (valid_edit_record(data) && read_u32(data + 8) == track_id)
+            continue;
+        if (rb->write(output, data, sizeof(data)) != sizeof(data))
+            goto done;
+        committed_size += sizeof(data);
+    }
+    if (position != (off_t)edit_offset ||
+        rb->write(output, latest, sizeof(latest)) != sizeof(latest))
+        goto done;
+    committed_size += sizeof(latest);
+
+    if (rb->lseek(input, edit_offset, SEEK_SET) < 0)
+        goto done;
+    while (rb->read(input, data, sizeof(data)) == sizeof(data)) {
+        if (valid_edit_record(data) && read_u32(data + 8) == track_id)
+            continue;
+        if (rb->write(output, data, sizeof(data)) != sizeof(data))
+            goto done;
+    }
+    ok = true;
+
+done:
+    if (input >= 0 && rb->close(input) < 0)
+        ok = false;
+    if (output >= 0 && rb->close(output) < 0)
+        ok = false;
+    if (!ok) {
+        rb->remove(temporary);
+        return false;
+    }
+    rb->remove(previous);
+    if (rb->rename(RBPREP_EDIT_JOURNAL, previous) < 0)
+        return false;
+    if (rb->rename(temporary, RBPREP_EDIT_JOURNAL) < 0) {
+        rb->rename(previous, RBPREP_EDIT_JOURNAL);
+        return false;
+    }
+    if (!write_burn_offsets(committed_size, playlist_offset)) {
+        rb->remove(RBPREP_EDIT_JOURNAL);
+        rb->rename(previous, RBPREP_EDIT_JOURNAL);
+        return false;
+    }
+    rb->remove(previous);
+    return true;
+}
+
 static bool delete_pending_playlist(unsigned char operation,
                                     uint32_t track_id,
                                     uint32_t playlist_id)
