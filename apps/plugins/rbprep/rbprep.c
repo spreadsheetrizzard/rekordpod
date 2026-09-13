@@ -470,6 +470,7 @@ static int confirm_time;
 static int confirm_playlist_node;
 static int staged_tool = -1;
 static int staged_original;
+static int staged_cue_slot = -1;
 static char staged_original_key[24];
 static int pending_snapshot_count;
 static int pending_playlist_count;
@@ -3298,6 +3299,21 @@ static int cue_slot_for_delete(int preferred)
     if (preferred >= 0 && preferred < 16 && hotcues[preferred] >= 0)
         return preferred;
     return -1;
+}
+
+static void set_cue_focus_slot(int slot)
+{
+    /* HOTCUE has one authoritative slot focus. Every cue tool consumes this
+       value, so changing it in SLOT or DELETE immediately carries through to
+       MOVE and COLOR as well (and vice versa for workflow defaults). */
+    cue_slot = MAX(0, MIN(15, slot));
+    overview_dirty = true;
+    force_full_redraw = true;
+}
+
+static void step_cue_focus_slot(int direction)
+{
+    set_cue_focus_slot((cue_slot + (direction > 0 ? 1 : 15)) & 15);
 }
 
 static int scrub_step_ms(void)
@@ -8510,6 +8526,18 @@ static void draw_tool_orbs(void)
                        i == selected ? LCD_BLACK
                                      : LCD_RGBPACK(195, 215, 201));
     }
+
+    if (mode == MODE_CUES) {
+        char focus[3];
+        int color = hotcues[cue_slot] >= 0
+                  ? cue_palette[hotcue_colors[cue_slot] & 7]
+                  : LCD_RGBPACK(58, 76, 64);
+
+        rb->snprintf(focus, sizeof(focus), "%02d", cue_slot + 1);
+        rb->lcd_set_foreground(color);
+        rb->lcd_drawrect(106, 66, 15, 14);
+        text(108, 69, focus, LCD_WHITE);
+    }
 }
 
 static void draw_tool_status(void)
@@ -8626,15 +8654,15 @@ static void draw_tool_status(void)
         rb->snprintf(line, sizeof(line), "QUANTIZE  %s",
                      quantize ? "ON" : "OFF");
     else if (tool == TOOL_CUE_SLOT) {
-        rb->snprintf(line, sizeof(line), "CUE SLOT %02d  %s", cue_slot + 1,
+        rb->snprintf(line, sizeof(line), "CUE %02d  SLOT %s", cue_slot + 1,
                      hotcues[cue_slot] >= 0 ? "SET" : "EMPTY");
     } else if (tool == TOOL_CUE_MOVE)
-        rb->snprintf(line, sizeof(line), "CUE MOVE  %02d", cue_slot + 1);
+        rb->snprintf(line, sizeof(line), "CUE %02d  MOVE", cue_slot + 1);
     else if (tool == TOOL_CUE_COLOR)
-        rb->snprintf(line, sizeof(line), "CUE COLOR  %s",
+        rb->snprintf(line, sizeof(line), "CUE %02d  COLOR %s", cue_slot + 1,
                      cue_color_names[hotcue_colors[cue_slot] & 7]);
     else if (tool == TOOL_CUE_DELETE) {
-        rb->snprintf(line, sizeof(line), "CUE DELETE  %02d", cue_slot + 1);
+        rb->snprintf(line, sizeof(line), "CUE %02d  DELETE", cue_slot + 1);
         color = LCD_RGBPACK(255, 90, 70);
     } else if (tool == TOOL_LOOP_LENGTH)
         rb->snprintf(line, sizeof(line), "LOOP SIZE  %s BEAT%s",
@@ -9659,7 +9687,8 @@ static void draw_index_status(void)
 static void discard_staged_edit(void)
 {
     if (staged_tool == TOOL_CUE_COLOR) {
-        hotcue_colors[cue_slot] = staged_original;
+        if (staged_cue_slot >= 0 && staged_cue_slot < 16)
+            hotcue_colors[staged_cue_slot] = staged_original;
         overview_dirty = true;
     } else if (staged_tool == TOOL_GRID_NUDGE) {
         grid_offset = staged_original;
@@ -9678,19 +9707,22 @@ static void discard_staged_edit(void)
                     sizeof(selected_key));
     }
     staged_tool = -1;
+    staged_cue_slot = -1;
 }
 
 static void stage_active_edit(void)
 {
     enum rbprep_tool tool = active_tool();
 
-    if (staged_tool == tool)
+    if (staged_tool == tool &&
+        (tool != TOOL_CUE_COLOR || staged_cue_slot == cue_slot))
         return;
     discard_staged_edit();
     staged_tool = tool;
-    if (tool == TOOL_CUE_COLOR)
+    if (tool == TOOL_CUE_COLOR) {
+        staged_cue_slot = cue_slot;
         staged_original = hotcue_colors[cue_slot];
-    else if (tool == TOOL_GRID_NUDGE)
+    } else if (tool == TOOL_GRID_NUDGE)
         staged_original = grid_offset;
     else if (tool == TOOL_GRID_BPM)
         staged_original = grid_bpm_x100;
@@ -9989,7 +10021,7 @@ static void finish_confirmation(bool apply)
         save_snapshot = true;
     } else if (action == CONFIRM_CUE_DELETE) {
         hotcues[confirm_slot] = -1;
-        cue_slot = confirm_slot;
+        set_cue_focus_slot(confirm_slot);
         overview_dirty = true;
         save_snapshot = true;
     } else if (action == CONFIRM_GRID_ORIGIN) {
@@ -9997,6 +10029,7 @@ static void finish_confirmation(bool apply)
         save_snapshot = true;
     } else if (action == CONFIRM_KEEP_EDIT) {
         staged_tool = -1;
+        staged_cue_slot = -1;
         save_snapshot = true;
     } else if (action == CONFIRM_ADD_PLAYLIST) {
         if (append_playlist_journal(confirm_playlist_node)) {
@@ -11473,7 +11506,7 @@ static void short_select(void)
                 auto_burn_pending_changes();
             }
             do {
-                cue_slot = (cue_slot + 1) & 15;
+                step_cue_focus_slot(1);
             } while (cue_slot != start_slot && hotcues[cue_slot] >= 0);
         } else if (tool == TOOL_CUE_DELETE) {
             if (cue_slot_for_delete(cue_slot) >= 0) {
@@ -11709,7 +11742,7 @@ static void long_select(void)
         if (tool == TOOL_CUE_DELETE) {
             int delete_slot = cue_slot_for_delete(cue_slot);
             if (delete_slot >= 0) {
-                cue_slot = delete_slot;
+                set_cue_focus_slot(delete_slot);
                 confirm_slot = cue_slot;
                 rb->snprintf(confirm_message, sizeof(confirm_message),
                              "DELETE CUE %02d?", cue_slot + 1);
@@ -11891,7 +11924,7 @@ static void adjust_active_tool(int direction)
         overview_dirty = true;
     }
     else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_DELETE)
-        cue_slot = (cue_slot + (direction > 0 ? 1 : 15)) & 15;
+        step_cue_focus_slot(direction);
     else if (tool == TOOL_CUE_COLOR) {
         stage_active_edit();
         hotcue_colors[cue_slot] =
@@ -12372,7 +12405,7 @@ static void apply_macro_step(const struct rbprep_macro_step *step)
         quantize = !!value;
     } else if (tool == TOOL_CUE_SLOT || tool == TOOL_CUE_MOVE ||
                tool == TOOL_CUE_COLOR || tool == TOOL_CUE_DELETE) {
-        cue_slot = MAX(0, MIN(15, value));
+        set_cue_focus_slot(value);
     } else if (tool == TOOL_LOOP_LENGTH) {
         loop_length_index = MAX(0,
             MIN((int)ARRAYLEN(loop_length_names) - 1, value));
@@ -13209,6 +13242,7 @@ enum plugin_status plugin_start(const void *parameter)
     confirm_active = false;
     exit_requested = false;
     staged_tool = -1;
+    staged_cue_slot = -1;
     cue_audition_active = false;
     cue_audition_latched = false;
     overview_playhead_white = true;
