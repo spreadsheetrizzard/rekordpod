@@ -99,6 +99,10 @@
 #define RBPREP_SELECT_DOUBLE_TICKS MAX(1, HZ * 3 / 10)
 #define RBPREP_SETTINGS_LAST 13
 #define RBPREP_MAIN_TRANSITION_TICKS MAX(1, HZ * 3 / 10)
+#define RBPREP_MAIN_SCREEN_X 101
+#define RBPREP_MAIN_SCREEN_Y 26
+#define RBPREP_MAIN_SCREEN_W 118
+#define RBPREP_MAIN_SCREEN_H 55
 #define RBPREP_RETURN_THUMB_W 80
 #define RBPREP_RETURN_THUMB_H 60
 #define RBPREP_HIGH_RES_WINDOW_WIDTH 112
@@ -383,9 +387,12 @@ static int main_wheel_touch_position;
 static long main_wheel_motion_tick;
 static long main_name_scroll_deadline;
 static bool main_launch_active;
+static bool main_launch_frame_seen;
 static int main_launch_item;
 static long main_launch_tick;
 static bool main_return_active;
+static bool main_return_frame_seen;
+static bool main_return_thumbnail_valid;
 static long main_return_tick;
 static fb_data main_return_thumbnail[RBPREP_RETURN_THUMB_W *
                                      RBPREP_RETURN_THUMB_H];
@@ -9086,58 +9093,242 @@ static const char * const main_menu_items[] = {
 static void draw_cdj_face_button(int x, int y, int width, int height,
                                  const char *label, int color, bool lit)
 {
-    rb->lcd_set_foreground(lit ? LCD_RGBPACK(32, 36, 33)
-                               : LCD_RGBPACK(15, 18, 16));
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(x - 1, y + 2, width + 2, height + 1);
+    rb->lcd_set_foreground(lit ? LCD_RGBPACK(42, 46, 43)
+                               : LCD_RGBPACK(20, 22, 21));
     rb->lcd_fillrect(x, y, width, height);
-    rb->lcd_set_foreground(lit ? color : LCD_RGBPACK(66, 72, 68));
+    rb->lcd_set_foreground(LCD_RGBPACK(125, 130, 127));
     rb->lcd_drawrect(x, y, width, height);
+    rb->lcd_set_foreground(LCD_RGBPACK(54, 58, 55));
+    rb->lcd_hline(x + 2, x + width - 3, y + height - 2);
+    rb->lcd_set_foreground(lit ? color : LCD_RGBPACK(56, 65, 59));
+    rb->lcd_drawrect(x + 2, y + 2, width - 4, height - 4);
     centered_text(x, width, y + MAX(1, (height - 8) / 2), label,
-                  lit ? LCD_WHITE : LCD_RGBPACK(126, 133, 129));
+                  lit ? LCD_WHITE : LCD_RGBPACK(154, 160, 156));
+}
+
+static void draw_cdj_round_button(int cx, int cy, int radius,
+                                  const char *label, int color, bool lit,
+                                  bool play_symbol)
+{
+    int line;
+
+    centered_text(cx - radius - 8, radius * 2 + 16,
+                  cy - radius - 10, label, LCD_RGBPACK(175, 180, 177));
+    rb->lcd_set_foreground(LCD_BLACK);
+    xlcd_fillcircle(cx + 1, cy + 2, radius + 2);
+    rb->lcd_set_foreground(LCD_RGBPACK(118, 123, 120));
+    xlcd_fillcircle(cx, cy, radius + 1);
+    rb->lcd_set_foreground(lit ? color : LCD_RGBPACK(42, 46, 43));
+    xlcd_fillcircle(cx, cy, radius);
+    rb->lcd_set_foreground(LCD_RGBPACK(12, 14, 13));
+    xlcd_fillcircle(cx, cy, MAX(2, radius - 3));
+    rb->lcd_set_foreground(lit ? LCD_WHITE : LCD_RGBPACK(158, 164, 160));
+    if (play_symbol) {
+        for (line = -4; line <= 4; line++)
+            rb->lcd_hline(cx - 2, cx + 3 - ABS(line), cy + line);
+    } else {
+        xlcd_fillcircle(cx, cy, MAX(1, radius / 4));
+        rb->lcd_hline(cx - radius / 2, cx + radius / 2, cy + radius / 2);
+    }
+}
+
+static void draw_cdj_hotcue_pad(int x, int y, const char *label,
+                                int color, bool lit)
+{
+    text(x, y + 1, label, lit ? LCD_WHITE : LCD_RGBPACK(128, 134, 130));
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(x + 9, y + 2, 29, 10);
+    rb->lcd_set_foreground(LCD_RGBPACK(100, 105, 102));
+    rb->lcd_drawrect(x + 9, y, 29, 11);
+    rb->lcd_set_foreground(lit ? color : LCD_RGBPACK(24, 27, 25));
+    rb->lcd_fillrect(x + 12, y + 3, 23, 5);
+    rb->lcd_set_foreground(color);
+    rb->lcd_hline(x + 12, x + 34, y + 9);
+}
+
+static void draw_cdj_encoder(int cx, int cy, bool lit)
+{
+    int color = lit ? theme_accent : LCD_RGBPACK(120, 126, 122);
+
+    centered_text(cx - 25, 50, cy - 22, "BROWSE", LCD_RGBPACK(170, 176, 172));
+    rb->lcd_set_foreground(LCD_BLACK);
+    xlcd_fillcircle(cx + 1, cy + 2, 14);
+    rb->lcd_set_foreground(LCD_RGBPACK(148, 153, 150));
+    xlcd_fillcircle(cx, cy, 13);
+    rb->lcd_set_foreground(LCD_RGBPACK(40, 43, 41));
+    xlcd_fillcircle(cx, cy, 10);
+    rb->lcd_set_foreground(color);
+    xlcd_drawcircle(cx, cy, 8);
+    rb->lcd_drawline(cx, cy - 7, cx + 2, cy - 4);
+    rb->lcd_set_foreground(LCD_RGBPACK(210, 214, 211));
+    xlcd_fillcircle(cx, cy, 3);
+}
+
+static void draw_cdj_tempo_fader(int glow)
+{
+    const int rail_x = 300;
+    const int rail_top = 124;
+    const int rail_bottom = 218;
+    const int slider_y = 169;
+
+    centered_text(274, 43, 106, "TEMPO", LCD_RGBPACK(174, 180, 176));
+    text(283, 120, "+", LCD_RGBPACK(132, 140, 135));
+    text(283, 165, "0", LCD_WHITE);
+    text(283, 211, "-", LCD_RGBPACK(132, 140, 135));
+    rb->lcd_set_foreground(LCD_RGBPACK(19, 21, 20));
+    rb->lcd_fillrect(293, rail_top - 3, 15, rail_bottom - rail_top + 7);
+    rb->lcd_set_foreground(LCD_RGBPACK(73, 78, 75));
+    rb->lcd_drawrect(293, rail_top - 3, 15, rail_bottom - rail_top + 7);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(rail_x - 1, rail_top, 3, rail_bottom - rail_top + 1);
+    rb->lcd_set_foreground(LCD_RGBPACK(95, 101, 97));
+    rb->lcd_vline(rail_x, rail_top, rail_bottom);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(289, slider_y - 3, 23, 9);
+    rb->lcd_set_foreground(glow == 6 ? theme_accent
+                                     : LCD_RGBPACK(142, 148, 144));
+    rb->lcd_fillrect(291, slider_y - 2, 19, 6);
+    rb->lcd_set_foreground(LCD_RGBPACK(42, 45, 43));
+    rb->lcd_hline(293, 308, slider_y + 1);
+    text(276, 225, "RESET", LCD_RGBPACK(115, 122, 117));
+}
+
+static void draw_main_cdj_controls(int glow)
+{
+    static const char * const top_labels[] = { "BROW", "TAG", "INFO", "MENU" };
+    static const char * const cue_labels[] = { "A", "B", "C", "D" };
+    static const int cue_colors[] = {
+        LCD_RGBPACK(255, 70, 62), LCD_RGBPACK(55, 225, 245),
+        LCD_RGBPACK(238, 215, 62), LCD_RGBPACK(75, 125, 255)
+    };
+    int index;
+
+    for (index = 0; index < 4; index++)
+        draw_cdj_face_button(82 + index * 40, 10, 37, 11,
+                             top_labels[index], theme_accent,
+                             glow == index * 2);
+
+    rb->lcd_set_foreground(LCD_RGBPACK(24, 27, 25));
+    rb->lcd_fillrect(5, 12, 46, 85);
+    rb->lcd_set_foreground(LCD_RGBPACK(70, 75, 72));
+    rb->lcd_drawrect(5, 12, 46, 85);
+    text(9, 16, "HOT CUE", LCD_RGBPACK(167, 173, 169));
+    for (index = 0; index < 4; index++)
+        draw_cdj_hotcue_pad(9, 29 + index * 16, cue_labels[index],
+                            cue_colors[index], glow == index * 2);
+
+    rb->lcd_set_foreground(LCD_RGBPACK(60, 65, 62));
+    rb->lcd_drawrect(228, 24, 42, 66);
+    draw_cdj_encoder(249, 49, glow == 1);
+    draw_cdj_face_button(234, 69, 31, 11, "BACK", LCD_WHITE, glow == 3);
+    rb->lcd_set_foreground(glow == 5 ? theme_accent
+                                     : LCD_RGBPACK(70, 76, 72));
+    xlcd_fillcircle(249, 85, 3);
+    text(255, 82, "Q", LCD_RGBPACK(146, 153, 149));
+
+    rb->lcd_set_foreground(LCD_RGBPACK(53, 58, 55));
+    rb->lcd_drawrect(56, 84, 47, 28);
+    draw_cdj_round_button(69, 104, 7, "IN", LCD_RGBPACK(255, 157, 42),
+                          glow == 0, false);
+    draw_cdj_round_button(91, 104, 7, "OUT", LCD_RGBPACK(255, 157, 42),
+                          glow == 1, false);
+
+    draw_cdj_round_button(30, 166, 13, "CUE", LCD_RGBPACK(255, 132, 26),
+                          glow == 2, false);
+    draw_cdj_round_button(30, 207, 14, "PLAY", theme_accent,
+                          glow == 4, true);
+    centered_text(51, 38, 126, "SEARCH", LCD_RGBPACK(142, 149, 144));
+    draw_cdj_round_button(60, 149, 5, "", LCD_WHITE, false, false);
+    draw_cdj_round_button(81, 149, 5, "", LCD_WHITE, false, false);
+    draw_cdj_round_button(60, 169, 5, "", LCD_WHITE, false, false);
+    draw_cdj_round_button(81, 169, 5, "", LCD_WHITE, false, false);
+
+    rb->lcd_set_foreground(glow == 7 ? theme_accent
+                                     : LCD_RGBPACK(75, 81, 77));
+    xlcd_fillcircle(298, 101, 3);
+    text(274, 96, "MASTER", LCD_RGBPACK(135, 142, 137));
+    draw_cdj_tempo_fader(glow);
+}
+
+static void format_main_screen_label(char *dest, size_t size,
+                                     const char *source, int visible,
+                                     bool animate)
+{
+    int length = rb->strlen(source);
+    int start = 0;
+    int index;
+
+    visible = MIN(visible, (int)size - 1);
+    if (length > visible && animate)
+        start = (*rb->current_tick / MAX(1, HZ / 5)) % (length + 3);
+    for (index = 0; index < visible; index++) {
+        int offset = start + index;
+
+        if (length <= visible)
+            dest[index] = index < length ? source[index] : ' ';
+        else if (!animate)
+            dest[index] = index < length ? source[index] : ' ';
+        else if (offset < length)
+            dest[index] = source[offset];
+        else if (offset < length + 3)
+            dest[index] = ' ';
+        else
+            dest[index] = source[offset - length - 3];
+    }
+    dest[visible] = '\0';
 }
 
 static void draw_main_cdj_screen(void)
 {
-    const int screen_x = 32;
-    const int screen_y = 16;
-    const int screen_w = 256;
-    const int screen_h = 84;
-    int top = MAX(0, MIN((int)ARRAYLEN(main_menu_items) - 5,
-                         selection - 2));
+    const int screen_x = RBPREP_MAIN_SCREEN_X;
+    const int screen_y = RBPREP_MAIN_SCREEN_Y;
+    const int screen_w = RBPREP_MAIN_SCREEN_W;
+    const int screen_h = RBPREP_MAIN_SCREEN_H;
+    int top = MAX(0, MIN((int)ARRAYLEN(main_menu_items) - 3,
+                         selection - 1));
     int row;
+    char counter[8];
 
-    rb->lcd_set_foreground(LCD_RGBPACK(34, 37, 35));
-    rb->lcd_fillrect(screen_x - 5, screen_y - 4,
-                     screen_w + 10, screen_h + 8);
-    rb->lcd_set_foreground(LCD_RGBPACK(105, 112, 108));
-    rb->lcd_drawrect(screen_x - 5, screen_y - 4,
-                     screen_w + 10, screen_h + 8);
+    rb->lcd_set_foreground(LCD_BLACK);
+    rb->lcd_fillrect(screen_x - 5, screen_y - 3,
+                     screen_w + 10, screen_h + 7);
+    rb->lcd_set_foreground(LCD_RGBPACK(108, 114, 110));
+    rb->lcd_drawrect(screen_x - 4, screen_y - 3,
+                     screen_w + 8, screen_h + 6);
+    rb->lcd_set_foreground(LCD_RGBPACK(35, 39, 36));
+    rb->lcd_drawrect(screen_x - 2, screen_y - 1,
+                     screen_w + 4, screen_h + 2);
     rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(screen_x, screen_y, screen_w, screen_h);
     rb->lcd_set_foreground(LCD_RGBPACK(20, 30, 24));
-    rb->lcd_fillrect(screen_x + 1, screen_y + 1, screen_w - 2, 12);
-    text(screen_x + 6, screen_y + 3, "BROWSE", LCD_WHITE);
-    text(screen_x + screen_w - 37, screen_y + 3, "MENU",
+    rb->lcd_fillrect(screen_x + 1, screen_y + 1, screen_w - 2, 10);
+    text(screen_x + 4, screen_y + 2, "BROWSE", LCD_WHITE);
+    rb->snprintf(counter, sizeof(counter), "%d/8", selection + 1);
+    text(screen_x + screen_w - 23, screen_y + 2, counter,
          LCD_RGBPACK(155, 168, 159));
-    for (row = 0; row < 5; row++) {
+    for (row = 0; row < 3; row++) {
         int item = top + row;
-        int y = screen_y + 15 + row * 13;
+        int y = screen_y + 12 + row * 14;
         bool selected_row = item == selection;
-        char fitted[38];
+        char fitted[16];
 
         if (selected_row) {
             rb->lcd_set_foreground(hsb_rgb(
                 accent_hue, MIN(100, accent_saturation + 10),
                 MAX(16, accent_brightness * 34 / 100)));
-            rb->lcd_fillrect(screen_x + 2, y - 1, screen_w - 4, 12);
+            rb->lcd_fillrect(screen_x + 2, y, screen_w - 4, 13);
             rb->lcd_set_foreground(theme_accent);
-            rb->lcd_fillrect(screen_x + 2, y - 1, 3, 12);
+            rb->lcd_fillrect(screen_x + 2, y, 2, 13);
         }
-        draw_main_glyph(screen_x + 14, y + 4, item, selected_row);
-        fit_text(fitted, sizeof(fitted), main_menu_items[item], screen_w - 42);
-        text(screen_x + 29, y, fitted,
+        draw_main_glyph(screen_x + 9, y + 6, item, selected_row);
+        format_main_screen_label(fitted, sizeof(fitted),
+                                 main_menu_items[item], 14, selected_row);
+        text(screen_x + 16, y + 2, fitted,
              selected_row ? LCD_WHITE : LCD_RGBPACK(146, 160, 151));
         if (selected_row)
-            text(screen_x + screen_w - 14, y, ">", theme_accent);
+            text(screen_x + screen_w - 8, y + 2, ">", theme_accent);
     }
     rb->lcd_set_foreground(theme_accent_dim);
     rb->lcd_drawrect(screen_x, screen_y, screen_w, screen_h);
@@ -9166,7 +9357,8 @@ static void draw_scaled_return_thumbnail(int x, int y, int width, int height)
 {
     int dy;
 
-    if (!main_viewport || width <= 0 || height <= 0)
+    if (!main_viewport || !main_return_thumbnail_valid ||
+        width <= 0 || height <= 0)
         return;
     for (dy = 0; dy < height; dy++) {
         int sy = dy * RBPREP_RETURN_THUMB_H / height;
@@ -9185,20 +9377,22 @@ static void capture_main_return_thumbnail(void)
 {
     int y;
 
-    if (!main_viewport)
-        return;
-    for (y = 0; y < RBPREP_RETURN_THUMB_H; y++) {
-        int sy = y * LCD_HEIGHT / RBPREP_RETURN_THUMB_H;
-        int x;
+    main_return_thumbnail_valid = main_viewport != NULL;
+    if (main_viewport) {
+        for (y = 0; y < RBPREP_RETURN_THUMB_H; y++) {
+            int sy = y * LCD_HEIGHT / RBPREP_RETURN_THUMB_H;
+            int x;
 
-        for (x = 0; x < RBPREP_RETURN_THUMB_W; x++) {
-            int sx = x * LCD_WIDTH / RBPREP_RETURN_THUMB_W;
+            for (x = 0; x < RBPREP_RETURN_THUMB_W; x++) {
+                int sx = x * LCD_WIDTH / RBPREP_RETURN_THUMB_W;
 
-            main_return_thumbnail[y * RBPREP_RETURN_THUMB_W + x] =
-                *FBADDRBUF(main_viewport->buffer, sx, sy);
+                main_return_thumbnail[y * RBPREP_RETURN_THUMB_W + x] =
+                    *FBADDRBUF(main_viewport->buffer, sx, sy);
+            }
         }
     }
     main_return_active = true;
+    main_return_frame_seen = false;
     main_return_tick = *rb->current_tick;
     activity_ticker_ping(0);
 }
@@ -9213,14 +9407,31 @@ static void draw_main_transition_overlay(void)
         int y;
         int width;
         int height;
+        int eased;
 
+        if (!main_return_frame_seen) {
+            /* Some exits persist settings or stop a transport before the main
+               menu gets a frame. Start the clock here so that work can never
+               consume the complete return animation before it is displayed. */
+            main_return_frame_seen = true;
+            main_return_tick = now;
+        }
         progress = MIN(1000, (int)((long long)(now - main_return_tick) *
                                    1000 / RBPREP_MAIN_TRANSITION_TICKS));
-        x = 32 * progress / 1000;
-        y = 16 * progress / 1000;
-        width = LCD_WIDTH - (LCD_WIDTH - 256) * progress / 1000;
-        height = LCD_HEIGHT - (LCD_HEIGHT - 84) * progress / 1000;
-        draw_scaled_return_thumbnail(x, y, width, height);
+        eased = (int)((long long)progress * progress *
+                      (3000 - progress * 2) / 1000000000LL);
+        x = RBPREP_MAIN_SCREEN_X * eased / 1000;
+        y = RBPREP_MAIN_SCREEN_Y * eased / 1000;
+        width = LCD_WIDTH - (LCD_WIDTH - RBPREP_MAIN_SCREEN_W) *
+                eased / 1000;
+        height = LCD_HEIGHT - (LCD_HEIGHT - RBPREP_MAIN_SCREEN_H) *
+                 eased / 1000;
+        if (main_return_thumbnail_valid)
+            draw_scaled_return_thumbnail(x, y, width, height);
+        else {
+            rb->lcd_set_foreground(LCD_BLACK);
+            rb->lcd_fillrect(x, y, width, height);
+        }
         rb->lcd_set_foreground(theme_accent);
         rb->lcd_drawrect(x, y, width, height);
         activity_ticker_ping(progress);
@@ -9229,13 +9440,22 @@ static void draw_main_transition_overlay(void)
         int y;
         int width;
         int height;
+        int eased;
 
+        if (!main_launch_frame_seen) {
+            main_launch_frame_seen = true;
+            main_launch_tick = now;
+        }
         progress = MIN(1000, (int)((long long)(now - main_launch_tick) *
                                    1000 / RBPREP_MAIN_TRANSITION_TICKS));
-        x = 32 * (1000 - progress) / 1000;
-        y = 16 * (1000 - progress) / 1000;
-        width = 256 + (LCD_WIDTH - 256) * progress / 1000;
-        height = 84 + (LCD_HEIGHT - 84) * progress / 1000;
+        eased = (int)((long long)progress * progress *
+                      (3000 - progress * 2) / 1000000000LL);
+        x = RBPREP_MAIN_SCREEN_X * (1000 - eased) / 1000;
+        y = RBPREP_MAIN_SCREEN_Y * (1000 - eased) / 1000;
+        width = RBPREP_MAIN_SCREEN_W +
+                (LCD_WIDTH - RBPREP_MAIN_SCREEN_W) * eased / 1000;
+        height = RBPREP_MAIN_SCREEN_H +
+                 (LCD_HEIGHT - RBPREP_MAIN_SCREEN_H) * eased / 1000;
         rb->lcd_set_foreground(LCD_BLACK);
         rb->lcd_fillrect(x, y, width, height);
         rb->lcd_set_foreground(theme_accent);
@@ -9255,20 +9475,10 @@ static void draw_main_menu(void)
     rb->lcd_set_foreground(LCD_RGBPACK(25, 28, 26));
     rb->lcd_drawrect(2, 9, LCD_WIDTH - 4, LCD_HEIGHT - 12);
     draw_main_cdj_screen();
+    draw_main_cdj_controls(glow);
+    /* The jog artwork is deliberately isolated from the CDJ face revision.
+       Its center, radius, touch marker and momentum rendering stay unchanged. */
     draw_main_menu_fx();
-    draw_cdj_face_button(9, 117, 39, 13, "LOOP", LCD_WHITE, glow == 0);
-    draw_cdj_face_button(9, 136, 39, 18, "CUE",
-                         LCD_RGBPACK(255, 145, 35), glow == 2);
-    draw_cdj_face_button(9, 160, 39, 18, "PLAY", theme_accent, glow == 4);
-    draw_cdj_face_button(272, 117, 38, 13, "BROWSE", LCD_WHITE, glow == 1);
-    draw_cdj_face_button(272, 136, 38, 13, "TAG", LCD_WHITE, glow == 3);
-    draw_cdj_face_button(272, 155, 38, 13, "INFO", LCD_WHITE, glow == 5);
-    draw_cdj_face_button(272, 174, 38, 13, "MENU", theme_accent, glow == 7);
-    rb->lcd_set_foreground(LCD_RGBPACK(60, 65, 62));
-    rb->lcd_vline(295, 196, 224);
-    rb->lcd_hline(290, 300, 210);
-    rb->lcd_set_foreground(theme_accent);
-    rb->lcd_fillrect(288, 207, 15, 5);
     draw_main_transition_overlay();
 }
 
@@ -10929,6 +11139,7 @@ static void begin_main_launch(int item)
                                       item));
     main_launch_tick = *rb->current_tick;
     main_launch_active = true;
+    main_launch_frame_seen = false;
     activity_ticker_ping(0);
     force_full_redraw = true;
 }
@@ -10937,13 +11148,14 @@ static void service_main_transitions(void)
 {
     long now = *rb->current_tick;
 
-    if (main_return_active &&
+    if (main_return_active && main_return_frame_seen &&
         !TIME_BEFORE(now, main_return_tick + RBPREP_MAIN_TRANSITION_TICKS)) {
         main_return_active = false;
+        main_return_thumbnail_valid = false;
         activity_ticker_ping(1000);
         force_full_redraw = true;
     }
-    if (main_launch_active &&
+    if (main_launch_active && main_launch_frame_seen &&
         !TIME_BEFORE(now, main_launch_tick + RBPREP_MAIN_TRANSITION_TICKS)) {
         int item = main_launch_item;
 
@@ -12942,7 +13154,10 @@ enum plugin_status plugin_start(const void *parameter)
     main_wheel_motion_tick = *rb->current_tick;
     main_name_scroll_deadline = *rb->current_tick;
     main_launch_active = false;
+    main_launch_frame_seen = false;
     main_return_active = false;
+    main_return_frame_seen = false;
+    main_return_thumbnail_valid = false;
     activity_ticker_progress = 0;
     activity_ticker_until = 0;
     activity_ticker_last_update = 0;
