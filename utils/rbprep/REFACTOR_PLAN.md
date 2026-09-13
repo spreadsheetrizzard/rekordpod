@@ -1,6 +1,6 @@
 # Rekordpod Stability and Performance Refactor
 
-Status: public-beta implementation baseline, 2026-09-11
+Status: public-beta release-candidate implementation, 2026-09-13
 
 Public Beta 1 deliberately refines the original memory rule below: the iPod
 Video keeps a bounded raw window plus a resident coarse peak pyramid, while
@@ -84,8 +84,9 @@ overrun the plugin region.
 ### Conservative profile: iPod Video 5G/5.5G
 
 - PP5022 performance ceiling respected.
-- Total plugin image and working state kept below 400 KiB, leaving at least
-  112 KiB of link/runtime safety margin.
+- Linked plugin image and static working state kept below 464 KiB, leaving at
+  least 48 KiB inside the 512 KiB plugin region. Exact sizes are recorded for
+  every release build rather than inferred from source allocations.
 - Approximately 24-32 KiB waveform page cache.
 - 4 KiB cooperative I/O slices.
 - Deck rendering targets 18-20 fps and may shed optional work before dropping
@@ -364,7 +365,7 @@ different node.
 - Current library and playlist browsing behavior.
 - Search and sorting, including BPM/key/genre/import date presentation.
 - Cue flags, cue colors, cue snapping, grid editing, quantize, and bar.beat.
-- Existing tool pages and four-orb page limit.
+- Existing tool pages and five-orb maximum (only PLAYER and DETAIL use five).
 - Playlist autoplay, collection shuffle, and playlist refresh behavior.
 - Power-only USB unless Data or supported DAC is armed from the USB page.
 - Return to Rekordpod after USB disconnect.
@@ -428,8 +429,8 @@ different node.
 
 ## Acceptance criteria
 
-- The iPod Video build stays under the documented 400 KiB internal budget and
-  never depends on the Classic's larger plugin region.
+- The iPod Video build leaves at least 48 KiB free in its documented 512 KiB
+  plugin region and never depends on the Classic's larger plugin region.
 - Normal input is serviced within one 50 ms tick budget unless a confirmed
   track-boundary transaction is visibly in progress.
 - Waveform/playhead position is derived from the same audio snapshot and does

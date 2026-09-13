@@ -404,14 +404,23 @@ static void rbprep_patch_mbr_for_512(unsigned char *data,
         if((type == 0x0b || type == 0x0c) &&
            start != 0 && count != 0)
         {
+            uint32_t translated_start;
+            uint32_t translated_count;
+
+            if(start > UINT32_MAX / mult || count > UINT32_MAX / mult)
+                continue;
+            translated_start = start * mult;
+            translated_count = count * mult;
+            if(translated_count > UINT32_MAX - translated_start)
+                continue;
             memcpy(fat_entry, &data[off], sizeof(fat_entry));
 
-            rbprep_put_le32(&fat_entry[8], start * mult);
-            rbprep_put_le32(&fat_entry[12], count * mult);
+            rbprep_put_le32(&fat_entry[8], translated_start);
+            rbprep_put_le32(&fat_entry[12], translated_count);
 
-            rbprep_fat_start[cur_cmd.lun] = (sector_t)start * mult;
+            rbprep_fat_start[cur_cmd.lun] = translated_start;
             rbprep_fat_end[cur_cmd.lun] =
-                rbprep_fat_start[cur_cmd.lun] + (sector_t)count * mult;
+                rbprep_fat_start[cur_cmd.lun] + translated_count;
 
             found = true;
             break;
@@ -470,6 +479,17 @@ static void rbprep_patch_fat32_bpb_for_512(unsigned char *data,
         unsigned int reserved = rbprep_get_le16(&b[14]);
         unsigned int fsinfo = rbprep_get_le16(&b[48]);
         unsigned int backup = rbprep_get_le16(&b[50]);
+        uint32_t total = rbprep_get_le32(&b[32]);
+        uint32_t fatsz = rbprep_get_le32(&b[36]);
+
+        if(spc == 0 || spc > UINT8_MAX / mult ||
+           reserved > UINT16_MAX / mult ||
+           total > UINT32_MAX / mult || fatsz > UINT32_MAX / mult ||
+           (fsinfo != 0 && fsinfo != 0xffff &&
+            fsinfo > UINT16_MAX / mult) ||
+           (backup != 0 && backup != 0xffff &&
+            backup > UINT16_MAX / mult))
+            continue;
 
         /*
          * Preserve all byte offsets while changing sector units
@@ -487,11 +507,9 @@ static void rbprep_patch_fat32_bpb_for_512(unsigned char *data,
          * which does not describe its actual partition start.
          */
 
-        rbprep_put_le32(&b[32],
-            rbprep_get_le32(&b[32]) * mult);
+        rbprep_put_le32(&b[32], total * mult);
 
-        rbprep_put_le32(&b[36],
-            rbprep_get_le32(&b[36]) * mult);
+        rbprep_put_le32(&b[36], fatsz * mult);
 
         if(fsinfo != 0 && fsinfo != 0xffff)
             rbprep_put_le16(&b[48], fsinfo * mult);
@@ -1469,7 +1487,8 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 
             logf("scsi read %llu %d", cur_cmd.sector, cur_cmd.count);
 
-            if((cur_cmd.sector + cur_cmd.count) > block_count) {
+            if(cur_cmd.sector > block_count ||
+               cur_cmd.count > block_count - cur_cmd.sector) {
                 send_csw(UMS_STATUS_FAIL);
                 cur_sense_data.sense_key=SENSE_ILLEGAL_REQUEST;
                 cur_sense_data.asc=ASC_LBA_OUT_OF_RANGE;
@@ -1520,7 +1539,8 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 
             logf("scsi read %llu %d", cur_cmd.sector, cur_cmd.count);
 
-            if((cur_cmd.sector + cur_cmd.count) > block_count) {
+            if(cur_cmd.sector > block_count ||
+               cur_cmd.count > block_count - cur_cmd.sector) {
                 send_csw(UMS_STATUS_FAIL);
                 cur_sense_data.sense_key=SENSE_ILLEGAL_REQUEST;
                 cur_sense_data.asc=ASC_LBA_OUT_OF_RANGE;
@@ -1564,7 +1584,8 @@ static void handle_scsi(struct command_block_wrapper* cbw)
             cur_cmd.block_size = block_size;
 
             /* Only the translated FAT32 partition is writable in RBPrep. */
-            if((cur_cmd.sector + cur_cmd.count) > block_count ||
+            if(cur_cmd.sector > block_count ||
+               cur_cmd.count > block_count - cur_cmd.sector ||
                !rbprep_write_in_fat(lun, cur_cmd.sector, cur_cmd.count)) {
                 send_csw(UMS_STATUS_FAIL);
                 cur_sense_data.sense_key=SENSE_ILLEGAL_REQUEST;
@@ -1606,7 +1627,8 @@ static void handle_scsi(struct command_block_wrapper* cbw)
             cur_cmd.block_size = block_size;
 
             /* Only the translated FAT32 partition is writable in RBPrep. */
-            if((cur_cmd.sector + cur_cmd.count) > block_count ||
+            if(cur_cmd.sector > block_count ||
+               cur_cmd.count > block_count - cur_cmd.sector ||
                !rbprep_write_in_fat(lun, cur_cmd.sector, cur_cmd.count)) {
                 send_csw(UMS_STATUS_FAIL);
                 cur_sense_data.sense_key=SENSE_ILLEGAL_REQUEST;

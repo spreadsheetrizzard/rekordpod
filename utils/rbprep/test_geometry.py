@@ -37,6 +37,11 @@ def translate_mbr(data, multiplier=MULTIPLIER):
             start = get32(result, offset + 8)
             count = get32(result, offset + 12)
             if start and count:
+                if (start > 0xFFFFFFFF // multiplier or
+                        count > 0xFFFFFFFF // multiplier or
+                        start * multiplier >
+                        0xFFFFFFFF - count * multiplier):
+                    continue
                 fat_entry = bytearray(result[offset:offset + 16])
                 put32(fat_entry, 8, start * multiplier)
                 put32(fat_entry, 12, count * multiplier)
@@ -49,6 +54,17 @@ def translate_mbr(data, multiplier=MULTIPLIER):
 
 def translate_bpb_out(data, multiplier=MULTIPLIER):
     result = bytearray(data)
+    values16 = {offset: get16(result, offset) for offset in (14, 48, 50)}
+    values32 = {offset: get32(result, offset) for offset in (32, 36)}
+    if (not result[13] or result[13] > 0xFF // multiplier or
+            values16[14] > 0xFFFF // multiplier or
+            any(value > 0xFFFFFFFF // multiplier
+                for value in values32.values())):
+        return result
+    for offset in (48, 50):
+        if (values16[offset] not in (0, 0xFFFF) and
+                values16[offset] > 0xFFFF // multiplier):
+            return result
     put16(result, 11, 512)
     result[13] *= multiplier
     for offset in (14, 48, 50):
@@ -140,6 +156,16 @@ class RBPrepGeometryTests(unittest.TestCase):
         self.assertTrue(start <= end - 1 < end and 1 <= end - (end - 1))
         self.assertFalse(start <= start - 1 < end)
         self.assertFalse(start <= end < end)
+
+    def test_mbr_translation_fails_closed_on_overflow(self):
+        mbr = sample_mbr()
+        put32(mbr, 462 + 8, 0x40000000)
+        self.assertEqual(translate_mbr(mbr), mbr)
+
+    def test_bpb_translation_fails_closed_on_overflow(self):
+        bpb = sample_bpb()
+        bpb[13] = 64
+        self.assertEqual(translate_bpb_out(bpb), bpb)
 
 
 @unittest.skipUnless(os.environ.get("RBPREP_SNAPSHOT"),

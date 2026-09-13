@@ -88,6 +88,8 @@
 #define RBPREP_PLAYLIST_JOURNAL_BAD \
     RBPREP_PLAYLIST_JOURNAL ".rbprep-corrupt"
 #define RBPREP_BURN_STATE "/.rockbox/rbprep/local-burn.rbs"
+#define RBPREP_BURN_STATE_NEW RBPREP_BURN_STATE ".rbprep-new"
+#define RBPREP_BURN_STATE_PREV RBPREP_BURN_STATE ".rbprep-prev"
 #define RBPREP_SEARCH_RESULTS "/.rockbox/rbprep/state/search.results"
 /* Fixed-size, little-endian RBE1 snapshots make interrupted appends harmless
    and keep the eventual macOS importer independent of compiler struct layout. */
@@ -115,6 +117,8 @@
 #define RBPREP_RETURN_THUMB_H 120
 #define RBPREP_HIGH_RES_WINDOW_WIDTH 112
 #define RBPREP_WHEEL_ARM_UNITS 3
+#define RBPREP_WHEEL_TOUCH_UNITS 96
+#define RBPREP_WHEEL_PHASE_UNITS 64
 #define RBPREP_MACRO_COUNT 2
 #define RBPREP_MACRO_STEPS 48
 #define RBPREP_MACRO_LEGACY_STEPS 24
@@ -5598,6 +5602,29 @@ static bool valid_edit_record(const unsigned char *data)
            (version == 1 || version == 2);
 }
 
+static bool verify_edit_journal_file(const char *path, uint32_t expected_size)
+{
+    unsigned char data[RBPREP_EDIT_RECORD_SIZE];
+    uint32_t consumed = 0;
+    int fd = rb->open(path, O_RDONLY);
+    bool ok;
+
+    if (fd < 0)
+        return false;
+    ok = rb->filesize(fd) == (off_t)expected_size;
+    while (ok && consumed < expected_size) {
+        if (rb->read(fd, data, sizeof(data)) != (ssize_t)sizeof(data) ||
+            !valid_edit_record(data)) {
+            ok = false;
+            break;
+        }
+        consumed += sizeof(data);
+    }
+    if (consumed != expected_size || rb->close(fd) < 0)
+        ok = false;
+    return ok;
+}
+
 static void apply_edit_record(const unsigned char *data)
 {
     int i;
@@ -5681,6 +5708,7 @@ static bool pack_current_edit_snapshot(unsigned char *data)
 static bool save_edit_snapshot(void)
 {
     unsigned char data[RBPREP_EDIT_RECORD_SIZE];
+    unsigned char verify[RBPREP_EDIT_RECORD_SIZE];
     off_t original_size;
     int fd;
     bool ok;
@@ -5705,6 +5733,24 @@ static bool save_edit_snapshot(void)
         rb->ftruncate(fd, original_size);
     if (rb->close(fd) < 0)
         ok = false;
+    if (ok) {
+        fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
+        ok = fd >= 0 && rb->filesize(fd) ==
+             original_size + RBPREP_EDIT_RECORD_SIZE &&
+             rb->lseek(fd, original_size, SEEK_SET) >= 0 &&
+             rb->read(fd, verify, sizeof(verify)) ==
+             (ssize_t)sizeof(verify) &&
+             !rb->memcmp(data, verify, sizeof(data));
+        if (fd >= 0 && rb->close(fd) < 0)
+            ok = false;
+    }
+    if (!ok && original_size >= 0) {
+        fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDWR);
+        if (fd >= 0) {
+            rb->ftruncate(fd, original_size);
+            rb->close(fd);
+        }
+    }
     return ok;
 }
 
@@ -5839,19 +5885,41 @@ static bool write_burn_offsets(uint32_t edit_offset,
                                uint32_t playlist_offset)
 {
     unsigned char data[12];
-    int fd;
+    unsigned char verify[12];
+    int verify_size;
+    bool had_previous;
 
     rb->memcpy(data, "RBL1", 4);
     write_u32(data + 4, edit_offset);
     write_u32(data + 8, playlist_offset);
-    fd = rb->open(RBPREP_BURN_STATE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0)
+    rb->remove(RBPREP_BURN_STATE_NEW);
+    if (!rbprep_store_write_verified(rb, RBPREP_BURN_STATE_NEW,
+                                     data, sizeof(data), verify,
+                                     sizeof(verify)))
         return false;
-    if (rb->write(fd, data, sizeof(data)) != sizeof(data)) {
-        rb->close(fd);
+    had_previous = rb->file_exists(RBPREP_BURN_STATE);
+    rb->remove(RBPREP_BURN_STATE_PREV);
+    if (had_previous &&
+        rb->rename(RBPREP_BURN_STATE, RBPREP_BURN_STATE_PREV) < 0) {
+        rb->remove(RBPREP_BURN_STATE_NEW);
         return false;
     }
-    rb->close(fd);
+    if (rb->rename(RBPREP_BURN_STATE_NEW, RBPREP_BURN_STATE) < 0) {
+        if (had_previous)
+            rb->rename(RBPREP_BURN_STATE_PREV, RBPREP_BURN_STATE);
+        rb->remove(RBPREP_BURN_STATE_NEW);
+        return false;
+    }
+    if (!rbprep_store_read(rb, RBPREP_BURN_STATE, verify,
+                           sizeof(verify), &verify_size) ||
+        verify_size != (int)sizeof(data) ||
+        rb->memcmp(data, verify, sizeof(data))) {
+        rb->remove(RBPREP_BURN_STATE);
+        if (had_previous)
+            rb->rename(RBPREP_BURN_STATE_PREV, RBPREP_BURN_STATE);
+        return false;
+    }
+    rb->remove(RBPREP_BURN_STATE_PREV);
     return true;
 }
 
@@ -6320,27 +6388,36 @@ static bool delete_pending_edit(uint32_t track_id)
     unsigned char data[RBPREP_EDIT_RECORD_SIZE];
     uint32_t edit_offset;
     uint32_t playlist_offset;
+    uint32_t output_size = 0;
+    off_t input_size;
+    off_t position = 0;
+    ssize_t got;
     int input;
     int output;
+    bool ok = true;
 
     read_burn_offsets(&edit_offset, &playlist_offset);
     (void)playlist_offset;
     input = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
     if (input < 0)
         return false;
-    if (edit_offset > (uint32_t)rb->filesize(input) ||
-        edit_offset % RBPREP_EDIT_RECORD_SIZE)
-        edit_offset = 0;
+    input_size = rb->filesize(input);
+    if (input_size < 0 || input_size % RBPREP_EDIT_RECORD_SIZE ||
+        edit_offset > (uint32_t)input_size ||
+        edit_offset % RBPREP_EDIT_RECORD_SIZE) {
+        rb->close(input);
+        return false;
+    }
     rb->remove(temporary);
     output = rb->open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (output < 0) {
         rb->close(input);
         return false;
     }
-    while (rb->read(input, data, sizeof(data)) == sizeof(data)) {
-        off_t after = rb->lseek(input, 0, SEEK_CUR);
-        bool pending = after >= (off_t)sizeof(data) &&
-                       (uint32_t)(after - sizeof(data)) >= edit_offset;
+    while ((got = rb->read(input, data, sizeof(data))) == sizeof(data)) {
+        bool pending = (uint32_t)position >= edit_offset;
+
+        position += sizeof(data);
         if (pending && valid_edit_record(data) &&
             read_u32(data + 8) == track_id)
             continue;
@@ -6350,13 +6427,27 @@ static bool delete_pending_edit(uint32_t track_id)
             rb->remove(temporary);
             return false;
         }
+        output_size += sizeof(data);
     }
-    rb->close(input);
-    rb->close(output);
+    if (got != 0)
+        ok = false;
+    if (rb->close(input) < 0)
+        ok = false;
+    if (rb->close(output) < 0)
+        ok = false;
+    if (!ok || !verify_edit_journal_file(temporary, output_size)) {
+        rb->remove(temporary);
+        return false;
+    }
     rb->remove(previous);
     if (rb->rename(RBPREP_EDIT_JOURNAL, previous) < 0)
         return false;
     if (rb->rename(temporary, RBPREP_EDIT_JOURNAL) < 0) {
+        rb->rename(previous, RBPREP_EDIT_JOURNAL);
+        return false;
+    }
+    if (!verify_edit_journal_file(RBPREP_EDIT_JOURNAL, output_size)) {
+        rb->remove(RBPREP_EDIT_JOURNAL);
         rb->rename(previous, RBPREP_EDIT_JOURNAL);
         return false;
     }
@@ -6373,8 +6464,11 @@ static bool commit_pending_edit(uint32_t track_id)
     uint32_t edit_offset;
     uint32_t playlist_offset;
     uint32_t committed_size = 0;
+    uint32_t output_size = 0;
     off_t size;
     off_t position;
+    off_t scan_position;
+    ssize_t got;
     int input = -1;
     int output = -1;
     bool found = false;
@@ -6394,13 +6488,15 @@ static bool commit_pending_edit(uint32_t track_id)
        Older committed snapshots are retained only for other tracks. */
     if (rb->lseek(input, edit_offset, SEEK_SET) < 0)
         goto done;
-    while (rb->read(input, data, sizeof(data)) == sizeof(data)) {
+    scan_position = edit_offset;
+    while ((got = rb->read(input, data, sizeof(data))) == sizeof(data)) {
+        scan_position += sizeof(data);
         if (valid_edit_record(data) && read_u32(data + 8) == track_id) {
             rb->memcpy(latest, data, sizeof(latest));
             found = true;
         }
     }
-    if (!found)
+    if (got != 0 || scan_position != size || !found)
         goto done;
 
     rb->remove(temporary);
@@ -6417,20 +6513,27 @@ static bool commit_pending_edit(uint32_t track_id)
         if (rb->write(output, data, sizeof(data)) != sizeof(data))
             goto done;
         committed_size += sizeof(data);
+        output_size += sizeof(data);
     }
     if (position != (off_t)edit_offset ||
         rb->write(output, latest, sizeof(latest)) != sizeof(latest))
         goto done;
     committed_size += sizeof(latest);
+    output_size += sizeof(latest);
 
     if (rb->lseek(input, edit_offset, SEEK_SET) < 0)
         goto done;
-    while (rb->read(input, data, sizeof(data)) == sizeof(data)) {
+    scan_position = edit_offset;
+    while ((got = rb->read(input, data, sizeof(data))) == sizeof(data)) {
+        scan_position += sizeof(data);
         if (valid_edit_record(data) && read_u32(data + 8) == track_id)
             continue;
         if (rb->write(output, data, sizeof(data)) != sizeof(data))
             goto done;
+        output_size += sizeof(data);
     }
+    if (got != 0 || scan_position != size)
+        goto done;
     ok = true;
 
 done:
@@ -6439,6 +6542,10 @@ done:
     if (output >= 0 && rb->close(output) < 0)
         ok = false;
     if (!ok) {
+        rb->remove(temporary);
+        return false;
+    }
+    if (!verify_edit_journal_file(temporary, output_size)) {
         rb->remove(temporary);
         return false;
     }
@@ -6458,6 +6565,50 @@ done:
     return true;
 }
 
+static bool verify_playlist_journal_file(const char *path,
+                                         uint32_t expected_size)
+{
+    char line[192];
+    char parsed[192];
+    uint32_t consumed = 0;
+    int length = 0;
+    int fd = rb->open(path, O_RDONLY);
+    bool ok;
+
+    if (fd < 0)
+        return false;
+    ok = rb->filesize(fd) == (off_t)expected_size;
+    while (ok && consumed < expected_size) {
+        unsigned char value;
+        struct rbprep_pending_playlist entry;
+
+        if (rb->read(fd, &value, 1) != 1) {
+            ok = false;
+            break;
+        }
+        consumed++;
+        if (value == '\n') {
+            line[length] = '\0';
+            rb->strlcpy(parsed, line, sizeof(parsed));
+            if (length > 0 &&
+                !parse_playlist_journal_line(parsed, &entry)) {
+                ok = false;
+                break;
+            }
+            length = 0;
+        } else if (value == '\r' ||
+                   length + 1 >= (int)sizeof(line)) {
+            ok = false;
+            break;
+        } else {
+            line[length++] = value;
+        }
+    }
+    if (consumed != expected_size || length != 0 || rb->close(fd) < 0)
+        ok = false;
+    return ok;
+}
+
 static bool delete_pending_playlist(unsigned char operation,
                                     uint32_t track_id,
                                     uint32_t playlist_id)
@@ -6468,17 +6619,25 @@ static bool delete_pending_playlist(unsigned char operation,
     uint32_t edit_offset;
     uint32_t playlist_offset;
     uint32_t position = 0;
+    uint32_t output_size = 0;
+    off_t input_size;
     int input;
     int output;
     int length = 0;
+    bool overflow = false;
+    bool ok = true;
 
     read_burn_offsets(&edit_offset, &playlist_offset);
     (void)edit_offset;
     input = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
     if (input < 0)
         return false;
-    if (playlist_offset > (uint32_t)rb->filesize(input))
-        playlist_offset = 0;
+    input_size = rb->filesize(input);
+    if (input_size < 0 || (uint64_t)input_size > UINT32_MAX ||
+        playlist_offset > (uint32_t)input_size) {
+        rb->close(input);
+        return false;
+    }
     rb->remove(temporary);
     output = rb->open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (output < 0) {
@@ -6489,11 +6648,14 @@ static bool delete_pending_playlist(unsigned char operation,
         unsigned char value;
         int got = rb->read(input, &value, 1);
 
+        if (got < 0)
+            goto playlist_delete_failed;
         if (got != 1 && length == 0)
             break;
         if (position < playlist_offset && got == 1) {
             if (rb->write(output, &value, 1) != 1)
                 goto playlist_delete_failed;
+            output_size++;
             position++;
             continue;
         }
@@ -6501,6 +6663,9 @@ static bool delete_pending_playlist(unsigned char operation,
             char parse[160];
             struct rbprep_pending_playlist entry;
             bool remove = false;
+
+            if (overflow)
+                goto playlist_delete_failed;
 
             line[length] = '\0';
             rb->strlcpy(parse, line, sizeof(parse));
@@ -6514,23 +6679,39 @@ static bool delete_pending_playlist(unsigned char operation,
                      rb->write(output, line, length) != length) ||
                     rb->write(output, "\n", 1) != 1)
                     goto playlist_delete_failed;
+                output_size += length + 1;
             }
             length = 0;
             if (got != 1)
                 break;
-        } else if (value != '\r' &&
-                   length + 1 < (int)sizeof(line)) {
-            line[length++] = value;
+        } else if (value != '\r') {
+            if (length + 1 < (int)sizeof(line))
+                line[length++] = value;
+            else
+                overflow = true;
         }
         if (got == 1)
             position++;
     }
-    rb->close(input);
-    rb->close(output);
+    if (rb->close(input) < 0)
+        ok = false;
+    if (rb->close(output) < 0)
+        ok = false;
+    if (!ok ||
+        !verify_playlist_journal_file(temporary, output_size)) {
+        rb->remove(temporary);
+        return false;
+    }
     rb->remove(previous);
     if (rb->rename(RBPREP_PLAYLIST_JOURNAL, previous) < 0)
         return false;
     if (rb->rename(temporary, RBPREP_PLAYLIST_JOURNAL) < 0) {
+        rb->rename(previous, RBPREP_PLAYLIST_JOURNAL);
+        return false;
+    }
+    if (!verify_playlist_journal_file(RBPREP_PLAYLIST_JOURNAL,
+                                      output_size)) {
+        rb->remove(RBPREP_PLAYLIST_JOURNAL);
         rb->rename(previous, RBPREP_PLAYLIST_JOURNAL);
         return false;
     }
@@ -7980,14 +8161,10 @@ static void draw_record_badge(int cx, int cy, int radius, int color,
 
 static void draw_blade_shell(const char *title, int accent)
 {
+    /* All non-deck contexts share one black canvas.  Decorative geometry is
+       confined to actual controls so it can never show through menu labels. */
     rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(0, 0, LCD_WIDTH, LCD_HEIGHT);
-    rb->lcd_set_foreground(LCD_RGBPACK(18, 21, 19));
-    rb->lcd_fillrect(2, RBPREP_STATUS_HEIGHT + 1, LCD_WIDTH - 4,
-                     LCD_HEIGHT - RBPREP_STATUS_HEIGHT - 3);
-    rb->lcd_set_foreground(LCD_BLACK);
-    rb->lcd_fillrect(5, RBPREP_STATUS_HEIGHT + 3, LCD_WIDTH - 10,
-                     LCD_HEIGHT - RBPREP_STATUS_HEIGHT - 8);
     rb->lcd_set_foreground(LCD_RGBPACK(5, 12, 8));
     rb->lcd_fillrect(5, RBPREP_STATUS_HEIGHT + 3, LCD_WIDTH - 10, 19);
     rb->lcd_set_foreground(accent);
@@ -8017,14 +8194,14 @@ static void draw_blade_selection(int y, int height, int color)
     const int right = LCD_WIDTH - 7;
     int radius = height / 2;
     int center_y = y + radius;
-    (void)color;
-
-    rb->lcd_set_foreground(LCD_RGBPACK(12, 49, 29));
+    rb->lcd_set_foreground(color == RBPREP_GREEN
+                           ? theme_accent_dim
+                           : LCD_RGBPACK(18, 24, 21));
     xlcd_fillcircle(left + radius, center_y, radius);
     xlcd_fillcircle(right - radius, center_y, radius);
     rb->lcd_fillrect(left + radius, y,
                      right - left - radius * 2 + 1, height + 1);
-    rb->lcd_set_foreground(RBPREP_GREEN);
+    rb->lcd_set_foreground(color);
     rb->lcd_hline(left + radius, right - radius, y + 1);
     rb->lcd_drawpixel(left + 2, center_y);
     rb->lcd_drawpixel(right - 2, center_y);
@@ -8120,9 +8297,8 @@ static void draw_playlist_carousel_blade(
                              LCD_RGBPACK(119, 151, 132);
     char line[96];
 
-    /* Every blade is a rigid trapezoid. Their alternating horizontal bias
-       supplies the controlled-chaos twist while five stable Y planes retain
-       a readable map of the playlist tree. */
+    /* Every blade is self-contained.  Earlier perspective rays converged
+       through neighboring labels and made the carousel look scratched. */
     rb->lcd_set_foreground(fill);
     rb->lcd_fillrect(x + 3, y, width - 6, height);
     rb->lcd_drawline(x, y + 3, x + 3, y);
@@ -8136,15 +8312,6 @@ static void draw_playlist_carousel_blade(
     rb->lcd_drawline(x, y + 3, x, y + height - 4);
     rb->lcd_drawline(x + width - 1, y + 3,
                      x + width - 1, y + height - 4);
-    if (depth > 0) {
-        int vanish_x = delta < 0 ? LCD_WIDTH - 7 : 7;
-        int vanish_y = 116;
-
-        rb->lcd_set_foreground(LCD_RGBPACK(14, 42, 34));
-        rb->lcd_drawline(x + (delta < 0 ? 0 : width - 1),
-                         y + height / 2, vanish_x, vanish_y);
-    }
-
     if (add_row) {
         rb->lcd_set_foreground(label);
         rb->lcd_drawrect(x + 10, y + height / 2 - 6, 13, 13);
@@ -8163,10 +8330,15 @@ static void draw_playlist_carousel_blade(
     }
     draw_playlist_node_glyph(x + 17, y + height / 2,
                              cached->node.kind == 0, delta == 0);
-    rb->snprintf(line, sizeof(line), "%s%.34s",
-                 cached->favorite_slot >= 0
-                    ? (cached->favorite_slot ? "F2  " : "F1  ") : "",
-                 cached->name);
+    {
+        const char *prefix = cached->favorite_slot >= 0
+                           ? (cached->favorite_slot ? "F2  " : "F1  ") : "";
+        int reserved = cached->node.kind != 0 ? 80 : 12;
+        int available = MAX(6, MIN(34, (width - 31 - reserved) / 6));
+
+        rb->snprintf(line, sizeof(line), "%s%.*s", prefix, available,
+                     cached->name);
+    }
     text(x + 31, y + (height - 8) / 2, line, label);
     if (cached->node.kind != 0) {
         int macro_slot = macro_link_for(cached->node.source_id);
@@ -8212,7 +8384,7 @@ static void draw_playlist_browser(void)
                 cached_playlist_visible(ordinal, false, &cached)
                     ? cached : NULL, false);
     }
-    rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
+    rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(0, 210, LCD_WIDTH, 30);
     rb->snprintf(line, sizeof(line), "%d/%d", tree_selection + 1,
                  playlist_browser_count());
@@ -8335,7 +8507,7 @@ static void draw_track_cache_placeholder(int y, bool selected)
                          : LCD_RGBPACK(12, 24, 28);
 
     if (selected)
-        draw_blade_selection(y - 1, 20, LCD_RGBPACK(25, 91, 148));
+        draw_blade_selection(y - 1, 20, RBPREP_GREEN);
     rb->lcd_set_foreground(shade);
     xlcd_fillcircle(12, y + 8, 5);
     rb->lcd_fillrect(24, y + 2, 118, 3);
@@ -8397,8 +8569,7 @@ static void draw_track_browser(void)
             continue;
         }
         if (ordinal == track_selection) {
-            draw_blade_selection(y - 1, 20,
-                                 LCD_RGBPACK(25, 91, 148));
+            draw_blade_selection(y - 1, 20, RBPREP_GREEN);
         }
         draw_record_badge(12, y + 8, 5,
                           track_color_display(cached->track.color),
@@ -8418,7 +8589,7 @@ static void draw_track_browser(void)
                      cached->key[0] ? cached->key : "--");
         text(276, y + 10, line, LCD_WHITE);
     }
-    rb->lcd_set_foreground(LCD_RGBPACK(14, 24, 18));
+    rb->lcd_set_foreground(LCD_BLACK);
     rb->lcd_fillrect(0, 210, LCD_WIDTH, 30);
     rb->snprintf(line, sizeof(line), "%d/%d", track_selection + 1,
                  track_row_count);
@@ -8460,9 +8631,7 @@ static void draw_collection_filter(void)
         bool selected = row == filter_selection;
         bool active = row >= 2 && row - 2 == track_sort_key;
         if (selected) {
-            draw_blade_selection(y - 3, 20,
-                                 active ? LCD_RGBPACK(31, 108, 72)
-                                        : LCD_RGBPACK(18, 78, 128));
+            draw_blade_selection(y - 3, 20, RBPREP_GREEN);
         }
         draw_record_badge(12, y + 5, 5,
                           RBPREP_GREEN, selected);
@@ -9822,7 +9991,7 @@ static void draw_genre_picker(void)
 
 static void wrap_main_wheel_phase(void)
 {
-    const int cycle = 64 * 256;
+    const int cycle = RBPREP_WHEEL_PHASE_UNITS * 256;
 
     main_wheel_phase_fp %= cycle;
     if (main_wheel_phase_fp < 0)
@@ -9864,11 +10033,14 @@ static void update_main_wheel_motion(void)
             int movement;
             int instantaneous;
 
-            if (delta > 48)
-                delta -= 96;
-            else if (delta < -48)
-                delta += 96;
-            movement = delta * 512 / 3; /* 96 touch units = one turn. */
+            if (delta > RBPREP_WHEEL_TOUCH_UNITS / 2)
+                delta -= RBPREP_WHEEL_TOUCH_UNITS;
+            else if (delta < -RBPREP_WHEEL_TOUCH_UNITS / 2)
+                delta += RBPREP_WHEEL_TOUCH_UNITS;
+            /* One full hardware-wheel trace is exactly one rendered platter
+               revolution, regardless of how many menu detents it generated. */
+            movement = delta * RBPREP_WHEEL_PHASE_UNITS * 256 /
+                       RBPREP_WHEEL_TOUCH_UNITS;
             main_wheel_phase_fp += movement;
             if (delta) {
                 instantaneous = movement * HZ / elapsed;
@@ -9905,7 +10077,8 @@ static void draw_main_menu_fx(void)
     int point;
 
     update_main_wheel_motion();
-    phase = (main_wheel_phase_fp >> 8) & 63;
+    phase = (main_wheel_phase_fp >> 8) &
+            (RBPREP_WHEEL_PHASE_UNITS - 1);
 
     /* A centered platter anchors the carousel. Its motion remains a trace of
        real wheel energy rather than a synthetic selection-position dial. */
@@ -9937,7 +10110,9 @@ static void draw_main_menu_fx(void)
 #ifdef HAVE_WHEEL_POSITION
     if (platter_wheel_mode && rb->wheel_status() >= 0) {
         /* Align the hardware wheel origin with the drawing table. */
-        int touch_angle = (rb->wheel_status() * 64 / 96 + 48) & 63;
+        int touch_angle = (rb->wheel_status() * RBPREP_WHEEL_PHASE_UNITS /
+                           RBPREP_WHEEL_TOUCH_UNITS + 48) &
+                          (RBPREP_WHEEL_PHASE_UNITS - 1);
         int touch_x = cx + wheel_cosine[touch_angle] * 43 / 256;
         int touch_y = cy + wheel_sine[touch_angle] * 43 / 256;
 

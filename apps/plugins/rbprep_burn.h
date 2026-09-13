@@ -1218,6 +1218,50 @@ static bool pdb_patch_snapshot(struct rbprep_pdb *pdb,
     return true;
 }
 
+static bool pdb_verify_snapshot(struct rbprep_pdb *pdb,
+                                const unsigned char *snapshot)
+{
+    struct rbprep_pdb_track track;
+    unsigned char raw[4];
+    char genre[32];
+    char key[24];
+    uint32_t ignored_max;
+    int genre_id = 0;
+    int key_id = 0;
+    unsigned char desired_color = snapshot[17] < 8
+                                ? snapshot[17] + 1 : 0;
+
+    if (!pdb_find_track(pdb, read_u32(snapshot + 8), &track))
+        return false;
+    rb->memcpy(genre, snapshot + 120, sizeof(genre));
+    genre[sizeof(genre) - 1] = '\0';
+    if (genre[0]) {
+        genre_id = pdb_find_genre(pdb, genre, &ignored_max);
+        if (genre_id <= 0)
+            return false;
+    }
+    if (read_u16(snapshot + 6) >= 2) {
+        rb->memcpy(key, snapshot + 192, sizeof(key));
+        key[sizeof(key) - 1] = '\0';
+        if (key[0]) {
+            key_id = pdb_find_key(pdb, key, &ignored_max);
+            if (key_id <= 0)
+                return false;
+        }
+        if (!burn_read_at(pdb->fd, track.row + 0x20, raw, 4) ||
+            read_u32(raw) != (uint32_t)key_id)
+            return false;
+    }
+    return burn_read_at(pdb->fd, track.row + 0x38, raw, 4) &&
+           read_u32(raw) == read_u32(snapshot + 24) &&
+           burn_read_at(pdb->fd, track.row + 0x3c, raw, 4) &&
+           read_u32(raw) == (uint32_t)genre_id &&
+           burn_read_at(pdb->fd, track.row + 0x50, raw, 2) &&
+           read_u16(raw) == read_u16(snapshot + 20) &&
+           burn_read_at(pdb->fd, track.row + 0x58, raw, 2) &&
+           raw[0] == desired_color && raw[1] == MIN(5, snapshot[16]);
+}
+
 static bool pdb_playlist_exists(struct rbprep_pdb *pdb, uint32_t playlist,
                                 bool *is_folder)
 {
@@ -1732,21 +1776,84 @@ pdb_add_playlist_entry(struct rbprep_pdb *pdb, uint32_t track,
                                    : PLAYLIST_ADD_VERIFY_FAILED;
 }
 
-static bool burn_record_is_latest(int fd, uint32_t track_id, off_t after)
+/* Return 1 when this is the newest snapshot, 0 when a later one exists, and
+   -1 on an I/O/format failure.  Callers must never mistake an unreadable
+   journal tail for an obsolete record. */
+static int burn_record_latest_state(int fd, uint32_t track_id, off_t after)
 {
     unsigned char record[RBPREP_EDIT_RECORD_SIZE];
-    bool latest = true;
+    ssize_t got;
+    int latest = 1;
 
-    if (rb->lseek(fd, after, SEEK_SET) < 0)
-        return false;
-    while (rb->read(fd, record, sizeof(record)) == sizeof(record)) {
-        if (valid_edit_record(record) && read_u32(record + 8) == track_id) {
-            latest = false;
+    if (after < 0 || rb->lseek(fd, after, SEEK_SET) < 0)
+        return -1;
+    while ((got = rb->read(fd, record, sizeof(record))) == sizeof(record)) {
+        if (!valid_edit_record(record)) {
+            latest = -1;
+            break;
+        }
+        if (read_u32(record + 8) == track_id) {
+            latest = 0;
             break;
         }
     }
-    rb->lseek(fd, after, SEEK_SET);
+    if (latest == 1 && got != 0)
+        latest = -1;
+    if (rb->lseek(fd, after, SEEK_SET) < 0)
+        return -1;
     return latest;
+}
+
+static bool burn_verify_metadata_journal(struct rbprep_pdb *pdb,
+                                         uint32_t edit_offset,
+                                         int target_track)
+{
+    unsigned char record[RBPREP_EDIT_RECORD_SIZE];
+    off_t size;
+    ssize_t got = 0;
+    int fd = rb->open(RBPREP_EDIT_JOURNAL, O_RDONLY);
+    bool ok = true;
+
+    if (fd < 0)
+        return false;
+    size = rb->filesize(fd);
+    if (size < 0 || edit_offset > (uint32_t)size ||
+        edit_offset % RBPREP_EDIT_RECORD_SIZE ||
+        size % RBPREP_EDIT_RECORD_SIZE ||
+        rb->lseek(fd, edit_offset, SEEK_SET) < 0) {
+        ok = false;
+        goto done;
+    }
+    while ((got = rb->read(fd, record, sizeof(record))) == sizeof(record)) {
+        off_t after = rb->lseek(fd, 0, SEEK_CUR);
+        uint32_t track_id;
+        int latest;
+
+        if (!valid_edit_record(record)) {
+            ok = false;
+            break;
+        }
+        track_id = read_u32(record + 8);
+        if (target_track >= 0 && track_id != (uint32_t)target_track)
+            continue;
+        latest = burn_record_latest_state(fd, track_id, after);
+        if (latest < 0) {
+            ok = false;
+            break;
+        }
+        if (!latest)
+            continue;
+        if (!pdb_verify_snapshot(pdb, record)) {
+            ok = false;
+            break;
+        }
+    }
+    if (got != 0)
+        ok = false;
+done:
+    if (rb->close(fd) < 0)
+        ok = false;
+    return ok;
 }
 
 static int burn_source_bpm(uint32_t track_id, int fallback)
@@ -1802,13 +1909,13 @@ static bool burn_rewrite_track_cues(uint32_t track_id,
     unsigned char header[40];
     unsigned char cue[8];
     off_t source_size;
-    off_t waveform_size;
+    off_t waveform_size = 0;
     off_t old_beat_offset;
     off_t required_size;
     off_t expected_size = 0;
     int old_cue_count;
-    int beat_count;
-    int new_cue_count;
+    int beat_count = 0;
+    int new_cue_count = 0;
     int input = -1;
     int output = -1;
     int slot;
@@ -1879,10 +1986,39 @@ done:
         ok = false;
     if (ok) {
         int verify = rb->open(temporary, O_RDONLY);
+        int expected_slot = 0;
 
-        ok = verify >= 0 && rb->filesize(verify) == expected_size;
-        if (verify >= 0)
-            rb->close(verify);
+        ok = verify >= 0 && rb->filesize(verify) == expected_size &&
+             rb->read(verify, header, sizeof(header)) ==
+             (ssize_t)sizeof(header) &&
+             !rb->memcmp(header, "RBW3", 4) &&
+             read_u16(header + 4) == 40 &&
+             read_u16(header + 12) == new_cue_count &&
+             read_u16(header + 14) == beat_count &&
+             header[32] == MIN(5, snapshot[16]) &&
+             header[33] == normalize_track_color(snapshot[17]) &&
+             rb->lseek(verify, sizeof(header) + waveform_size,
+                       SEEK_SET) >= 0;
+        for (slot = 0; ok && slot < new_cue_count; slot++) {
+            int32_t expected_time;
+
+            while (expected_slot < 16 &&
+                   (int32_t)read_u32(snapshot + 40 + expected_slot * 4) < 0)
+                expected_slot++;
+            if (expected_slot >= 16 ||
+                rb->read(verify, cue, sizeof(cue)) !=
+                (ssize_t)sizeof(cue)) {
+                ok = false;
+                break;
+            }
+            expected_time = read_u32(snapshot + 40 + expected_slot * 4);
+            ok = (int32_t)read_u32(cue) == expected_time &&
+                 cue[4] == (snapshot[104 + expected_slot] & 7) &&
+                 cue[5] == expected_slot + 1 && read_u16(cue + 6) == 0;
+            expected_slot++;
+        }
+        if (verify >= 0 && rb->close(verify) < 0)
+            ok = false;
     }
     if (!ok) {
         rb->remove(temporary);
@@ -2128,7 +2264,34 @@ static bool burn_rewrite_analysis(const char *path,
         rb->remove(temporary);
         return false;
     }
-    rb->close(fd);
+    if (rb->close(fd) < 0) {
+        rb->remove(temporary);
+        return false;
+    }
+    fd = rb->open(temporary, O_RDONLY);
+    if (fd < 0 || rb->filesize(fd) != output_at) {
+        if (fd >= 0)
+            rb->close(fd);
+        rb->remove(temporary);
+        return false;
+    }
+    source_at = 0;
+    while (source_at < output_at) {
+        int amount = MIN((int)sizeof(rbprep_burn_page),
+                         output_at - source_at);
+
+        if (rb->read(fd, rbprep_burn_page, amount) != amount ||
+            rb->memcmp(rbprep_burn_page, output + source_at, amount)) {
+            rb->close(fd);
+            rb->remove(temporary);
+            return false;
+        }
+        source_at += amount;
+    }
+    if (rb->close(fd) < 0) {
+        rb->remove(temporary);
+        return false;
+    }
     return burn_swap_keep_previous(path, temporary, previous);
 }
 
@@ -2184,7 +2347,7 @@ static void burn_finish_analysis_files(struct rbprep_pdb *pdb,
             continue;
         track_id = read_u32(record + 8);
         if ((target_track >= 0 && track_id != (uint32_t)target_track) ||
-            !burn_record_is_latest(fd, track_id, after))
+            burn_record_latest_state(fd, track_id, after) == 0)
             continue;
 
         rb->snprintf(path, sizeof(path), "%s/%06lu.rbw",
@@ -3048,6 +3211,7 @@ static bool rbprep_burn_transaction(int target_track, bool playlist_only)
     uint32_t edit_offset;
     uint32_t playlist_offset;
     int fd;
+    ssize_t record_read = 0;
     int completed = 0;
     int total;
     bool success = false;
@@ -3229,16 +3393,28 @@ static bool rbprep_burn_transaction(int target_track, bool playlist_only)
             rb->close(pdb.fd);
             goto done;
         }
-        while (rb->read(fd, record, sizeof(record)) == sizeof(record)) {
+        while ((record_read = rb->read(fd, record, sizeof(record))) ==
+               sizeof(record)) {
             off_t after = rb->lseek(fd, 0, SEEK_CUR);
             struct rbprep_pdb_track track;
             uint32_t track_id;
+            int latest;
             if (!valid_edit_record(record))
                 continue;
             track_id = read_u32(record + 8);
             if (target_track >= 0 && track_id != (uint32_t)target_track)
                 continue;
-            if (!burn_record_is_latest(fd, track_id, after))
+            latest = burn_record_latest_state(fd, track_id, after);
+            if (latest < 0) {
+                failure = "edit journal scan";
+                rb->close(fd);
+                if (!playlist_only)
+                    burn_finish_analysis_files(&pdb, edit_offset, true,
+                                               target_track);
+                rb->close(pdb.fd);
+                goto done;
+            }
+            if (!latest)
                 continue;
             rb->splash_progress(MIN(completed, total), total,
                                 "Burning track %lu",
@@ -3263,6 +3439,15 @@ static bool rbprep_burn_transaction(int target_track, bool playlist_only)
                 goto done;
             }
             completed++;
+        }
+        if (record_read != 0) {
+            failure = "edit journal read";
+            rb->close(fd);
+            if (!playlist_only)
+                burn_finish_analysis_files(&pdb, edit_offset, true,
+                                           target_track);
+            rb->close(pdb.fd);
+            goto done;
         }
         rb->close(fd);
     }
@@ -3298,7 +3483,20 @@ static bool rbprep_burn_transaction(int target_track, bool playlist_only)
        write before the whole file is scanned. A read-after-write scan on
        this same descriptor can observe a mixture of old and new page data
        on the iPod even though reopening produces the correct view. */
-    rb->close(pdb.fd);
+    if (rb->close(pdb.fd) < 0) {
+        struct rbprep_pdb original;
+
+        pdb.fd = -1;
+        failure = "PDB flush";
+        if (pdb_open(&original, RBPREP_PDB)) {
+            if (!playlist_only)
+                burn_finish_analysis_files(&original, edit_offset, true,
+                                           target_track);
+            rb->close(original.fd);
+        }
+        goto done;
+    }
+    pdb.fd = -1;
     if (!pdb_open_retry(&pdb, RBPREP_PDB_NEW)) {
         failure = "PDB validation";
         struct rbprep_pdb original;
@@ -3315,6 +3513,14 @@ static bool rbprep_burn_transaction(int target_track, bool playlist_only)
         preserve_failed_pdb = true;
         if (!playlist_only)
             burn_finish_analysis_files(&pdb, edit_offset, true, target_track);
+        rb->close(pdb.fd);
+        goto done;
+    }
+    if (!playlist_only && pending_snapshot_count > 0 &&
+        !burn_verify_metadata_journal(&pdb, edit_offset, target_track)) {
+        failure = "PDB metadata verification";
+        preserve_failed_pdb = true;
+        burn_finish_analysis_files(&pdb, edit_offset, true, target_track);
         rb->close(pdb.fd);
         goto done;
     }

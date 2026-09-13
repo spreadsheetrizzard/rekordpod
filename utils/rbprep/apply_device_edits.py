@@ -31,7 +31,7 @@ except ImportError as error:  # pragma: no cover - exercised by the launcher
 
 EDIT_RECORD_SIZE = 216
 EDIT_MAGIC = b"RBE1"
-EDIT_VERSION = 1
+EDIT_VERSIONS = (1, 2)
 EDIT_JOURNAL = Path(".rockbox/rbprep/edits.rbe")
 PLAYLIST_JOURNAL = Path(".rockbox/rbprep/playlist-adds.rba")
 LOCAL_BURN_STATE = Path(".rockbox/rbprep/local-burn.rbs")
@@ -104,7 +104,7 @@ def parse_edit_journal(path: Path, start: int = 0) -> tuple[dict[int, EditSnapsh
         raw = data[offset:offset + EDIT_RECORD_SIZE]
         if (raw[:4] != EDIT_MAGIC or
                 struct.unpack_from("<H", raw, 4)[0] != EDIT_RECORD_SIZE or
-                struct.unpack_from("<H", raw, 6)[0] != EDIT_VERSION):
+                struct.unpack_from("<H", raw, 6)[0] not in EDIT_VERSIONS):
             continue
         valid += 1
         track_id, saved_tick = struct.unpack_from("<II", raw, 8)
@@ -122,7 +122,7 @@ def parse_edit_journal(path: Path, start: int = 0) -> tuple[dict[int, EditSnapsh
             deck_cue_ms=deck_cue_ms,
             hotcues_ms=struct.unpack_from("<16i", raw, 40),
             hotcue_colors=tuple(raw[104:120]),
-            genre=_cstring(raw[120:152]), title=_cstring(raw[152:216]),
+            genre=_cstring(raw[120:152]), title=_cstring(raw[152:192]),
             raw=raw,
         )
         latest[track_id] = snapshot

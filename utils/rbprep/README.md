@@ -57,22 +57,20 @@ both the rebuilt RBI3 index and every DeviceSQL page chain are validated before
 their rollback copies are removed. A failure names the exact stage or
 track/list pair and rolls the transaction back.
 
-The deck offers four signal-oriented views: the detailed RGB waveform; a
-boombox whose woofers follow the live sub-120 Hz envelope and whose chromatic
-cone rings show a confidence-gated observed bass note; a live 20-band,
--60-to-0 dBFS spectrum; and a turntable whose circular micro-waveform, numbered
-cue flags, and strobe dots roll with the selected platter speed while its
-tonearm travels inward over the full track duration. Cue time selects a groove
-radius between the outer playable edge and half-radius; each labeled flag grows
-outward from a tip planted on that groove. At -12 dB the boombox adds a subtle
-cabinet-rattle cue. The non-waveform analyzers intentionally omit edit overlays;
-beatgrid, loop, and cue detail stays on the RGB waveform.
+The deck offers eight signal-oriented views across VIZ and MORVIZ: RGB
+waveform, 20-band EQ, phrase map, harmonic constellation, spectral canyon,
+boombox, stereo orbit, and Oscillo-Turntable. The boombox follows the live
+sub-120 Hz envelope and shows a confidence-gated observed bass note; the
+turntable combines a readable horizontal oscilloscope with platter, Phase,
+cue, RPM, and tonearm motion. Non-waveform analyzers intentionally omit edit
+overlays; beatgrid, loop, and cue detail stays on the RGB waveform.
 
-Prep Deck tools are arranged in ten four-letter pages with no more than four
-orbs per page: PLAY, PNAV, TMPO, GRID, CUES, LOOP, META, LIST, VIZ, and MACR.
+Prep Deck tools are arranged in eleven pages: PLAYER, PLNAV, BTGRID, LISTS,
+HOTCUE, DETAIL, VIZ, MORVIZ, TEMPO, LOOPS, and LOCK. Pages contain at most five
+orbs; PLAYER and DETAIL use the fifth position and the rest use four or fewer.
 While the tool picker is open, LEFT/RIGHT or the wheel moves within a page and
 physical up/down banks pages while preserving (or clamping) the orb column.
-Two named workflow pads can retain up to 24 ordered tool selections each;
+Two named workflow pads can retain up to 48 ordered tool selections each;
 repeated tools remain repeated cells. Workflows never replay edits or input
 timing: horizontal stepping only selects the next tool. SELECT+LEFT/RIGHT
 steps within a row and SELECT+up/down swaps the two rows. A playlist's hold
@@ -108,8 +106,8 @@ settings reset for a newly loaded song and the pre-plugin Rockbox
 pitch/timestretch state is restored on exit. The main menu's Prep Deck item can
 attach to the current indexed Rockbox track without restarting it.
 
-This iPod 6G fork launches RBPrep once during Rockbox startup when
-`/.rockbox/rocks/apps/rbprep.rock` is present. The `autoboot` launch draws an
+This fork launches Rekordpod once during Rockbox startup when
+`/.rockbox/rocks/apps/rekordpod.rock` is present. The `autoboot` launch draws an
 animated `rekordpod` wordmark using the bundled Adobe Helvetica font. Holding
 MENU during boot bypasses RBPrep, and RBPrep's Exit to Rockbox item returns to
 the ordinary root menu without relaunching it. Main and browser selections use
@@ -124,14 +122,13 @@ the traditional Device Library. Hardware that reads only OneLibrary / Device
 Library Plus needs a matching Plus-library update; RBPrep does not write that
 second database yet.
 
-`apply_device_edits.py` is the explicit write-back step. It keeps only the
-newest full snapshot per track, diffs that state against the current DeviceSQL
-database and ANLZ data, and applies only the net metadata, beat-grid, hot-cue,
-and playlist changes. Before replacing anything it builds and validates all
-outputs; apply mode creates timestamped copies of every affected device file
-and rolls back already-replaced files if the transaction fails. The journals
-are compacted to one snapshot/request per object after a successful apply, so
-reversed or repeated edits do not accumulate.
+`apply_device_edits.py` is an optional host-side recovery and diagnostic tool,
+not part of the normal Rekordpod workflow. Normal metadata, beat-grid, hot-cue,
+and playlist burns happen entirely on the iPod. The utility can preview or
+apply a surviving device journal when investigating a damaged beta install;
+it builds and validates all outputs before replacement, creates timestamped
+copies of every affected file, and rolls back already-replaced files if the
+transaction fails.
 
 Run a read-only preview first:
 
@@ -141,6 +138,5 @@ PYTHONPATH=/path/to/rekordbox-pdb/src python3 \
     --volume /Volumes/RIZZPOD --backup-root /path/to/backups
 ```
 
-Add `--apply` only after reviewing the preview. The macOS launcher supplied
-with RBPrep performs both passes, displays a confirmation, flushes writes, and
-ejects the volume.
+Add `--apply` only after reviewing the preview. It is not required to prepare
+tracks or playlists in Rekordpod.
