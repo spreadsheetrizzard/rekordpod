@@ -11098,6 +11098,14 @@ static void animate_context_transition(enum rbprep_mode new_mode)
 {
     const int dissolve_frames = 2;
 
+    /* Tool pages are one continuous deck, not separate application screens.
+       Bank them immediately so page navigation never fades the waveform or
+       interrupts the visual relationship between adjacent controls. */
+    if (presented_mode >= MODE_DECK && new_mode >= MODE_DECK) {
+        present_transition_destination();
+        return;
+    }
+
     /* Keep the former destination motifs available for later diagnostics,
        but public interaction uses only the continuous dissolve. */
     (void)draw_context_transition_motif;
