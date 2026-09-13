@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef RBPREP_WAVE_INDEX_H
 #define RBPREP_WAVE_INDEX_H
 

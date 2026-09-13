@@ -935,13 +935,13 @@ static void rbprep_autostart(void)
 {
     static bool attempted;
     const char *path = ROCKBOX_DIR "/rocks/apps/rekordpod.rock";
-    const char *disabled = ROCKBOX_DIR "/rbprep/autoboot.off";
+    const char *disabled = ROCKBOX_DIR "/rekordpod/autoboot.off";
 
     if (attempted)
         return;
     attempted = true;
 
-    /* MENU is a deliberately simple recovery bypass.  Returning from RBPrep
+    /* MENU is a deliberately simple recovery bypass.  Returning from Rekordpod
        continues into the normal Rockbox root menu and cannot relaunch it. */
     if ((button_status() & BUTTON_MENU) || file_exists(disabled) ||
         !file_exists(path))

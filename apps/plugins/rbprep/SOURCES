@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 rbprep.c
 rbprep_caps.c
 rbprep_grid.c

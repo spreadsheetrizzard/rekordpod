@@ -1,7 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "rbprep_store.h"
 
-#define RBPREP_ROOT_DIR "/.rockbox/rbprep"
-#define RBPREP_STATE_DIR "/.rockbox/rbprep/state"
+#define RBPREP_ROOT_DIR "/.rockbox/rekordpod"
+#define RBPREP_STATE_DIR "/.rockbox/rekordpod/state"
 
 static bool read_exact(const struct plugin_api *api, int fd,
                        void *buffer, size_t size)

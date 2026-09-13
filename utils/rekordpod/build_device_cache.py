@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Build the indexed, per-track RBPrep cache used by the Rockbox plugin."""
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Build the indexed, per-track Rekordpod cache used by the Rockbox plugin."""
 
 from __future__ import annotations
 
@@ -118,7 +120,7 @@ def build_index(connection: sqlite3.Connection) -> bytes:
     columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(tracks)")
     }
-    # Per-track My Tag associations are optional because older RBPrep imports
+    # Per-track My Tag associations are optional because older Rekordpod imports
     # predate exportExt.pdb support. Hashtags in Comments remain useful as a
     # zero-migration fallback and become searchable under both fields.
     has_tags = "tags" in columns
@@ -428,7 +430,7 @@ def build(args: argparse.Namespace) -> None:
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary_name = tempfile.mkstemp(
-        prefix=".rbprep-device-", suffix=".zip", dir=output.parent
+        prefix=".rekordpod-device-", suffix=".zip", dir=output.parent
     )
     os.close(handle)
     temporary = Path(temporary_name)
@@ -439,13 +441,13 @@ def build(args: argparse.Namespace) -> None:
             temporary, "w", allowZip64=True
         ) as target:
             for item in source.infolist():
-                if not item.filename.startswith(".rockbox/rbprep/"):
+                if not item.filename.startswith(".rockbox/rekordpod/"):
                     target.writestr(item, source.read(item.filename))
-            target.writestr(zip_info(".rockbox/rbprep/library.rbi"), index)
-            target.writestr(zip_info(".rockbox/rbprep/genres.rbg"), genres)
+            target.writestr(zip_info(".rockbox/rekordpod/library.rbi"), index)
+            target.writestr(zip_info(".rockbox/rekordpod/genres.rbg"), genres)
             if smart_queries is not None:
                 target.writestr(
-                    zip_info(".rockbox/rbprep/smart-playlists.rbq"),
+                    zip_info(".rockbox/rekordpod/smart-playlists.rbq"),
                     smart_queries,
                 )
             for current, (stable_key, track_id, bpm, rating, color) in enumerate(
@@ -457,7 +459,7 @@ def build(args: argparse.Namespace) -> None:
                 )
                 if payload is not None:
                     target.writestr(
-                        zip_info(f".rockbox/rbprep/tracks/{int(track_id):06d}.rbw"),
+                        zip_info(f".rockbox/rekordpod/tracks/{int(track_id):06d}.rbw"),
                         payload,
                     )
                     analyzed += 1
@@ -482,7 +484,7 @@ def build_index_only(args: argparse.Namespace) -> None:
     output = Path(args.index_output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary_name = tempfile.mkstemp(
-        prefix=".rbprep-index-", suffix=".rbi", dir=output.parent
+        prefix=".rekordpod-index-", suffix=".rbi", dir=output.parent
     )
     try:
         with os.fdopen(handle, "wb") as stream:

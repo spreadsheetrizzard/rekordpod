@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Apply RBPrep's on-device edit journals to a rekordbox USB export.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Apply Rekordpod's on-device edit journals to a rekordbox USB export.
 
 The journal stores full track snapshots.  Only the newest snapshot for each
 track is considered, and that desired state is diffed against export.pdb and
@@ -25,16 +27,16 @@ try:
 except ImportError as error:  # pragma: no cover - exercised by the launcher
     raise SystemExit(
         "rekordbox-pdb editing support is unavailable. Run this with the "
-        "RBPrep Python environment and its rekordbox-pdb source on PYTHONPATH."
+        "Rekordpod Python environment and its rekordbox-pdb source on PYTHONPATH."
     ) from error
 
 
 EDIT_RECORD_SIZE = 216
 EDIT_MAGIC = b"RBE1"
 EDIT_VERSIONS = (1, 2)
-EDIT_JOURNAL = Path(".rockbox/rbprep/edits.rbe")
-PLAYLIST_JOURNAL = Path(".rockbox/rbprep/playlist-adds.rba")
-LOCAL_BURN_STATE = Path(".rockbox/rbprep/local-burn.rbs")
+EDIT_JOURNAL = Path(".rockbox/rekordpod/edits.rbe")
+PLAYLIST_JOURNAL = Path(".rockbox/rekordpod/playlist-adds.rba")
+LOCAL_BURN_STATE = Path(".rockbox/rekordpod/local-burn.rbs")
 PDB_PATH = Path("PIONEER/rekordbox/export.pdb")
 COLOR_RGB = (
     (255, 70, 70), (255, 145, 40), (250, 220, 45), (55, 235, 95),
@@ -318,7 +320,7 @@ def current_color_index(color_id: int) -> int:
 
 
 def source_bpm_from_cache(volume: Path, track_id: int, fallback: int) -> int:
-    path = volume / f".rockbox/rbprep/tracks/{track_id:06d}.rbw"
+    path = volume / f".rockbox/rekordpod/tracks/{track_id:06d}.rbw"
     try:
         header = path.read_bytes()[:28]
     except OSError:
@@ -374,7 +376,7 @@ def plan_changes(volume: Path, snapshots: dict[int, EditSnapshot],
             continue
         for path in analysis_files:
             original = path.read_bytes()
-            baseline_path = path.with_name(path.name + ".rbprep-bak")
+            baseline_path = path.with_name(path.name + ".rekordpod-bak")
             baseline = baseline_path.read_bytes() if baseline_path.exists() else original
             source_bpm = source_bpm_from_cache(volume, track_id, track.tempo)
             rewritten = rewrite_analysis(baseline, snapshot, source_bpm)
@@ -433,7 +435,7 @@ def backup_files(volume: Path, backup_root: Path, paths: Iterable[Path]) -> Path
 
 
 def atomic_replace(path: Path, data: bytes) -> None:
-    temporary = path.with_name(f".{path.name}.rbprep-new-{os.getpid()}")
+    temporary = path.with_name(f".{path.name}.rekordpod-new-{os.getpid()}")
     try:
         with temporary.open("wb") as handle:
             handle.write(data)
@@ -513,7 +515,7 @@ def run(args: argparse.Namespace) -> int:
             return 1
         atomic_replace(burn_state_path,
                        local_burn_state(edit_size, playlist_size))
-        print("The Rekordbox export already matches the newest RBPrep state.")
+        print("The Rekordbox export already matches the newest Rekordpod state.")
         return 0
 
     replacements: dict[Path, bytes] = {pdb_path: pdb_bytes, **analysis}

@@ -1,4 +1,6 @@
-/* RBPrep's on-device rekordbox transaction writer.
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
+/* Rekordpod's on-device rekordbox transaction writer.
  *
  * This is included by rbprep.c after the edit-journal helpers so it can share
  * the plugin's compact RBE1 format without exporting a second plugin ABI.
@@ -6,13 +8,13 @@
  * same-directory temporary replacement before it is renamed into place.
  */
 
-#define RBPREP_PDB_NEW  RBPREP_PDB ".rbprep-new"
-#define RBPREP_PDB_PREV RBPREP_PDB ".rbprep-prev"
-#define RBPREP_PDB_BAK  RBPREP_PDB ".rbprep-bak"
-#define RBPREP_PDB_FAILED "/.rockbox/rbprep/export-failed.pdb"
-#define RBPREP_INDEX_NEW  RBPREP_INDEX ".rbprep-new"
-#define RBPREP_INDEX_PREV RBPREP_INDEX ".rbprep-prev"
-#define RBPREP_INDEX_BAK  RBPREP_INDEX ".rbprep-bak"
+#define RBPREP_PDB_NEW  RBPREP_PDB ".rekordpod-new"
+#define RBPREP_PDB_PREV RBPREP_PDB ".rekordpod-prev"
+#define RBPREP_PDB_BAK  RBPREP_PDB ".rekordpod-bak"
+#define RBPREP_PDB_FAILED "/.rockbox/rekordpod/export-failed.pdb"
+#define RBPREP_INDEX_NEW  RBPREP_INDEX ".rekordpod-new"
+#define RBPREP_INDEX_PREV RBPREP_INDEX ".rekordpod-prev"
+#define RBPREP_INDEX_BAK  RBPREP_INDEX ".rekordpod-bak"
 #define RBPREP_PDB_PAGE_MAX 4096
 #define RBPREP_PDB_TOUCH_MAX 32
 
@@ -1923,8 +1925,8 @@ static bool burn_rewrite_track_cues(uint32_t track_id,
 
     rb->snprintf(path, sizeof(path), "%s/%06lu.rbw", RBPREP_TRACK_DIR,
                  (unsigned long)track_id);
-    rb->snprintf(temporary, sizeof(temporary), "%s.rbprep-new", path);
-    rb->snprintf(previous, sizeof(previous), "%s.rbprep-prev", path);
+    rb->snprintf(temporary, sizeof(temporary), "%s.rekordpod-new", path);
+    rb->snprintf(previous, sizeof(previous), "%s.rekordpod-prev", path);
     if (!rb->file_exists(path) && rb->file_exists(previous))
         rb->rename(previous, path);
     if (!rb->file_exists(path))
@@ -2133,9 +2135,9 @@ static bool burn_rewrite_analysis(const char *path,
     bool saw_pco2 = false;
     bool extended;
 
-    rb->snprintf(backup, sizeof(backup), "%s.rbprep-bak", path);
-    rb->snprintf(temporary, sizeof(temporary), "%s.rbprep-new", path);
-    rb->snprintf(previous, sizeof(previous), "%s.rbprep-prev", path);
+    rb->snprintf(backup, sizeof(backup), "%s.rekordpod-bak", path);
+    rb->snprintf(temporary, sizeof(temporary), "%s.rekordpod-new", path);
+    rb->snprintf(previous, sizeof(previous), "%s.rekordpod-prev", path);
     extended = rb->strrchr(path, '.') &&
                !rb->strcasecmp(rb->strrchr(path, '.'), ".EXT");
     if (!rb->file_exists(path) && rb->file_exists(previous))
@@ -2352,7 +2354,7 @@ static void burn_finish_analysis_files(struct rbprep_pdb *pdb,
 
         rb->snprintf(path, sizeof(path), "%s/%06lu.rbw",
                      RBPREP_TRACK_DIR, (unsigned long)track_id);
-        rb->snprintf(previous, sizeof(previous), "%s.rbprep-prev", path);
+        rb->snprintf(previous, sizeof(previous), "%s.rekordpod-prev", path);
         if (restore)
             burn_restore_previous(path, previous);
         else
@@ -2362,13 +2364,13 @@ static void burn_finish_analysis_files(struct rbprep_pdb *pdb,
             !track.analysis_path[0])
             continue;
         rb->strlcpy(path, track.analysis_path, sizeof(path));
-        rb->snprintf(previous, sizeof(previous), "%s.rbprep-prev", path);
+        rb->snprintf(previous, sizeof(previous), "%s.rekordpod-prev", path);
         if (restore)
             burn_restore_previous(path, previous);
         else
             rb->remove(previous);
         burn_analysis_variant(path, ".EXT");
-        rb->snprintf(previous, sizeof(previous), "%s.rbprep-prev", path);
+        rb->snprintf(previous, sizeof(previous), "%s.rekordpod-prev", path);
         if (restore)
             burn_restore_previous(path, previous);
         else

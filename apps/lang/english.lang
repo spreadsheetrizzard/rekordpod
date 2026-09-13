@@ -10760,24 +10760,24 @@
 </phrase>
 <phrase>
   id: LANG_USB_RBPREP
-  desc: RBPrep translated USB disk geometry
+  desc: Rekordpod translated USB disk geometry
   user: core
   <source>
     *: none
-    ipod6g: "RBPrep Mode"
+    ipod6g: "Rekordpod Mode"
   </source>
   <dest>
     *: none
-    ipod6g: "RBPrep Mode"
+    ipod6g: "Rekordpod Mode"
   </dest>
   <voice>
     *: none
-    ipod6g: "RBPrep Mode"
+    ipod6g: "Rekordpod Mode"
   </voice>
 </phrase>
 <phrase>
   id: LANG_RBPREP_TRANSPARENT
-  desc: RBPrep mode
+  desc: Rekordpod mode
   user: core
   <source>
     *: none
@@ -10794,7 +10794,7 @@
 </phrase>
 <phrase>
   id: LANG_RBPREP_READ_ONLY
-  desc: RBPrep mode
+  desc: Rekordpod mode
   user: core
   <source>
     *: none
@@ -10811,7 +10811,7 @@
 </phrase>
 <phrase>
   id: LANG_RBPREP_READ_WRITE
-  desc: RBPrep mode
+  desc: Rekordpod mode
   user: core
   <source>
     *: none

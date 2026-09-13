@@ -82,7 +82,7 @@ static void draw_usb_keypad_mode(struct viewport *title)
 #endif /* USB_ENABLE_HID */
 
 #if defined(IPOD_6G) && defined(HAVE_LCD_COLOR)
-#define REKORDPOD_USB_STATUS "/.rockbox/rbprep/usb-status.rbs"
+#define REKORDPOD_USB_STATUS "/.rockbox/rekordpod/usb-status.rbs"
 #define REKORDPOD_DAC_SAMPLES 512
 #define REKORDPOD_DAC_BANDS 20
 

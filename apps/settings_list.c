@@ -2488,7 +2488,7 @@ const struct settings_list settings[] = {
 
 #ifdef IPOD_6G
     CHOICE_SETTING(0, usb_rbprep, LANG_USB_RBPREP,
-                   RBPREP_MODE_READ_WRITE, "rbprep mode",
+                   RBPREP_MODE_READ_WRITE, "rekordpod mode",
                    "transparent,read-only,read-write",
                    usb_storage_set_rbprep, 3,
                    ID2P(LANG_RBPREP_TRANSPARENT),

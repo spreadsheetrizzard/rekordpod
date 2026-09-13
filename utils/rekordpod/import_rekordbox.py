@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Convert a rekordbox Device Library export into RBPrep/Rockbox inputs.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Convert a rekordbox Device Library export into Rekordpod/Rockbox inputs.
 
 The metadata model deliberately mirrors Drag'n'Dunk's ImportedTrackRow and
 playlist ordering.  Audio paths in export.pdb are already rooted at the
@@ -42,7 +44,7 @@ BAD_COMPONENT = re.compile(r"[/:\\\x00-\x1f]")
 
 
 class Progress:
-    """Small dependency-free terminal progress bar for long RBPrep jobs."""
+    """Small dependency-free terminal progress bar for long Rekordpod jobs."""
 
     def __init__(self, phase: str, total: int):
         self.phase = phase
@@ -302,8 +304,8 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
     destination.mkdir(parents=True, exist_ok=True)
     playlist_root = destination / "Playlists"
     playlist_root.mkdir(exist_ok=True)
-    cache_path = destination / "rbprep-library.sqlite"
-    temporary_cache = destination / ".rbprep-library.sqlite.tmp"
+    cache_path = destination / "rekordpod-library.sqlite"
+    temporary_cache = destination / ".rekordpod-library.sqlite.tmp"
     temporary_cache.unlink(missing_ok=True)
     preserved_smart_queries: list[tuple[int, int, int, str]] = []
     if cache_path.exists():
@@ -466,7 +468,7 @@ def convert(source: Path, destination: Path, analysis_root: Path | None = None) 
             for value in analyses.values()
         ),
     }
-    (destination / "rbprep-summary.json").write_text(
+    (destination / "rekordpod-summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return summary

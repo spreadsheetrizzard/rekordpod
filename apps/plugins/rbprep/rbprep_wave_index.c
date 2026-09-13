@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "rbprep_wave_index.h"
 
 #define RBX_HEADER_SIZE 64
@@ -6,7 +8,7 @@
 #else
 #define RBX_VERSION 1
 #endif
-#define RBX_DIR "/.rockbox/rbprep/wave-index"
+#define RBX_DIR "/.rockbox/rekordpod/wave-index"
 
 static const uint16_t level_blocks[RBPREP_WAVE_INDEX_LEVELS] = {
 #if RBPREP_WAVE_INDEX_FINE

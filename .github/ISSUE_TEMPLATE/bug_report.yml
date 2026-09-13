@@ -1,0 +1,81 @@
+name: Rekordpod beta bug
+description: Report a reproducible device, playback, UI, USB, or library-write problem
+title: "[beta] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Back up the complete `PIONEER` directory before reproducing a write-path problem. Do not upload music, private library databases, serial numbers, or unredacted journals to a public issue.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit and ZIP SHA-256
+      description: Identify the exact source commit and installed archive.
+      placeholder: commit; sha256
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: iPod target
+      options:
+        - iPod Classic 6G/7G
+        - iPod Video 5G/5.5G
+        - Unsupported / other
+    validations:
+      required: true
+  - type: input
+    id: storage
+    attributes:
+      label: Storage
+      description: Drive/card type, adapter model, capacity, and filesystem.
+      placeholder: 1 TB microSD array; adapter; FAT32
+    validations:
+      required: true
+  - type: input
+    id: library
+    attributes:
+      label: Library and track context
+      description: Track/playlist counts, rekordbox version, affected format, duration, BPM, and zoom. Redact names if needed.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Exact reproduction steps
+      description: Include playback state, elapsed time, inputs in order, and whether USB was attached.
+      placeholder: |
+        1. Open ...
+        2. Press ...
+        3. After ... seconds ...
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed result
+      description: Quote the complete on-screen error and describe audio/display behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted evidence
+      description: Attach a simulator capture or device photo and list preserved recovery filenames. Do not upload copyrighted audio or private databases.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I have a separate backup of the affected library.
+          required: true
+        - label: I removed private metadata and device identifiers from public attachments.
+          required: true

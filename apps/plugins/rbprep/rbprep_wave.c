@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "rbprep_wave.h"
 
 static bool read_exact(const struct plugin_api *api, int fd,

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """Regression tests for Rekordpod's append-only edit and cue formats."""
 
 import importlib.util

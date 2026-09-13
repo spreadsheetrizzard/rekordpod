@@ -168,7 +168,7 @@ not a full sample array.
 
 ### On-device RBX1 sidecar
 
-The iPod may build `/.rockbox/rbprep/wave-index/<track-id>.rbx` from RBW3. This
+The iPod may build `/.rockbox/rekordpod/wave-index/<track-id>.rbx` from RBW3. This
 is an acceleration cache, never the sole copy of analysis.
 
 - It is built by streaming RBW3 through a 4-16 KiB buffer.
@@ -266,7 +266,7 @@ power loss cannot invalidate the older generation.
 
 Writes are sequential and infrequent. Wheel movement and cue experimentation
 never cause repeated sector updates. State files live under
-`/.rockbox/rbprep/state/`; installers preserve that directory.
+`/.rockbox/rekordpod/state/`; installers preserve that directory.
 
 ## PDB and Rekordpod-index transaction
 

@@ -1,11 +1,11 @@
-# RBPrep Rekordbox metadata importer
+# Rekordpod Rekordbox metadata importer
 
 `import_rekordbox.py` reads the `PIONEER/rekordbox/export.pdb` Device Library
 database and produces two inputs:
 
 * `Playlists/**/*.m3u8`, preserving Rekordbox folders, playlist order, and the
   volume-rooted `/Contents/...` paths Rockbox uses.
-* `rbprep-library.sqlite`, using the metadata fields and stable identities from
+* `rekordpod-library.sqlite`, using the metadata fields and stable identities from
   Drag'n'Dunk (`rb:<TrackID>`).
 
 The SQLite cache includes title, artist, album, genre, BPM, key, year, rating,
@@ -22,8 +22,8 @@ amplitude and RGB samples instead of enlarging the 1,200-point overview.
 Install the parser and run:
 
 ```
-python3 -m pip install -r utils/rbprep/requirements.txt
-python3 utils/rbprep/import_rekordbox.py \
+python3 -m pip install -r utils/rekordpod/requirements.txt
+python3 utils/rekordpod/import_rekordbox.py \
     /Volumes/RIZZPOD/PIONEER/rekordbox/export.pdb output-directory \
     --analysis-root /Volumes/RIZZPOD/PIONEER/USBANLZ
 ```
@@ -40,16 +40,14 @@ or import date and sort by title, BPM, year, key, comments, tags, or import
 date without sorting thousands of records on the iPod. BPM and musical key
 remain visible together in every Collection row.
 
-The RBPrep plugin journals confirmed changes immediately by default. Its
-`Save Edits` setting can instead coalesce changes into one snapshot when the
-next track loads. Pending Edits is scrollable and shows both coalesced track
-snapshots and playlist operations: SELECT opens the referenced track, hold
-SELECT confirms deletion of the selected request, and PLAY opens the local-burn
-confirmation. `Auto Burn` remains off by default; when explicitly enabled it
-runs that same transaction after each confirmed edit rather than on wheel
-movement. Analysis edits stop playback only while borrowing the codec buffer;
-playlist-only commits keep playback allocated. Local burn keeps persistent
-`.rbprep-bak` originals, consumes only the journal tail after the last
+The Rekordpod plugin writes confirmed changes to its verified journal immediately,
+but coalesces repeated work on one track into the newest complete snapshot.
+When a dirty track unloads, Rekordpod asks whether to save or discard it before
+the next track takes over. Confirmed playlist operations burn immediately
+without running from wheel movement. Analysis edits stop playback only while
+borrowing the codec buffer; playlist-only commits keep playback allocated.
+Local burn keeps persistent
+`.rekordpod-bak` originals, consumes only the journal tail after the last
 successful marker, and refuses incomplete or over-capacity journals instead of
 silently advancing them. Repeated playlist operations replay idempotently, the
 local RBI3 membership table is compacted on every playlist transaction, and
@@ -75,7 +73,7 @@ repeated tools remain repeated cells. Workflows never replay edits or input
 timing: horizontal stepping only selects the next tool. SELECT+LEFT/RIGHT
 steps within a row and SELECT+up/down swaps the two rows. A playlist's hold
 menu can associate M1 or M2 so the pad appears automatically during prep.
-Hold SELECT on either VIZ macro orb to open its manager. Each workflow can be
+Hold SELECT on either LOCK workflow orb to open its manager. Each workflow can be
 renamed, edited, or cleared. The sequence editor supports explicit INSERT,
 REPLACE, and DELETE operations at any valid cell; its paged picker exposes all
 ordinary Prep Deck tools but excludes the two workflow orbs to prevent
@@ -84,15 +82,15 @@ executes a tool, seeks, or modifies track metadata.
 Workflow files use stable, append-only tool identifiers. Older RBM1/RBM2 files
 are upgraded to RBM3 without changing their sequence, and the workflow picker
 uses the same canonical names and icon renderer as the live tool orbs. The
-MACR page orders its controls M1, M2, then Pitch Lock.
+LOCK page orders Pitch Lock, Quantize, M1, and M2.
 `tool-macros.rbm` and `playlist-workflows.rbl` are independent of analysis
 caches and are preserved by ordinary overlay installs.
 
 Internally smart playlists use RBI node kind `2` (folder is `0`, materialized
 playlist is `1`) and are marked SMART in the device browser. Their rules live
-in `/.rockbox/rbprep/smart-playlists.rbq`: the first line is `RBQ1`; each later
+in `/.rockbox/rekordpod/smart-playlists.rbq`: the first line is `RBQ1`; each later
 line begins with the stable playlist ID and a tab, followed by versioned flags,
-a reserved native-Rekordbox rule-kind field, and the query payload. RBPrep only
+a reserved native-Rekordbox rule-kind field, and the query payload. Rekordpod only
 reads the leading ID today, deliberately retaining the complete remaining
 query text byte-for-byte. Local burn materializes current membership as a
 traditional playlist for CDJ compatibility while preserving node kind `2` and
@@ -109,17 +107,17 @@ attach to the current indexed Rockbox track without restarting it.
 This fork launches Rekordpod once during Rockbox startup when
 `/.rockbox/rocks/apps/rekordpod.rock` is present. The `autoboot` launch draws an
 animated `rekordpod` wordmark using the bundled Adobe Helvetica font. Holding
-MENU during boot bypasses RBPrep, and RBPrep's Exit to Rockbox item returns to
+MENU during boot bypasses Rekordpod, and Rekordpod's Exit to Rockbox item returns to
 the ordinary root menu without relaunching it. Main and browser selections use
 rounded capsule geometry; the main menu is icon-first and the playlist tree has
-separate folder and playlist glyphs. Search and Add Genre use an RBPrep wheel
+separate folder and playlist glyphs. Search and Add Genre use a Rekordpod wheel
 keyboard with selectable Space, Backspace, and Done keys plus direct LEFT,
 RIGHT, PLAY, and MENU shortcuts.
 
 Local burn updates the traditional Rekordbox Device Library (`export.pdb`) and
 its DAT/EXT analysis files. Those changes are intended for players that browse
 the traditional Device Library. Hardware that reads only OneLibrary / Device
-Library Plus needs a matching Plus-library update; RBPrep does not write that
+Library Plus needs a matching Plus-library update; Rekordpod does not write that
 second database yet.
 
 `apply_device_edits.py` is an optional host-side recovery and diagnostic tool,
@@ -134,9 +132,19 @@ Run a read-only preview first:
 
 ```
 PYTHONPATH=/path/to/rekordbox-pdb/src python3 \
-    utils/rbprep/apply_device_edits.py \
+    utils/rekordpod/apply_device_edits.py \
     --volume /Volumes/RIZZPOD --backup-root /path/to/backups
 ```
 
 Add `--apply` only after reviewing the preview. It is not required to prepare
 tracks or playlists in Rekordpod.
+
+Public builds compile the retained private screenshot implementation out with
+`REKORDPOD_PRIVATE_SCREENSHOTS=0`. Simulator capture and real-device photography
+are the supported release-media paths; see the checklist in
+[`TESTING.md`](../../TESTING.md).
+
+Rekordpod and these utilities are part of this Rockbox fork and are distributed
+under GPL-2.0-or-later. Dependency, format-research, Drag'n'Dunk lineage, font,
+trademark, and AI-assistance disclosures are recorded in
+[`ATTRIBUTION.md`](../../ATTRIBUTION.md).

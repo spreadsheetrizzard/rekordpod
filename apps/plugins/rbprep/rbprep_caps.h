@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef RBPREP_CAPS_H
 #define RBPREP_CAPS_H
 

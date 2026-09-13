@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #include "plugin.h"
 #include "lib/configfile.h"
 #include "lib/helper.h"
@@ -10,14 +12,14 @@
 #include "rbprep_wave_index.h"
 
 #if CONFIG_KEYPAD != IPOD_4G_PAD
-#error "RBPrep currently targets the iPod click wheel"
+#error "Rekordpod currently targets the iPod click wheel"
 #endif
 
 #define RBPREP_PDB "/PIONEER/rekordbox/export.pdb"
-#define RBPREP_INDEX "/.rockbox/rbprep/library.rbi"
-#define RBPREP_GENRES "/.rockbox/rbprep/genres.rbg"
-#define RBPREP_CUSTOM_GENRES "/.rockbox/rbprep/custom-genres.txt"
-#define RBPREP_TRACK_DIR "/.rockbox/rbprep/tracks"
+#define RBPREP_INDEX "/.rockbox/rekordpod/library.rbi"
+#define RBPREP_GENRES "/.rockbox/rekordpod/genres.rbg"
+#define RBPREP_CUSTOM_GENRES "/.rockbox/rekordpod/custom-genres.txt"
+#define RBPREP_TRACK_DIR "/.rockbox/rekordpod/tracks"
 #define RBPREP_POINTS 131072
 #define RBPREP_BEATS 16384
 #define RBPREP_INDEX_HEADER 64
@@ -33,7 +35,7 @@
 #define RBPREP_TRACK_CACHE_ROWS 18
 #define RBPREP_LIBRARY_SCAN_BYTES 4096
 #define RBPREP_PLAYLIST_ORDER_MAX 8192
-#define RBPREP_PLAYLIST_ORDER_DIR "/.rockbox/rbprep/state/orders"
+#define RBPREP_PLAYLIST_ORDER_DIR "/.rockbox/rekordpod/state/orders"
 #define RBPREP_TREE_NODES 2048
 #define RBPREP_STATUS_HEIGHT 8
 #define RBPREP_DECK_X 0
@@ -62,36 +64,41 @@
 #define RBPREP_HUD_SCROLL_TICKS MAX(1, HZ / 10)
 #define RBPREP_STATUS_TICKS MAX(1, HZ)
 #define RBPREP_CONFIG_VERSION 4
-#define RBPREP_CONFIG_FILE "/.rockbox/rbprep/rbprep.cfg"
-#define RBPREP_SCREENSHOT_DIR "/.rockbox/rbprep/screenshots"
-#define RBPREP_DEVICE_NAME_FILE "/.rockbox/rbprep/device-name.txt"
-#define RBPREP_USB_STATUS "/.rockbox/rbprep/usb-status.rbs"
-#define RBPREP_AUTOBOOT_OFF "/.rockbox/rbprep/autoboot.off"
-#define RBPREP_MACRO_FILE_A "/.rockbox/rbprep/state/macros.a"
-#define RBPREP_MACRO_FILE_B "/.rockbox/rbprep/state/macros.b"
-#define RBPREP_MACRO_LEGACY_FILE "/.rockbox/rbprep/tool-macros.rbm"
-#define RBPREP_MACRO_LEGACY_TMP "/.rockbox/rbprep/tool-macros.rbm.tmp"
-#define RBPREP_MACRO_LEGACY_PREV "/.rockbox/rbprep/tool-macros.rbm.prev"
+#define RBPREP_CONFIG_FILE "/.rockbox/rekordpod/rekordpod.cfg"
+#ifndef REKORDPOD_ENABLE_SCREENSHOTS
+#define REKORDPOD_ENABLE_SCREENSHOTS 0
+#endif
+#if REKORDPOD_ENABLE_SCREENSHOTS
+#define RBPREP_SCREENSHOT_DIR "/.rockbox/rekordpod/screenshots"
+#endif
+#define RBPREP_DEVICE_NAME_FILE "/.rockbox/rekordpod/device-name.txt"
+#define RBPREP_USB_STATUS "/.rockbox/rekordpod/usb-status.rbs"
+#define RBPREP_AUTOBOOT_OFF "/.rockbox/rekordpod/autoboot.off"
+#define RBPREP_MACRO_FILE_A "/.rockbox/rekordpod/state/macros.a"
+#define RBPREP_MACRO_FILE_B "/.rockbox/rekordpod/state/macros.b"
+#define RBPREP_MACRO_LEGACY_FILE "/.rockbox/rekordpod/tool-macros.rbm"
+#define RBPREP_MACRO_LEGACY_TMP "/.rockbox/rekordpod/tool-macros.rbm.tmp"
+#define RBPREP_MACRO_LEGACY_PREV "/.rockbox/rekordpod/tool-macros.rbm.prev"
 #define RBPREP_MACRO_LEGACY_ROOT "/.rekordpod-macros.rbm"
 #define RBPREP_MACRO_LEGACY_ROOT_TMP "/.rekordpod-macros.rbm.tmp"
 #define RBPREP_MACRO_LEGACY_ROOT_PREV "/.rekordpod-macros.rbm.prev"
 #define RBPREP_MACRO_LINK_FILE "/.rekordpod-workflows.rbl"
 #define RBPREP_MACRO_LINK_TMP "/.rekordpod-workflows.rbl.tmp"
 #define RBPREP_MACRO_LINK_LEGACY \
-    "/.rockbox/rbprep/playlist-workflows.rbl"
-#define RBPREP_SMART_QUERY_FILE "/.rockbox/rbprep/smart-playlists.rbq"
-#define RBPREP_PLAYLIST_JOURNAL "/.rockbox/rbprep/playlist-adds.rba"
-#define RBPREP_EDIT_JOURNAL "/.rockbox/rbprep/edits.rbe"
-#define RBPREP_EDIT_JOURNAL_REPAIR RBPREP_EDIT_JOURNAL ".rbprep-repair"
-#define RBPREP_EDIT_JOURNAL_BAD RBPREP_EDIT_JOURNAL ".rbprep-corrupt"
+    "/.rockbox/rekordpod/playlist-workflows.rbl"
+#define RBPREP_SMART_QUERY_FILE "/.rockbox/rekordpod/smart-playlists.rbq"
+#define RBPREP_PLAYLIST_JOURNAL "/.rockbox/rekordpod/playlist-adds.rba"
+#define RBPREP_EDIT_JOURNAL "/.rockbox/rekordpod/edits.rbe"
+#define RBPREP_EDIT_JOURNAL_REPAIR RBPREP_EDIT_JOURNAL ".rekordpod-repair"
+#define RBPREP_EDIT_JOURNAL_BAD RBPREP_EDIT_JOURNAL ".rekordpod-corrupt"
 #define RBPREP_PLAYLIST_JOURNAL_REPAIR \
-    RBPREP_PLAYLIST_JOURNAL ".rbprep-repair"
+    RBPREP_PLAYLIST_JOURNAL ".rekordpod-repair"
 #define RBPREP_PLAYLIST_JOURNAL_BAD \
-    RBPREP_PLAYLIST_JOURNAL ".rbprep-corrupt"
-#define RBPREP_BURN_STATE "/.rockbox/rbprep/local-burn.rbs"
-#define RBPREP_BURN_STATE_NEW RBPREP_BURN_STATE ".rbprep-new"
-#define RBPREP_BURN_STATE_PREV RBPREP_BURN_STATE ".rbprep-prev"
-#define RBPREP_SEARCH_RESULTS "/.rockbox/rbprep/state/search.results"
+    RBPREP_PLAYLIST_JOURNAL ".rekordpod-corrupt"
+#define RBPREP_BURN_STATE "/.rockbox/rekordpod/local-burn.rbs"
+#define RBPREP_BURN_STATE_NEW RBPREP_BURN_STATE ".rekordpod-new"
+#define RBPREP_BURN_STATE_PREV RBPREP_BURN_STATE ".rekordpod-prev"
+#define RBPREP_SEARCH_RESULTS "/.rockbox/rekordpod/state/search.results"
 /* Fixed-size, little-endian RBE1 snapshots make interrupted appends harmless
    and keep the eventual macOS importer independent of compiler struct layout. */
 #define RBPREP_EDIT_RECORD_SIZE 216
@@ -112,7 +119,9 @@
 #define RBPREP_MAIN_DISSOLVE_STEPS 16
 #define RBPREP_CONTEXT_TRANSITION_TICKS MAX(1, HZ / 50)
 #define RBPREP_CONTEXT_TRANSITION_FRAMES 7
+#if REKORDPOD_ENABLE_SCREENSHOTS
 #define RBPREP_SCREENSHOT_ROW_BYTES ((LCD_WIDTH * 3 + 3) & ~3)
+#endif
 #define RBPREP_MAIN_SCREEN_X 101
 #define RBPREP_MAIN_SCREEN_Y 26
 #define RBPREP_MAIN_SCREEN_W 118
@@ -457,9 +466,13 @@ static fb_data main_transition_thumbnail[RBPREP_RETURN_THUMB_W *
                                          RBPREP_RETURN_THUMB_H];
 static unsigned short main_transition_x_lut[LCD_WIDTH];
 static unsigned short main_transition_y_lut[LCD_HEIGHT];
+#if REKORDPOD_ENABLE_SCREENSHOTS
 static unsigned char screenshot_row[RBPREP_SCREENSHOT_ROW_BYTES];
+#endif
 static struct viewport *main_viewport;
+#if REKORDPOD_ENABLE_SCREENSHOTS
 static bool screenshot_hold_fired;
+#endif
 static bool transition_render_only;
 static bool transition_running;
 static enum rbprep_mode presented_mode;
@@ -871,7 +884,7 @@ static void restore_dac_gain(void)
 static void set_storage_performance_mode(bool enabled)
 {
 #ifdef DISK_SPINDOWN
-    /* RBPrep's animation should not stall while ATA/iFlash wakes for the
+    /* Rekordpod's animation should not stall while ATA/iFlash wakes for the
        periodic playback-buffer refill. Restore the user's policy on lock or
        exit so this performance mode does not leak into normal Rockbox use. */
     rb->storage_spindown(enabled ? 254
@@ -1957,6 +1970,7 @@ static bool write_exact(int fd, const void *buffer, size_t size)
     return true;
 }
 
+#if REKORDPOD_ENABLE_SCREENSHOTS
 static bool save_rekordpod_screenshot(void)
 {
     unsigned char header[54];
@@ -2036,6 +2050,7 @@ static bool handle_screenshot_hold(int button)
     }
     return false;
 }
+#endif
 
 static uint32_t macro_checksum(const unsigned char *data, size_t size)
 {
@@ -6587,8 +6602,8 @@ static void refresh_pending_summary(void)
 
 static bool delete_pending_edit(uint32_t track_id)
 {
-    const char *temporary = RBPREP_EDIT_JOURNAL ".rbprep-new";
-    const char *previous = RBPREP_EDIT_JOURNAL ".rbprep-prev";
+    const char *temporary = RBPREP_EDIT_JOURNAL ".rekordpod-new";
+    const char *previous = RBPREP_EDIT_JOURNAL ".rekordpod-prev";
     unsigned char data[RBPREP_EDIT_RECORD_SIZE];
     uint32_t edit_offset;
     uint32_t playlist_offset;
@@ -6661,8 +6676,8 @@ static bool delete_pending_edit(uint32_t track_id)
 
 static bool commit_pending_edit(uint32_t track_id)
 {
-    const char *temporary = RBPREP_EDIT_JOURNAL ".rbprep-new";
-    const char *previous = RBPREP_EDIT_JOURNAL ".rbprep-prev";
+    const char *temporary = RBPREP_EDIT_JOURNAL ".rekordpod-new";
+    const char *previous = RBPREP_EDIT_JOURNAL ".rekordpod-prev";
     unsigned char data[RBPREP_EDIT_RECORD_SIZE];
     unsigned char latest[RBPREP_EDIT_RECORD_SIZE];
     uint32_t edit_offset;
@@ -6817,8 +6832,8 @@ static bool delete_pending_playlist(unsigned char operation,
                                     uint32_t track_id,
                                     uint32_t playlist_id)
 {
-    const char *temporary = RBPREP_PLAYLIST_JOURNAL ".rbprep-new";
-    const char *previous = RBPREP_PLAYLIST_JOURNAL ".rbprep-prev";
+    const char *temporary = RBPREP_PLAYLIST_JOURNAL ".rekordpod-new";
+    const char *previous = RBPREP_PLAYLIST_JOURNAL ".rekordpod-prev";
     char line[160];
     uint32_t edit_offset;
     uint32_t playlist_offset;
@@ -7378,7 +7393,7 @@ static void service_play_statistics(void)
         play_stat_counted = true;
         if (total_plays < INT_MAX)
             total_plays++;
-        /* This used to rewrite rbprep.cfg synchronously at exactly 60 s.
+        /* This used to rewrite rekordpod.cfg synchronously at exactly 60 s.
            iFlash erase/program latency then froze the render loop for several
            seconds. Persist at pause, track change, USB, or plugin exit. */
         mark_rbprep_config_dirty();
@@ -7559,7 +7574,7 @@ static bool load_waveform(int track_id)
     source_fingerprint = rbprep_wave_index_fingerprint(
         header, sizeof(header), source_size);
     rb->snprintf(index_filename, sizeof(index_filename),
-                 "/.rockbox/rbprep/wave-index/%06d.rbx", track_id);
+                 "/.rockbox/rekordpod/wave-index/%06d.rbx", track_id);
     if (!rbprep_wave_index_open(&wave_index, index_filename, track_id,
                                 waveform_points, source_size,
                                 source_fingerprint, overview_waveform) &&
@@ -12589,7 +12604,9 @@ static bool rbprep_keyboard(char *value, size_t size, const char *title)
     int character_count = sizeof(characters) - 1;
     int key_count = character_count + 3;
     int selected_key = 0;
+#if REKORDPOD_ENABLE_SCREENSHOTS
     bool play_pressed = false;
+#endif
 
     while (true) {
         int button;
@@ -12598,6 +12615,7 @@ static bool rbprep_keyboard(char *value, size_t size, const char *title)
 
         draw_rbprep_keyboard(title, value, selected_key);
         button = rb->button_get(true);
+#if REKORDPOD_ENABLE_SCREENSHOTS
         if (handle_screenshot_hold(button)) {
             play_pressed = false;
             continue;
@@ -12611,6 +12629,7 @@ static bool rbprep_keyboard(char *value, size_t size, const char *title)
                 return true;
             continue;
         }
+#endif
         if (button & BUTTON_REL)
             continue;
         base = button & ~BUTTON_REPEAT;
@@ -12626,6 +12645,10 @@ static bool rbprep_keyboard(char *value, size_t size, const char *title)
                 value[length] = ' ';
                 value[length + 1] = '\0';
             }
+#if !REKORDPOD_ENABLE_SCREENSHOTS
+        } else if (base == BUTTON_PLAY) {
+            return true;
+#endif
         } else if (base == BUTTON_MENU) {
             return false;
         } else if (base == BUTTON_SELECT && !(button & BUTTON_REPEAT)) {
@@ -14125,7 +14148,7 @@ static void apply_macro_step(const struct rbprep_macro_step *step)
 
 done:
     /* Workflow playback is a real-time navigation path. The macro file owns
-       stored defaults, so do not synchronously rewrite rbprep.cfg for every
+       stored defaults, so do not synchronously rewrite rekordpod.cfg for every
        cell transition; that disk write was long enough to drop input edges. */
     overview_dirty = true;
     force_full_redraw = true;
@@ -15011,7 +15034,9 @@ enum plugin_status plugin_start(const void *parameter)
     seek_portal_active = false;
     menu_button_down = false;
     menu_hold_fired = false;
+#if REKORDPOD_ENABLE_SCREENSHOTS
     screenshot_hold_fired = false;
+#endif
     force_full_redraw = true;
     selected_title[0] = selected_artist[0] = selected_genre[0] = '\0';
     selected_key[0] = selected_extension[0] = '\0';
@@ -15208,11 +15233,13 @@ enum plugin_status plugin_start(const void *parameter)
         button = rb->button_get_w_tmo(display_locked ? MAX(1, HZ / 20) : 1);
         if (button != BUTTON_NONE)
             redraw = true;
+#if REKORDPOD_ENABLE_SCREENSHOTS
         if (handle_screenshot_hold(button)) {
             pressed = BUTTON_NONE;
             force_full_redraw = true;
             continue;
         }
+#endif
         if (select_click_pending && button != BUTTON_NONE &&
             button != BUTTON_SELECT) {
             /* Keep a single click attached to the tool on which it began.

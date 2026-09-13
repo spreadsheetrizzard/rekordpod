@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
 #ifndef RBPREP_STORE_H
 #define RBPREP_STORE_H
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Host-side regression tests for RBPrep's 4096 <-> 512 translations."""
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+"""Host-side regression tests for Rekordpod's 4096 <-> 512 translations."""
 
 import os
 import struct
@@ -125,7 +127,7 @@ def sample_bpb():
     return data
 
 
-class RBPrepGeometryTests(unittest.TestCase):
+class RekordpodGeometryTests(unittest.TestCase):
     def test_observed_rizzpod_partition_geometry(self):
         translated = translate_mbr(sample_mbr())
         self.assertEqual(get32(translated, 454), 394_224)
@@ -168,12 +170,12 @@ class RBPrepGeometryTests(unittest.TestCase):
         self.assertEqual(translate_bpb_out(bpb), bpb)
 
 
-@unittest.skipUnless(os.environ.get("RBPREP_SNAPSHOT"),
-                     "set RBPREP_SNAPSHOT to test captured sectors")
-class RBPrepCapturedSectorTests(unittest.TestCase):
+@unittest.skipUnless(os.environ.get("REKORDPOD_SNAPSHOT"),
+                     "set REKORDPOD_SNAPSHOT to test captured sectors")
+class RekordpodCapturedSectorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.snapshot = Path(os.environ["RBPREP_SNAPSHOT"])
+        cls.snapshot = Path(os.environ["REKORDPOD_SNAPSHOT"])
         cls.mbr = (cls.snapshot / "disk-first-1MiB.bin").read_bytes()[:512]
         cls.bpb = (cls.snapshot / "fat32-first-4MiB.bin").read_bytes()[:512]
 
