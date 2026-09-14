@@ -46,9 +46,12 @@ fi
     -r "$SCRIPT_DIR/requirements-installer.txt"
 
 rm -rf "$SCRIPT_DIR/build" "$SCRIPT_DIR/dist"
-REKORDPOD_ASSET_DIR="$ASSET_DIR" \
-    "$VENV/bin/python" -m PyInstaller \
-    --noconfirm --clean "$SCRIPT_DIR/rekordpod-installer.spec"
+(
+    cd "$SCRIPT_DIR"
+    REKORDPOD_ASSET_DIR="$ASSET_DIR" \
+        "$VENV/bin/python" -m PyInstaller \
+        --noconfirm --clean "$SCRIPT_DIR/rekordpod-installer.spec"
+)
 
 mkdir -p "$OUTPUT_DIR"
 rm -rf "$OUTPUT_DIR/Rekordpod Installer.app" \

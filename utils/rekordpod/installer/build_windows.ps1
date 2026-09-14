@@ -35,8 +35,14 @@ Remove-Item -LiteralPath (Join-Path $PSScriptRoot "dist") `
 
 $env:REKORDPOD_ASSET_DIR = (Resolve-Path -LiteralPath $AssetDirectory).Path
 try {
-    & $Python -m PyInstaller --noconfirm --clean `
-        (Join-Path $PSScriptRoot "rekordpod-installer.spec")
+    Push-Location $PSScriptRoot
+    try {
+        & $Python -m PyInstaller --noconfirm --clean `
+            (Join-Path $PSScriptRoot "rekordpod-installer.spec")
+    }
+    finally {
+        Pop-Location
+    }
 }
 finally {
     Remove-Item Env:\REKORDPOD_ASSET_DIR -ErrorAction SilentlyContinue

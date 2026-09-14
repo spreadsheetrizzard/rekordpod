@@ -1,0 +1,59 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft release tag containing the iPod firmware archive
+        required: true
+        default: v1.0.0-beta.1
+
+permissions:
+  contents: write
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: utils/rekordpod/installer/requirements-installer.txt
+
+      - name: Download the matching iPod firmware
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          gh release download "${{ inputs.release_tag }}" `
+            --pattern rekordpod-public-beta-1-ipod6g.zip `
+            --dir release-assets
+
+      - name: Build the Windows installer
+        shell: pwsh
+        run: |
+          ./utils/rekordpod/installer/build_windows.ps1 `
+            "$PWD/release-assets" "$PWD/release-output"
+
+      - name: Package the Windows installer
+        shell: pwsh
+        run: |
+          Compress-Archive -CompressionLevel Optimal `
+            -Path "release-output/Rekordpod Installer.exe", `
+                  "release-output/Rekordpod Installer SHA256.txt" `
+            -DestinationPath "release-output/Rekordpod-Installer-Windows.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rekordpod-Installer-Windows
+          path: release-output/Rekordpod-Installer-Windows.zip
+
+      - name: Attach installer to the draft release
+        shell: pwsh
+        run: |
+          gh release upload "${{ inputs.release_tag }}" `
+            "release-output/Rekordpod-Installer-Windows.zip" --clobber
