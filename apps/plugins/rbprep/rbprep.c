@@ -458,6 +458,9 @@ static int theme_wheel_outline = LCD_RGBPACK(145, 153, 148);
 static int main_wheel_phase_fp;
 static int main_wheel_velocity_fp;
 static int main_wheel_touch_position;
+static int main_wheel_arm_delta;
+static bool main_wheel_gesture_tracked;
+static bool main_wheel_blocked_until_release;
 static long main_wheel_motion_tick;
 static long main_name_scroll_deadline;
 static bool main_transition_thumbnail_valid;
@@ -1346,7 +1349,7 @@ static struct rbprep_tool_page tool_pages[] = {
     { MODE_LOOP, "LOOPS", 4,
       { TOOL_LOOP_LENGTH, TOOL_LOOP_IN, TOOL_LOOP_OUT, TOOL_LOOP_ACTIVE } },
     { MODE_MACRO, "LOCK", 4,
-      { TOOL_KEYLOCK, TOOL_GRID_QUANTIZE, TOOL_MACRO_ONE, TOOL_MACRO_TWO } }
+      { TOOL_MACRO_ONE, TOOL_MACRO_TWO, TOOL_KEYLOCK, TOOL_GRID_QUANTIZE } }
 };
 
 static void update_player_tool_order(void)
@@ -6363,8 +6366,14 @@ static bool normalize_playlist_journal_records(void)
 
 static bool repair_pending_journals(void)
 {
-    return normalize_edit_journal_records() &&
-           normalize_playlist_journal_records();
+    /* Always attempt both repairs.  Short-circuiting here allowed a damaged
+       edit journal to leave an otherwise recoverable playlist tail untouched,
+       which then blocked create+add transactions with the misleading
+       "pending journal incomplete" error. */
+    bool edit_ok = normalize_edit_journal_records();
+    bool playlist_ok = normalize_playlist_journal_records();
+
+    return edit_ok && playlist_ok;
 }
 
 static void remove_pending_playlist_at(int slot)
@@ -6828,6 +6837,20 @@ static bool verify_playlist_journal_file(const char *path,
     return ok;
 }
 
+static bool playlist_journal_is_complete(void)
+{
+    int fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
+    off_t size;
+
+    if (fd < 0)
+        return true;
+    size = rb->filesize(fd);
+    rb->close(fd);
+    return size >= 0 && (uint64_t)size <= UINT32_MAX &&
+           verify_playlist_journal_file(RBPREP_PLAYLIST_JOURNAL,
+                                        (uint32_t)size);
+}
+
 static bool delete_pending_playlist(unsigned char operation,
                                     uint32_t track_id,
                                     uint32_t playlist_id)
@@ -7163,21 +7186,63 @@ static bool burn_playlist_changes_now(void)
 {
     struct rbprep_node_record active;
     uint32_t active_source_id = 0;
+    int audio_status;
     bool saved_playlist_playback = playlist_playback;
+    bool resume_audio;
+    bool capture_was_active;
     bool success;
+
+    refresh_pending_summary();
+    if (pending_playlist_count == 0)
+        return !pending_summary_overflow && playlist_journal_is_complete();
 
     if (active_playlist_node >= 0 &&
         read_node_record(active_playlist_node, &active))
         active_source_id = active.source_id;
+
+    /* Playlist PDB/index writes are deliberately synchronous. Letting the
+       decoder compete for storage made these commits drag on and could starve
+       the deck UI. Settle any editor seek, gently silence playback, and pause
+       for the transaction. A track which was already paused stays paused. */
+    if (seek_state != SEEK_IDLE)
+        stop_editor_audio();
+    update_play_clock();
+    audio_status = rb->audio_status();
+    resume_audio = (audio_status & AUDIO_STATUS_PLAY) &&
+                   !(audio_status & AUDIO_STATUS_PAUSE);
+    capture_was_active = spectrum_capture_active;
+    stop_spectrum_capture();
+    if (resume_audio) {
+        activity_ticker_ping(240);
+        rb->pcmbuf_fade(true, false);
+        rb->sleep(MAX(1, HZ / 3 + 1));
+        update_play_clock();
+        rb->audio_pause();
+        rb->pcmbuf_fade(false, false);
+        reset_play_clock(playhead, *rb->current_tick);
+    }
+
     success = rbprep_burn_playlists();
     refresh_pending_summary();
     playlist_playback = saved_playlist_playback;
-    if (!success)
-        return false;
+    if (success)
+        refresh_active_playlist_context(active_source_id);
 
-    refresh_active_playlist_context(active_source_id);
+    if (resume_audio) {
+        /* Rockbox may apply the user's own pause-fade policy while resuming.
+           Re-arm the PCM envelope immediately afterwards so this path always
+           returns with the same short, gentle fade-in. */
+        rb->audio_resume();
+        rb->pcmbuf_fade(false, false);
+        rb->pcmbuf_fade(true, true);
+        audio_was_running = true;
+        reset_play_clock(playhead, *rb->current_tick);
+    }
+    if (capture_was_active && !display_locked)
+        start_spectrum_capture();
+    activity_ticker_ping(1000);
     force_full_redraw = true;
-    return true;
+    return success;
 }
 
 static bool auto_burn_pending_changes(void)
@@ -7427,37 +7492,22 @@ static int waveform_index_progress(void)
 
 static void draw_waveform_preparation(int progress, const char *stage)
 {
-    int width = LCD_WIDTH - 56;
-    int fill = width * MAX(0, MIN(100, progress)) / 100;
-    char percent[16];
     bool first_frame = !waveform_preparation_visible && !display_locked;
 
+    (void)stage;
     if (first_frame)
         animate_context_dissolve(false, 2);
     activity_ticker_ping(progress * 10);
     rb->lcd_set_background(LCD_BLACK);
     rb->lcd_clear_display();
     draw_status_bar();
-    centered_text(0, LCD_WIDTH, 72, "LOADING TRACK", LCD_WHITE);
-    centered_text(0, LCD_WIDTH, 91, stage, LCD_RGBPACK(145, 165, 151));
-    rb->lcd_set_foreground(LCD_RGBPACK(22, 35, 27));
-    rb->lcd_fillrect(28, 118, width, 12);
-    rb->lcd_set_foreground(RBPREP_GREEN);
-    if (fill > 0)
-        rb->lcd_fillrect(28, 118, fill, 12);
-    rb->lcd_set_foreground(LCD_RGBPACK(95, 120, 103));
-    rb->lcd_drawrect(27, 117, width + 2, 14);
-    rb->snprintf(percent, sizeof(percent), "%d%%", progress);
-    centered_text(0, LCD_WIDTH, 143, percent, LCD_WHITE);
-    centered_text(0, LCD_WIDTH, 176,
-                  "PLAYBACK WILL RESUME WHEN READY",
-                  LCD_RGBPACK(95, 120, 103));
     if (first_frame) {
         capture_main_transition_thumbnail();
         waveform_preparation_visible = true;
         animate_context_dissolve(true, 2);
-        /* Restore the native-resolution loading screen after the thumbnail
-           dissolve without exposing a softened final frame. */
+        /* Restore the native top ticker after the dissolve without exposing
+           a softened final frame.  Ordinary track changes intentionally have
+           no centered loading card or progress bar. */
         draw_waveform_preparation(progress, stage);
     } else {
         rb->lcd_update();
@@ -7501,6 +7551,7 @@ static bool load_waveform(int track_id)
     int fd;
     int i;
     int cue_count;
+    int playback_status;
     uint32_t declared_points;
     int declared_beats;
     off_t metadata_offset;
@@ -7512,6 +7563,18 @@ static bool load_waveform(int track_id)
     char filename[MAX_PATH];
     char index_filename[MAX_PATH];
     unsigned char header[40];
+
+    /* Waveform/index preparation is intentionally a storage-only phase.
+       Never let a caller accidentally run it beside decoder output: that
+       makes both operations slower and can starve the UI on HDD/iFlash and
+       multi-card adapters. Every legitimate entry point quiesces transport
+       before reaching here and resumes only after its deck state is ready. */
+    playback_status = rb->audio_status();
+    if (((playback_status & AUDIO_STATUS_PLAY) &&
+         !(playback_status & AUDIO_STATUS_PAUSE)) ||
+        rb->mixer_channel_status(PCM_MIXER_CHAN_PLAYBACK) ==
+            CHANNEL_PLAYING)
+        return false;
 
     waveform_preparation_visible = false;
     clear_analysis();
@@ -7889,10 +7952,16 @@ static bool quiesce_audio_for_track_load(bool *resume_after_prepare)
         finish_transport_seek(playhead);
     }
 
-    /* audio_pause() is also our synchronous queue barrier: a finishing seek
-       posted above is handled before it returns.  Rockbox may then complete a
-       configured fade-out asynchronously, so mixer state is checked below. */
+    /* Loading favors storage throughput over a decorative pause fade. Mute
+       the PCM channel first so Rockbox's optional pause fade completes on its
+       next tick, then use audio_pause() as the synchronous seek/queue barrier.
+       The mixer check below is the final authority: no analysis read starts
+       while output remains active. */
+    if (was_running ||
+        rb->mixer_channel_status(PCM_MIXER_CHAN_PLAYBACK) == CHANNEL_PLAYING)
+        rb->pcmbuf_fade(false, false);
     rb->audio_pause();
+    audio_was_running = false;
     seek_state = SEEK_IDLE;
     seek_preview = false;
     cue_audition_active = false;
@@ -7990,6 +8059,10 @@ static bool play_track_index(int index, int row,
     bool playlist_replaced = false;
     bool analysis_changed = false;
     bool target_from_playlist;
+    bool start_new_transport = false;
+    bool restart_existing_transport = false;
+    bool pause_restarted_transport = false;
+    bool resume_loaded_transport = false;
     int old_track_id = selected_track_id;
     int old_position = clamp_playhead(playhead);
     int old_resume_index = 0;
@@ -8027,9 +8100,9 @@ static bool play_track_index(int index, int row,
                      !rb->strcmp(id3->path, path);
     if (!force_reload && index == selected_track_index && id3 && id3->path &&
         !rb->strcmp(id3->path, path)) {
-        if (waveform_points <= 0) {
-            bool resume_after_prepare = false;
+        bool resume_after_prepare = false;
 
+        if (waveform_points <= 0) {
             if (!quiesce_audio_for_track_load(&resume_after_prepare)) {
                 rb->splash(HZ * 2, "Audio pause timed out");
                 restore_black_canvas();
@@ -8049,9 +8122,6 @@ static bool play_track_index(int index, int row,
                 return false;
             }
             load_latest_edit(track.id);
-            if (resume_after_prepare &&
-                (rb->audio_status() & AUDIO_STATUS_PAUSE))
-                rb->audio_resume();
             if (capture_was_active && !display_locked)
                 start_spectrum_capture();
         }
@@ -8061,7 +8131,11 @@ static bool play_track_index(int index, int row,
         mode = MODE_DECK;
         if (macro_active >= 0 && tool_macros[macro_active].count > 0)
             apply_macro_step(&tool_macros[macro_active].steps[0]);
+        if (resume_after_prepare &&
+            (rb->audio_status() & AUDIO_STATUS_PAUSE))
+            rb->audio_resume();
         reset_play_clock(playhead, *rb->current_tick);
+        audio_was_running = !!(rb->audio_status() & AUDIO_STATUS_PLAY);
         force_full_redraw = true;
         activity_ticker_ping(1000);
         return true;
@@ -8234,22 +8308,17 @@ static bool play_track_index(int index, int row,
             playhead = clamp_playhead(id3->elapsed);
         } else {
             playhead = old_position;
-            rb->playlist_start(old_resume_index, playhead, 0);
-            if (!resume_existing)
-                rb->audio_pause();
+            restart_existing_transport = true;
+            pause_restarted_transport = !resume_existing;
         }
-        if (resume_existing &&
-            (rb->audio_status() & AUDIO_STATUS_PAUSE))
-            rb->audio_resume();
+        resume_loaded_transport = resume_existing;
     } else {
         playhead = 0;
-        rb->playlist_start(0, 0, 0);
+        start_new_transport = true;
     }
     if (capture_was_active && !display_locked)
         start_spectrum_capture();
-    reset_play_clock(playhead, *rb->current_tick);
     playing_track_row = row;
-    audio_was_running = !!(rb->audio_status() & AUDIO_STATUS_PLAY);
     deck_return_mode = return_mode;
     mode = MODE_DECK;
     if (macro_active >= 0 && tool_macros[macro_active].count > 0)
@@ -8258,6 +8327,22 @@ static bool play_track_index(int index, int row,
        remembered workflow reselects a cue-oriented tool during loading. */
     if (old_track_id < 0 || track.id != (uint32_t)old_track_id)
         set_cue_focus_slot(0);
+
+    /* Loading is now fully complete. Only at this boundary may transport be
+       restarted, ensuring waveform, grid, metadata, macros, and capture state
+       never compete with decoder/storage work. */
+    if (start_new_transport) {
+        rb->playlist_start(0, 0, 0);
+    } else if (restart_existing_transport) {
+        rb->playlist_start(old_resume_index, playhead, 0);
+        if (pause_restarted_transport)
+            rb->audio_pause();
+    } else if (resume_loaded_transport &&
+               (rb->audio_status() & AUDIO_STATUS_PAUSE)) {
+        rb->audio_resume();
+    }
+    reset_play_clock(playhead, *rb->current_tick);
+    audio_was_running = !!(rb->audio_status() & AUDIO_STATUS_PLAY);
     force_full_redraw = true;
     activity_ticker_ping(1000);
     return true;
@@ -9769,6 +9854,9 @@ static void draw_tool_orbs(void)
         enum rbprep_tool tool = tool_pages[page].tools[i];
         int cx = 49 + i * 16;
         bool enabled = pnav_tool_available(tool);
+        bool portal_flash = seek_portal_active && i == selected &&
+                            tool == TOOL_SEEK &&
+                            ((*rb->current_tick / MAX(1, HZ / 3)) & 1);
         int color = !enabled ? LCD_RGBPACK(8, 10, 9) : i == selected
                   ? (tool_menu_active ? LCD_WHITE : RBPREP_GREEN)
                   : LCD_RGBPACK(48, 70, 56);
@@ -9776,17 +9864,22 @@ static void draw_tool_orbs(void)
                          i == selected ? LCD_BLACK
                                        : LCD_RGBPACK(195, 215, 201);
 
-        /* The portal owns SEEK only temporarily. Blink the glyph, not the
-           orb or page, so the HUD remains stable while making that state
-           unmistakable. */
-        if (seek_portal_active && i == selected && tool == TOOL_SEEK &&
-            ((*rb->current_tick / MAX(1, HZ / 4)) & 1))
-            icon_color = color;
-        rb->lcd_set_foreground(color);
-        if (enabled)
+        /* Make the borrowed SEEK tool visibly temporary without moving any
+           HUD geometry: alternate the whole selected control between its
+           normal solid state and a bright outlined state. */
+        if (portal_flash) {
+            rb->lcd_set_foreground(LCD_BLACK);
+            xlcd_fillcircle(cx, 73, 7);
+            rb->lcd_set_foreground(theme_accent);
+            xlcd_drawcircle(cx, 73, 7);
+            icon_color = LCD_WHITE;
+        } else if (enabled) {
+            rb->lcd_set_foreground(color);
             xlcd_fillcircle(cx, 73, i == selected ? 7 : 6);
-        else
+        } else {
+            rb->lcd_set_foreground(i == selected ? LCD_WHITE : color);
             xlcd_drawcircle(cx, 73, i == selected ? 7 : 6);
+        }
         draw_tool_icon(cx, 73, tool, icon_color);
     }
 
@@ -10264,13 +10357,33 @@ static bool main_wheel_motion_active(void)
 static void update_main_wheel_motion(void)
 {
 #ifdef HAVE_WHEEL_POSITION
+    const int cardinal_buttons = BUTTON_LEFT | BUTTON_RIGHT |
+                                 BUTTON_MENU | BUTTON_PLAY;
     long now = *rb->current_tick;
     long elapsed = now - main_wheel_motion_tick;
+    int button_state = rb->button_status();
     int position = rb->wheel_status();
 
     if (!platter_wheel_mode) {
         main_wheel_touch_position = -1;
+        main_wheel_arm_delta = 0;
+        main_wheel_gesture_tracked = false;
+        main_wheel_blocked_until_release = false;
         main_wheel_velocity_fp = 0;
+        main_wheel_motion_tick = now;
+        return;
+    }
+    /* Cardinal presses touch the capacitive ring but are not scroll
+       gestures.  They cannot seed the platter trace; a real trace already in
+       progress may continue through a cardinal zone. */
+    if ((button_state & cardinal_buttons) && !main_wheel_gesture_tracked)
+        main_wheel_blocked_until_release = true;
+    if (main_wheel_blocked_until_release) {
+        main_wheel_touch_position = -1;
+        main_wheel_arm_delta = 0;
+        main_wheel_velocity_fp = 0;
+        if (position < 0 && !(button_state & cardinal_buttons))
+            main_wheel_blocked_until_release = false;
         main_wheel_motion_tick = now;
         return;
     }
@@ -10287,6 +10400,16 @@ static void update_main_wheel_motion(void)
                 delta -= RBPREP_WHEEL_TOUCH_UNITS;
             else if (delta < -RBPREP_WHEEL_TOUCH_UNITS / 2)
                 delta += RBPREP_WHEEL_TOUCH_UNITS;
+            if (!main_wheel_gesture_tracked) {
+                main_wheel_arm_delta += delta;
+                if (ABS(main_wheel_arm_delta) < RBPREP_WHEEL_ARM_UNITS) {
+                    delta = 0;
+                } else {
+                    delta = main_wheel_arm_delta;
+                    main_wheel_arm_delta = 0;
+                    main_wheel_gesture_tracked = true;
+                }
+            }
             /* One full hardware-wheel trace is exactly one rendered platter
                revolution, regardless of how many menu detents it generated. */
             movement = delta * RBPREP_WHEEL_PHASE_UNITS * 256 /
@@ -10303,6 +10426,7 @@ static void update_main_wheel_motion(void)
         main_wheel_touch_position = position;
     } else {
         main_wheel_touch_position = -1;
+        main_wheel_arm_delta = 0;
         if (ABS(main_wheel_velocity_fp) >= 96) {
             int damping = MIN(224, (int)(elapsed * 700 / MAX(1, HZ)));
 
@@ -10312,6 +10436,7 @@ static void update_main_wheel_motion(void)
                 (long long)main_wheel_velocity_fp * (256 - damping) / 256;
         } else {
             main_wheel_velocity_fp = 0;
+            main_wheel_gesture_tracked = false;
         }
     }
     wrap_main_wheel_phase();
@@ -10358,7 +10483,8 @@ static void draw_main_menu_fx(void)
             rb->lcd_drawpixel(x, y);
     }
 #ifdef HAVE_WHEEL_POSITION
-    if (platter_wheel_mode && rb->wheel_status() >= 0) {
+    if (platter_wheel_mode && main_wheel_gesture_tracked &&
+        rb->wheel_status() >= 0) {
         /* Align the hardware wheel origin with the drawing table. */
         int touch_angle = (rb->wheel_status() * RBPREP_WHEEL_PHASE_UNITS /
                            RBPREP_WHEEL_TOUCH_UNITS + 48) &
@@ -11356,6 +11482,48 @@ static void begin_track_load_confirmation(int index, int row,
     context_change_serial++;
 }
 
+static bool append_playlist_records_verified(const char *records, int length)
+{
+    off_t original_size;
+    uint32_t expected_size;
+    int fd;
+    bool ok;
+
+    if (!records || length <= 0 || !repair_playlist_journal_tail() ||
+        !normalize_playlist_journal_records())
+        return false;
+    fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDWR | O_CREAT, 0666);
+    if (fd < 0)
+        return false;
+    original_size = rb->filesize(fd);
+    ok = original_size >= 0 &&
+         (uint64_t)original_size + (uint32_t)length <= UINT32_MAX &&
+         rb->lseek(fd, original_size, SEEK_SET) >= 0 &&
+         write_exact(fd, records, length);
+    if (!ok && original_size >= 0)
+        rb->ftruncate(fd, original_size);
+    if (rb->close(fd) < 0)
+        ok = false;
+    expected_size = ok ? (uint32_t)original_size + (uint32_t)length : 0;
+    if (ok)
+        ok = verify_playlist_journal_file(RBPREP_PLAYLIST_JOURNAL,
+                                          expected_size);
+    if (!ok && original_size >= 0) {
+        /* Never leave half of a create+add pair behind.  This is deliberately
+           an in-place rollback: the pre-append journal was normalized and
+           verified before opening it, so its exact prefix is trustworthy. */
+        fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDWR);
+        if (fd >= 0) {
+            rb->ftruncate(fd, original_size);
+            rb->close(fd);
+        }
+        refresh_pending_summary();
+        return false;
+    }
+    refresh_pending_summary();
+    return true;
+}
+
 static bool append_playlist_operation(unsigned char operation,
                                       uint32_t track_id,
                                       uint32_t playlist_id,
@@ -11364,10 +11532,7 @@ static bool append_playlist_operation(unsigned char operation,
                                       const char *name)
 {
     char line[192];
-    off_t original_size;
-    int fd;
     int length;
-    bool ok;
 
     if (!playlist_id || !rb->strchr("ACRMDO", operation))
         return false;
@@ -11379,23 +11544,7 @@ static bool append_playlist_operation(unsigned char operation,
                           name ? name : "");
     if (length <= 0 || length >= (int)sizeof(line))
         return false;
-    if (!repair_playlist_journal_tail())
-        return false;
-    fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDWR | O_CREAT, 0666);
-    if (fd < 0)
-        return false;
-    original_size = rb->filesize(fd);
-    ok = original_size >= 0 &&
-         rb->lseek(fd, original_size, SEEK_SET) >= 0 &&
-         write_exact(fd, line, length);
-    if (!ok && original_size >= 0)
-        rb->ftruncate(fd, original_size);
-    if (rb->close(fd) < 0)
-        ok = false;
-    if (!ok)
-        return false;
-    refresh_pending_summary();
-    return true;
+    return append_playlist_records_verified(line, length);
 }
 
 static bool commit_playlist_order(void)
@@ -11430,11 +11579,8 @@ static bool append_playlist_seed_operation(uint32_t playlist_id,
                                            const char *name)
 {
     char data[384];
-    off_t original_size;
-    int fd;
     int first;
     int second;
-    bool ok;
 
     if (!playlist_id || selected_track_id < 0 || !name || !name[0])
         return false;
@@ -11451,23 +11597,7 @@ static bool append_playlist_seed_operation(uint32_t playlist_id,
                           (unsigned long)playlist_id, name);
     if (second <= 0 || first + second >= (int)sizeof(data))
         return false;
-    if (!repair_playlist_journal_tail())
-        return false;
-    fd = rb->open(RBPREP_PLAYLIST_JOURNAL,
-                  O_RDWR | O_CREAT, 0666);
-    if (fd < 0)
-        return false;
-    original_size = rb->filesize(fd);
-    ok = original_size >= 0 &&
-         rb->lseek(fd, original_size, SEEK_SET) >= 0 &&
-         write_exact(fd, data, first + second);
-    if (!ok && original_size >= 0)
-        rb->ftruncate(fd, original_size);
-    if (rb->close(fd) < 0)
-        ok = false;
-    if (ok)
-        refresh_pending_summary();
-    return ok;
+    return append_playlist_records_verified(data, first + second);
 }
 
 static bool append_playlist_journal(int node_index)
@@ -11483,6 +11613,11 @@ static bool append_playlist_journal(int node_index)
     if (library_index_version >= 2 && !node.source_id)
         return false;
     playlist_id = node.source_id ? node.source_id : (uint32_t)node_index;
+    /* Favorite/add is idempotent. Avoid even opening a transaction when the
+       local playlist already contains this exact track. */
+    if (selected_track_index >= 0 &&
+        rbi_node_has_member(&node, selected_track_index))
+        return true;
     for (i = 0; i < pending_playlist_count; i++) {
         if (pending_playlists[i].operation == PLAYLIST_OP_ADD &&
             pending_playlists[i].track_id == (uint32_t)selected_track_id &&
@@ -11800,16 +11935,18 @@ static void draw_confirmation(void)
         for (choice = 0; choice < 3; choice++) {
             bool selected = confirm_choice == choice;
 
-            /* Selection contrast must not depend on a user accent that may
-               be too bright, dark, or close to the label color. */
-            rb->lcd_set_foreground(selected ? LCD_WHITE
-                                             : LCD_RGBPACK(20, 26, 22));
+            /* Keep every label on the same dark field.  Selection is an
+               accent outline, never a fill that can swallow the text. */
+            rb->lcd_set_foreground(LCD_RGBPACK(13, 17, 15));
             rb->lcd_fillrect(left, y + 53, widths[choice], 20);
             centered_text(left, widths[choice], y + 58, choices[choice],
-                          selected ? LCD_BLACK : LCD_WHITE);
+                          LCD_WHITE);
+            rb->lcd_set_foreground(selected ? theme_accent
+                                             : LCD_RGBPACK(52, 61, 56));
+            rb->lcd_drawrect(left, y + 53, widths[choice], 20);
             if (selected) {
-                rb->lcd_set_foreground(RBPREP_GREEN);
-                rb->lcd_drawrect(left, y + 53, widths[choice], 20);
+                rb->lcd_drawrect(left + 1, y + 54,
+                                 widths[choice] - 2, 18);
             }
             left += widths[choice] + 4;
         }
@@ -11818,22 +11955,22 @@ static void draw_confirmation(void)
         return;
     }
 
-    rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(20, 26, 22)
-                                      : LCD_WHITE);
+    rb->lcd_set_foreground(LCD_RGBPACK(13, 17, 15));
     rb->lcd_fillrect(x + 12, y + 51, 72, 18);
-    text(x + 29, y + 55, "CANCEL", confirm_ok ? LCD_WHITE : LCD_BLACK);
-    if (!confirm_ok) {
-        rb->lcd_set_foreground(RBPREP_GREEN);
-        rb->lcd_drawrect(x + 12, y + 51, 72, 18);
-    }
-    rb->lcd_set_foreground(confirm_ok ? LCD_WHITE
-                                      : LCD_RGBPACK(20, 26, 22));
+    text(x + 29, y + 55, "CANCEL", LCD_WHITE);
+    rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(52, 61, 56)
+                                      : theme_accent);
+    rb->lcd_drawrect(x + 12, y + 51, 72, 18);
+    if (!confirm_ok)
+        rb->lcd_drawrect(x + 13, y + 52, 70, 16);
+    rb->lcd_set_foreground(LCD_RGBPACK(13, 17, 15));
     rb->lcd_fillrect(x + width - 66, y + 51, 54, 18);
-    text(x + width - 48, y + 55, "OK", confirm_ok ? LCD_BLACK : LCD_WHITE);
-    if (confirm_ok) {
-        rb->lcd_set_foreground(RBPREP_GREEN);
-        rb->lcd_drawrect(x + width - 66, y + 51, 54, 18);
-    }
+    text(x + width - 48, y + 55, "OK", LCD_WHITE);
+    rb->lcd_set_foreground(confirm_ok ? theme_accent
+                                      : LCD_RGBPACK(52, 61, 56));
+    rb->lcd_drawrect(x + width - 66, y + 51, 54, 18);
+    if (confirm_ok)
+        rb->lcd_drawrect(x + width - 65, y + 52, 52, 16);
 }
 
 static void draw_screen(void)
@@ -11973,7 +12110,9 @@ static bool play_clock_audio_running(int status)
                        seek_state == SEEK_CUE_HOLD;
 
     return clock_state && (status & AUDIO_STATUS_PLAY) &&
-           !(status & AUDIO_STATUS_PAUSE);
+           !(status & AUDIO_STATUS_PAUSE) &&
+           rb->mixer_channel_status(PCM_MIXER_CHAN_PLAYBACK) ==
+               CHANNEL_PLAYING;
 }
 
 static bool play_clock_tracks_cursor(int status)
@@ -11998,7 +12137,11 @@ static int live_playhead_now(void)
     int status = rb->audio_status();
     long now = *rb->current_tick;
 
-    if (!play_clock_tracks_cursor(status))
+    /* AUDIO_STATUS_PLAY is raised when a start request is queued, before the
+       decoder has delivered its first PCM buffer. Keep input timestamps and
+       the waveform pinned until synchronized_audio_playhead() observes that
+       first real output buffer and establishes an authoritative anchor. */
+    if (!play_clock_tracks_cursor(status) || reported_audio_elapsed < 0)
         return clamp_playhead(playhead);
     return interpolated_playhead(now);
 }
@@ -12012,8 +12155,24 @@ static int synchronized_audio_playhead(void)
 
     if (!play_clock_audio_running(status))
         return clamp_playhead(playhead);
-    position = interpolated_playhead(now);
     id3 = rb->audio_current_track();
+    if (reported_audio_elapsed < 0) {
+        int observed;
+
+        /* This is the PCM-start latch. A queued decoder is not playback; the
+           clock begins only once the mixer is playing and Rockbox can supply
+           the timestamp belonging to that output. This prevents the freshly
+           loaded waveform from moving during codec/buffer startup. */
+        if (!id3)
+            return clamp_playhead(playhead);
+        observed = clamp_playhead(id3->elapsed);
+        reported_audio_elapsed = observed;
+        play_clock_anchor = observed;
+        play_clock_tick = now;
+        audio_sync_after = now + MAX(1, HZ / 4);
+        return observed;
+    }
+    position = interpolated_playhead(now);
     if (id3 && !TIME_BEFORE(now, audio_sync_after)) {
         int observed = clamp_playhead(id3->elapsed);
 
@@ -14959,6 +15118,9 @@ enum plugin_status plugin_start(const void *parameter)
     main_wheel_phase_fp = 0;
     main_wheel_velocity_fp = 0;
     main_wheel_touch_position = -1;
+    main_wheel_arm_delta = 0;
+    main_wheel_gesture_tracked = false;
+    main_wheel_blocked_until_release = false;
     main_wheel_motion_tick = *rb->current_tick;
     main_name_scroll_deadline = *rb->current_tick;
     main_transition_thumbnail_valid = false;
@@ -15109,6 +15271,11 @@ enum plugin_status plugin_start(const void *parameter)
     rebuild_waveform_height_lut();
     clear_analysis();
     load_smart_query_flags();
+    rbprep_burn_failure_detail[0] = '\0';
+    if (!pdb_restore_page_journal()) {
+        rb->splash(HZ * 4, "Rekordpod database recovery failed");
+        return PLUGIN_ERROR;
+    }
     open_library_index();
     load_genre_rollup();
     load_tool_macros();

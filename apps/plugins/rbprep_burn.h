@@ -4,8 +4,9 @@
  *
  * This is included by rbprep.c after the edit-journal helpers so it can share
  * the plugin's compact RBE1 format without exporting a second plugin ABI.
- * Every mutable rekordbox file gets a persistent baseline backup and a
- * same-directory temporary replacement before it is renamed into place.
+ * General mutations use a persistent baseline backup and same-directory
+ * replacement. A single add to an existing playlist uses a verified 4 KB
+ * page journal plus an index replacement, avoiding a full export.pdb copy.
  */
 
 #define RBPREP_PDB_NEW  RBPREP_PDB ".rekordpod-new"
@@ -15,8 +16,15 @@
 #define RBPREP_INDEX_NEW  RBPREP_INDEX ".rekordpod-new"
 #define RBPREP_INDEX_PREV RBPREP_INDEX ".rekordpod-prev"
 #define RBPREP_INDEX_BAK  RBPREP_INDEX ".rekordpod-bak"
+#define RBPREP_PDB_PAGE_JOURNAL \
+    "/.rockbox/rekordpod/pdb-page-transaction.rpf"
+#define RBPREP_PDB_PAGE_JOURNAL_TMP \
+    "/.rockbox/rekordpod/pdb-page-transaction.tmp"
 #define RBPREP_PDB_PAGE_MAX 4096
 #define RBPREP_PDB_TOUCH_MAX 32
+#define RBPREP_PDB_PAGE_JOURNAL_HEADER 20
+#define RBPREP_PDB_PAGE_JOURNAL_RECORD 12
+#define RBPREP_PDB_PAGE_JOURNAL_MAX 3
 
 struct rbprep_pdb_touch {
     uint32_t table;
@@ -357,6 +365,247 @@ static bool pdb_table_entry(struct rbprep_pdb *pdb, uint32_t type,
         }
     }
     return false;
+}
+
+/* A single add to an existing playlist can modify only the PDB header page,
+   table 8's last page, and (when that page is full) its reserved successor.
+   Snapshot those pages before the in-place write. This retains crash recovery
+   without copying a multi-megabyte export.pdb for every favorite click. */
+static bool pdb_page_journal_header(int fd, uint32_t *original_size,
+                                    int *record_count)
+{
+    unsigned char header[RBPREP_PDB_PAGE_JOURNAL_HEADER];
+    uint64_t expected;
+    off_t actual;
+
+    if (!burn_read_at(fd, 0, header, sizeof(header)) ||
+        rb->memcmp(header, "RPF1", 4) ||
+        read_u32(header + 4) != RBPREP_PDB_PAGE_MAX ||
+        read_u32(header + 16) != macro_checksum(header, 16))
+        return false;
+    *original_size = read_u32(header + 8);
+    *record_count = read_u32(header + 12);
+    if (*record_count < 1 ||
+        *record_count > RBPREP_PDB_PAGE_JOURNAL_MAX)
+        return false;
+    expected = RBPREP_PDB_PAGE_JOURNAL_HEADER +
+        (uint64_t)*record_count *
+        (RBPREP_PDB_PAGE_JOURNAL_RECORD + RBPREP_PDB_PAGE_MAX);
+    actual = rb->filesize(fd);
+    return expected <= 0xffffffffu && actual == (off_t)expected;
+}
+
+static bool pdb_page_journal_validate(int fd, uint32_t *original_size,
+                                      int *record_count)
+{
+    unsigned char record[RBPREP_PDB_PAGE_JOURNAL_RECORD];
+    uint32_t pages[RBPREP_PDB_PAGE_JOURNAL_MAX];
+    int i;
+
+    if (!pdb_page_journal_header(fd, original_size, record_count) ||
+        rb->lseek(fd, RBPREP_PDB_PAGE_JOURNAL_HEADER, SEEK_SET) < 0)
+        return false;
+    for (i = 0; i < *record_count; i++) {
+        uint32_t page;
+        uint32_t saved;
+        uint32_t expected_saved;
+        uint64_t offset;
+        int prior;
+
+        if (!read_exact(fd, record, sizeof(record)) ||
+            !read_exact(fd, rbprep_burn_page, RBPREP_PDB_PAGE_MAX))
+            return false;
+        page = read_u32(record);
+        saved = read_u32(record + 4);
+        offset = (uint64_t)page * RBPREP_PDB_PAGE_MAX;
+        if (offset > 0xffffffffu)
+            return false;
+        expected_saved = offset < *original_size
+            ? MIN((uint32_t)RBPREP_PDB_PAGE_MAX,
+                  *original_size - (uint32_t)offset) : 0;
+        if (saved != expected_saved ||
+            read_u32(record + 8) !=
+                macro_checksum(rbprep_burn_page, RBPREP_PDB_PAGE_MAX))
+            return false;
+        for (prior = 0; prior < i; prior++)
+            if (pages[prior] == page)
+                return false;
+        pages[i] = page;
+    }
+    return true;
+}
+
+static bool pdb_restore_page_journal(void)
+{
+    unsigned char record[RBPREP_PDB_PAGE_JOURNAL_RECORD];
+    uint32_t original_size;
+    int record_count;
+    int journal = -1;
+    int pdb_fd = -1;
+    int i;
+    bool index_was_open = library_fd >= 0;
+    bool ok = false;
+
+    rb->remove(RBPREP_PDB_PAGE_JOURNAL_TMP);
+    if (!rb->file_exists(RBPREP_PDB_PAGE_JOURNAL))
+        return true;
+    journal = rb->open(RBPREP_PDB_PAGE_JOURNAL, O_RDONLY);
+    if (journal < 0 ||
+        !pdb_page_journal_validate(journal, &original_size, &record_count) ||
+        rb->lseek(journal, RBPREP_PDB_PAGE_JOURNAL_HEADER, SEEK_SET) < 0)
+        goto done;
+    pdb_fd = rb->open(RBPREP_PDB, O_RDWR);
+    if (pdb_fd < 0)
+        goto done;
+    for (i = 0; i < record_count; i++) {
+        uint32_t page;
+        uint32_t saved;
+
+        if (!read_exact(journal, record, sizeof(record)) ||
+            !read_exact(journal, rbprep_burn_page, RBPREP_PDB_PAGE_MAX))
+            goto done;
+        page = read_u32(record);
+        saved = read_u32(record + 4);
+        if (saved && !burn_write_at(pdb_fd,
+                                    page * RBPREP_PDB_PAGE_MAX,
+                                    rbprep_burn_page, saved))
+            goto done;
+    }
+    if (rb->close(journal) < 0) {
+        journal = -1;
+        goto done;
+    }
+    journal = -1;
+    if (rb->ftruncate(pdb_fd, original_size) < 0 || rb->close(pdb_fd) < 0) {
+        pdb_fd = -1;
+        goto done;
+    }
+    pdb_fd = -1;
+    if (library_fd >= 0) {
+        rb->close(library_fd);
+        library_fd = -1;
+    }
+    if (rb->file_exists(RBPREP_INDEX_PREV))
+        burn_restore_previous(RBPREP_INDEX, RBPREP_INDEX_PREV);
+    rb->remove(RBPREP_INDEX_NEW);
+    if (index_was_open && !open_library_index())
+        goto done;
+    if (rb->remove(RBPREP_PDB_PAGE_JOURNAL) < 0 &&
+        rb->file_exists(RBPREP_PDB_PAGE_JOURNAL))
+        goto done;
+    ok = true;
+
+done:
+    if (pdb_fd >= 0)
+        rb->close(pdb_fd);
+    if (journal >= 0)
+        rb->close(journal);
+    if (!ok && !rbprep_burn_failure_detail[0])
+        rb->strlcpy(rbprep_burn_failure_detail,
+                    "PDB page journal recovery",
+                    sizeof(rbprep_burn_failure_detail));
+    return ok;
+}
+
+static bool pdb_capture_page_journal(struct rbprep_pdb *pdb)
+{
+    unsigned char header[RBPREP_PDB_PAGE_JOURNAL_HEADER];
+    unsigned char record[RBPREP_PDB_PAGE_JOURNAL_RECORD];
+    unsigned char table[16];
+    unsigned char raw[4];
+    uint32_t pages[RBPREP_PDB_PAGE_JOURNAL_MAX];
+    uint32_t entry;
+    uint32_t original_size;
+    uint32_t next_unused;
+    uint32_t candidate;
+    uint32_t last;
+    int record_count = 0;
+    int journal = -1;
+    int verify = -1;
+    int i;
+    bool ok = false;
+    off_t file_size = rb->filesize(pdb->fd);
+
+    if (file_size <= 0 || (uint64_t)file_size > 0xffffffffu ||
+        !pdb_table_entry(pdb, 8, &entry) ||
+        !burn_read_at(pdb->fd, entry, table, sizeof(table)) ||
+        !burn_read_at(pdb->fd, 12, raw, sizeof(raw)))
+        goto done;
+    original_size = file_size;
+    next_unused = read_u32(raw);
+    candidate = read_u32(table + 4);
+    last = read_u32(table + 12);
+    if (!last || (uint64_t)last * RBPREP_PDB_PAGE_MAX >= original_size)
+        goto done;
+    pages[record_count++] = 0;
+    if (last != 0)
+        pages[record_count++] = last;
+    if (candidate && candidate != last && candidate < next_unused)
+        pages[record_count++] = candidate;
+    if (record_count > RBPREP_PDB_PAGE_JOURNAL_MAX)
+        goto done;
+
+    rb->remove(RBPREP_PDB_PAGE_JOURNAL_TMP);
+    journal = rb->open(RBPREP_PDB_PAGE_JOURNAL_TMP,
+                       O_RDWR | O_CREAT | O_TRUNC, 0666);
+    if (journal < 0)
+        goto done;
+    rb->memset(header, 0, sizeof(header));
+    rb->memcpy(header, "RPF1", 4);
+    write_u32(header + 4, RBPREP_PDB_PAGE_MAX);
+    write_u32(header + 8, original_size);
+    write_u32(header + 12, record_count);
+    write_u32(header + 16, macro_checksum(header, 16));
+    if (!write_exact(journal, header, sizeof(header)))
+        goto done;
+    for (i = 0; i < record_count; i++) {
+        uint64_t offset = (uint64_t)pages[i] * RBPREP_PDB_PAGE_MAX;
+        uint32_t saved = offset < original_size
+            ? MIN((uint32_t)RBPREP_PDB_PAGE_MAX,
+                  original_size - (uint32_t)offset) : 0;
+
+        rb->memset(rbprep_burn_page, 0, RBPREP_PDB_PAGE_MAX);
+        if (saved && !burn_read_at(pdb->fd, (uint32_t)offset,
+                                   rbprep_burn_page, saved))
+            goto done;
+        write_u32(record, pages[i]);
+        write_u32(record + 4, saved);
+        write_u32(record + 8,
+                  macro_checksum(rbprep_burn_page, RBPREP_PDB_PAGE_MAX));
+        if (!write_exact(journal, record, sizeof(record)) ||
+            !write_exact(journal, rbprep_burn_page, RBPREP_PDB_PAGE_MAX))
+            goto done;
+    }
+    if (rb->close(journal) < 0) {
+        journal = -1;
+        goto done;
+    }
+    journal = -1;
+    verify = rb->open(RBPREP_PDB_PAGE_JOURNAL_TMP, O_RDONLY);
+    if (verify < 0 ||
+        !pdb_page_journal_validate(verify, &original_size, &record_count))
+        goto done;
+    rb->close(verify);
+    verify = -1;
+    rb->remove(RBPREP_PDB_PAGE_JOURNAL);
+    if (rb->rename(RBPREP_PDB_PAGE_JOURNAL_TMP,
+                   RBPREP_PDB_PAGE_JOURNAL) < 0)
+        goto done;
+    ok = true;
+
+done:
+    if (verify >= 0)
+        rb->close(verify);
+    if (journal >= 0)
+        rb->close(journal);
+    if (!ok) {
+        rb->remove(RBPREP_PDB_PAGE_JOURNAL_TMP);
+        if (!rbprep_burn_failure_detail[0])
+            rb->strlcpy(rbprep_burn_failure_detail,
+                        "PDB page journal create",
+                        sizeof(rbprep_burn_failure_detail));
+    }
+    return ok;
 }
 
 static int pdb_slot_count(const unsigned char *page)
@@ -2074,8 +2323,8 @@ static int burn_build_pco2(unsigned char *out, int capacity,
                            const unsigned char *snapshot)
 {
     static const unsigned char rgb_palette[8][3] = {
-        {255, 70, 70}, {255, 145, 40}, {250, 220, 45}, {55, 235, 95},
-        {50, 225, 225}, {55, 135, 255}, {175, 90, 255}, {255, 80, 185}
+        {255, 0, 0}, {255, 94, 0}, {255, 232, 0}, {26, 255, 0},
+        {0, 224, 255}, {0, 0, 255}, {77, 0, 255}, {255, 0, 161}
     };
     int count = burn_hotcue_count(snapshot);
     int length = 20 + count * 48;
@@ -3204,6 +3453,153 @@ done:
     return success;
 }
 
+static bool rbprep_burn_single_playlist_add_fast(uint32_t edit_offset)
+{
+    const struct rbprep_pending_playlist *operation = &pending_playlists[0];
+    struct rbprep_pdb pdb;
+    uint32_t playlist = operation->playlist_id;
+    uint32_t playlist_size = 0;
+    bool present = false;
+    bool journal_captured = false;
+    bool checkpoint_ready = false;
+    bool success = false;
+    int completed = 0;
+    int journal_fd;
+    int maximum;
+    const char *failure = "fast playlist add";
+
+    rb->memset(&pdb, 0, sizeof(pdb));
+    pdb.fd = -1;
+    if (operation->operation != PLAYLIST_OP_ADD ||
+        !rb->file_exists(RBPREP_PDB) || library_fd < 0) {
+        rb->strlcpy(rbprep_burn_failure_detail,
+                    "fast add prerequisites",
+                    sizeof(rbprep_burn_failure_detail));
+        goto done;
+    }
+    if (!pdb_open(&pdb, RBPREP_PDB)) {
+        failure = "PDB open";
+        goto done;
+    }
+    if (!pdb_capture_page_journal(&pdb)) {
+        failure = "PDB page journal";
+        goto done;
+    }
+    journal_captured = true;
+    if (!burn_playlist_operation(&pdb, operation, &completed, 1)) {
+        failure = "playlist row";
+        goto done;
+    }
+    if (pdb.structural) {
+        unsigned char raw[4];
+
+        if (!burn_read_at(pdb.fd, 0x14, raw, sizeof(raw))) {
+            failure = "PDB sequence read";
+            goto done;
+        }
+        write_u32(raw, read_u32(raw) + 1);
+        if (!burn_write_at(pdb.fd, 0x14, raw, sizeof(raw))) {
+            failure = "PDB sequence write";
+            goto done;
+        }
+    }
+    if (rb->close(pdb.fd) < 0) {
+        pdb.fd = -1;
+        failure = "PDB flush";
+        goto done;
+    }
+    pdb.fd = -1;
+
+    /* Reopen from storage and verify the exact relationship just written.
+       Full-table structural scans remain on the general transaction path;
+       this fast path validates its track, playlist, row, and page journal. */
+    if (!pdb_open_retry(&pdb, RBPREP_PDB) ||
+        !pdb_resolve_playlist(&pdb, operation->playlist_id,
+                              operation->name, &playlist)) {
+        failure = "PDB add verification";
+        goto done;
+    }
+    maximum = pdb_playlist_entry_index(&pdb, operation->track_id,
+                                       playlist, &present);
+    if (maximum < 0 || !present) {
+        failure = "PDB add verification";
+        goto done;
+    }
+    if (rb->close(pdb.fd) < 0) {
+        pdb.fd = -1;
+        failure = "PDB verify flush";
+        goto done;
+    }
+    pdb.fd = -1;
+
+    /* RBI3 is much smaller than export.pdb. Rebuild it for immediate local
+       playlist parity, but retain the old file by rename until the PDB page
+       journal has been retired. */
+    if (!burn_rewrite_local_index()) {
+        failure = "Rekordpod playlist parity";
+        goto done;
+    }
+    if (library_fd >= 0) {
+        rb->close(library_fd);
+        library_fd = -1;
+    }
+    if (!burn_swap_keep_previous(RBPREP_INDEX, RBPREP_INDEX_NEW,
+                                 RBPREP_INDEX_PREV)) {
+        failure = "Rekordpod index commit";
+        goto done;
+    }
+    if (!open_library_index()) {
+        failure = "Rekordpod index validation";
+        goto done;
+    }
+
+    /* The PDB and local index are now a verified pair. Remove the rollback
+       marker before advancing the append-only journal checkpoint: a crash in
+       between merely replays an idempotent ADD on the next attempt. */
+    if (rb->remove(RBPREP_PDB_PAGE_JOURNAL) < 0 &&
+        rb->file_exists(RBPREP_PDB_PAGE_JOURNAL)) {
+        failure = "PDB page journal retire";
+        goto done;
+    }
+    journal_captured = false;
+    rb->remove(RBPREP_INDEX_PREV);
+    journal_fd = rb->open(RBPREP_PLAYLIST_JOURNAL, O_RDONLY);
+    if (journal_fd >= 0) {
+        off_t size = rb->filesize(journal_fd);
+
+        if (size >= 0 && (uint64_t)size <= 0xffffffffu) {
+            playlist_size = size;
+            checkpoint_ready = true;
+        }
+        rb->close(journal_fd);
+    }
+    if (!checkpoint_ready ||
+        !write_burn_offsets(edit_offset, playlist_size))
+        rb->splash(HZ, "Saved; pending marker will retry");
+    rb->splash_progress(1, 1, "Playlist saved");
+    success = true;
+
+done:
+    if (pdb.fd >= 0)
+        rb->close(pdb.fd);
+    rb->remove(RBPREP_INDEX_NEW);
+    if (!success && journal_captured) {
+        if (!pdb_restore_page_journal())
+            failure = "PDB page rollback";
+        if (library_fd < 0)
+            open_library_index();
+    }
+    if (!success) {
+        if (rbprep_burn_failure_detail[0])
+            rb->splashf(HZ * 4, "BURN FAILED: %s",
+                        rbprep_burn_failure_detail);
+        else
+            rb->splashf(HZ * 3, "BURN FAILED: %s", failure);
+    }
+    restore_black_canvas();
+    return success;
+}
+
 static bool rbprep_burn_transaction(int target_track, bool playlist_only)
 {
     struct rbprep_pdb pdb;
@@ -3226,6 +3622,10 @@ static bool rbprep_burn_transaction(int target_track, bool playlist_only)
     const char *failure = "initialization";
 
     rbprep_burn_failure_detail[0] = '\0';
+    if (!pdb_restore_page_journal()) {
+        failure = "PDB page journal recovery";
+        goto done;
+    }
     refresh_pending_summary();
     if (pending_summary_overflow) {
         rb->strlcpy(rbprep_burn_failure_detail,
@@ -3233,7 +3633,11 @@ static bool rbprep_burn_transaction(int target_track, bool playlist_only)
                     sizeof(rbprep_burn_failure_detail));
         goto done;
     }
-    if (pending_journal_invalid) {
+    /* A playlist-only commit must not be held hostage by an unrelated edit
+       journal tail.  Its own journal is fully revalidated here; track/full
+       commits remain strict about both journals. */
+    if (pending_journal_invalid &&
+        (!playlist_only || !playlist_journal_is_complete())) {
         rb->strlcpy(rbprep_burn_failure_detail,
                     "pending journal is incomplete",
                     sizeof(rbprep_burn_failure_detail));
@@ -3265,10 +3669,14 @@ static bool rbprep_burn_transaction(int target_track, bool playlist_only)
         }
     }
     read_burn_offsets(&edit_offset, &playlist_offset);
+    if (playlist_only && pending_playlist_count == 1 &&
+        pending_playlists[0].operation == PLAYLIST_OP_ADD)
+        return rbprep_burn_single_playlist_add_fast(edit_offset);
     if (needs_analysis_workspace) {
         stop_editor_audio();
         /* Analysis rewrites need two simultaneous copies of the largest
-           ANLZ file. Playlist-only commits deliberately keep audio alive. */
+           ANLZ file. Playlist-only commits do not borrow the audio buffer;
+           their caller pauses transport briefly to prioritize storage I/O. */
         rb->audio_stop();
         rb->yield();
         audio_was_running = false;

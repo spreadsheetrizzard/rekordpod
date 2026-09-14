@@ -39,8 +39,8 @@ PLAYLIST_JOURNAL = Path(".rockbox/rekordpod/playlist-adds.rba")
 LOCAL_BURN_STATE = Path(".rockbox/rekordpod/local-burn.rbs")
 PDB_PATH = Path("PIONEER/rekordbox/export.pdb")
 COLOR_RGB = (
-    (255, 70, 70), (255, 145, 40), (250, 220, 45), (55, 235, 95),
-    (50, 225, 225), (55, 135, 255), (175, 90, 255), (255, 80, 185),
+    (255, 0, 0), (255, 94, 0), (255, 232, 0), (26, 255, 0),
+    (0, 224, 255), (0, 0, 255), (77, 0, 255), (255, 0, 161),
 )
 
 

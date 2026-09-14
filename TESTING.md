@@ -47,24 +47,28 @@ destination.
 All of these must pass on the release commit:
 
 1. Build and package iPod Classic 6G/7G with the default release flags.
-2. Build and package iPod Video 5G/5.5G with the default release flags.
-3. Confirm `REKORDPOD_PRIVATE_SCREENSHOTS=0` in both build logs or generated
+2. Confirm `REKORDPOD_PRIVATE_SCREENSHOTS=0` in the build log or generated
    command lines. The public binary must not expose a screenshot hotkey.
-4. Run `utils/rekordpod/test_geometry.py`.
-5. Run `utils/rekordpod/test_edit_formats.py`.
-6. Run Python bytecode compilation on every script under `utils/rekordpod`.
-7. Run the complete Rockbox ZIP integrity check for both archives.
-8. Run `git diff --check` and confirm there are no tracked caches, generated
+3. Run `utils/rekordpod/test_geometry.py`.
+4. Run `utils/rekordpod/test_edit_formats.py`.
+5. Run Python bytecode compilation on every script under `utils/rekordpod`.
+6. Run the complete Rockbox ZIP integrity check for the Classic archive.
+7. Run `git diff --check` and confirm there are no tracked caches, generated
    `.pyc` files, device libraries, journals, or screenshots.
-9. Record plugin-region use from both linker reports. Do not release an image
-   that crosses its target's plugin memory budget.
-10. Record SHA-256 digests for both binary archives and the source archive.
+8. Record plugin-region use from the Classic linker report. Do not release an
+   image that crosses the target's plugin memory budget.
+9. Record SHA-256 digests for the binary archive, installers, and source
+   archive.
 
 For the private build only, compile once with
 `REKORDPOD_PRIVATE_SCREENSHOTS=1` to ensure the retained capture code does not rot.
 That build must be labeled private and must not replace a public archive.
 
 ## Installation and boot
+
+For a destructive clean-install rehearsal, follow [INSTALL.md](INSTALL.md)
+through every geometry and backup checkpoint. The abbreviated steps below are
+for an already prepared test volume.
 
 1. Verify the ZIP target and SHA-256 against the release manifest.
 2. Overlay the ZIP's `.rockbox` directory; do not delete the existing directory
@@ -239,9 +243,8 @@ microSD adapter, and multi-card adapter.
   a clean eject.
 - Hotplug, first handshake, repeated mount/eject, and boot-with-cable produce no
   ATA `-2`, `-2147483605`, writeback panic, duplicate initialization, or menu reset.
-- On Classic only, test USB DAC separately if enabled. Confirm gain initializes
-  safely, audio is audible, UI remains responsive, and exit returns to
-  Rekordpod. Do not claim DAC support for iPod Video.
+- Test USB DAC separately if enabled. Confirm gain initializes safely, audio is
+  audible, UI remains responsive, and exit returns to Rekordpod.
 - After every USB write test, run a filesystem check and compare the protected
   library against its expected state.
 
@@ -249,7 +252,8 @@ microSD adapter, and multi-card adapter.
 
 The public release has **no on-device screenshot hotkey**. Do not document Hold
 PLAY as a capture gesture. Use simulator framebuffer capture for clean UI
-images and photograph the physical iPod for hardware proof.
+images and photograph the physical iPod for hardw
+are proof.
 
 ### Capture matrix
 

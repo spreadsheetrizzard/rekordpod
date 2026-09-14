@@ -1,0 +1,45 @@
+name: Rekordpod feature proposal
+description: Propose a focused addition to the smart DJ drive workflow
+title: "[proposal] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the preparation problem first. UI sketches are welcome, but the workflow and hardware constraints matter more than visual novelty.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Preparation problem
+      description: What is difficult or impossible in the current workflow?
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Proposed click-wheel workflow
+      description: Describe navigation, activation, cancellation, and playback behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: data
+    attributes:
+      label: Data and compatibility impact
+      description: Identify any DeviceSQL, ANLZ, USB, playback, storage, or persistence changes.
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: Expected use
+      options:
+        - Repeated during most track preparation
+        - Occasional library organization
+        - Settings or maintenance
+        - Experimental / exploratory
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: References or test material
+      description: Link public specifications or provide a redacted test case. Do not upload private databases or music.

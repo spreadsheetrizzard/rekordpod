@@ -27,6 +27,14 @@ formats = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = formats
 SPEC.loader.exec_module(formats)
 
+CACHE_MODULE_PATH = Path(__file__).with_name("build_device_cache.py")
+CACHE_SPEC = importlib.util.spec_from_file_location(
+    "rekordpod_build_device_cache", CACHE_MODULE_PATH)
+assert CACHE_SPEC and CACHE_SPEC.loader
+cache_formats = importlib.util.module_from_spec(CACHE_SPEC)
+sys.modules[CACHE_SPEC.name] = cache_formats
+CACHE_SPEC.loader.exec_module(cache_formats)
+
 
 def snapshot(version=2, hotcues=None):
     cues = tuple(hotcues if hotcues is not None else [-1] * 16)
@@ -81,6 +89,17 @@ class EditFormatTests(unittest.TestCase):
         self.assertEqual(formats.parse_pco2_hotcues(tags[b"PCO2"]), {})
         self.assertEqual(struct.unpack_from(">H", tags[b"PCOB"], 18)[0], 0)
         self.assertEqual(struct.unpack_from(">H", tags[b"PCO2"], 16)[0], 0)
+
+    def test_cue_palette_round_trips_rekordbox_green(self):
+        tag = formats.build_pco2_hotcues([(1, 12345, 3)])
+        self.assertEqual(formats.parse_pco2_hotcues(tag),
+                         {1: (12345, (26, 255, 0))})
+        self.assertEqual(cache_formats.cue_color("#1AFF00"), 3)
+
+    def test_pre_beta_and_uncoloured_cues_import_as_green(self):
+        self.assertEqual(cache_formats.cue_color("#37EB5F"), 3)
+        self.assertEqual(cache_formats.cue_color(""), 3)
+        self.assertEqual(cache_formats.cue_color("#000000"), 3)
 
 
 if __name__ == "__main__":

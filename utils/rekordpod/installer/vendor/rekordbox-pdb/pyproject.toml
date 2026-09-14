@@ -1,0 +1,38 @@
+[project]
+name = "rekordbox-pdb"
+version = "0.1.0"
+description = "Read and write the rekordbox export.pdb / exportExt.pdb databases from PIONEER USB exports"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["rekordbox", "pioneer", "cdj", "xdj", "dj", "export.pdb", "devicesql"]
+authors = [{ name = "fragmede" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Database",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/fragmede/rekordbox-pdb"
+Repository = "https://github.com/fragmede/rekordbox-pdb"
+
+[project.scripts]
+rekordbox-pdb = "rekordbox_pdb.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rekordbox_pdb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -82,7 +82,7 @@ executes a tool, seeks, or modifies track metadata.
 Workflow files use stable, append-only tool identifiers. Older RBM1/RBM2 files
 are upgraded to RBM3 without changing their sequence, and the workflow picker
 uses the same canonical names and icon renderer as the live tool orbs. The
-LOCK page orders Pitch Lock, Quantize, M1, and M2.
+LOCK page orders M1, M2, Pitch Lock, and Quantize.
 `tool-macros.rbm` and `playlist-workflows.rbl` are independent of analysis
 caches and are preserved by ordinary overlay installs.
 

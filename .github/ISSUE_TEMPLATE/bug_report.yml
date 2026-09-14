@@ -22,7 +22,6 @@ body:
       label: iPod target
       options:
         - iPod Classic 6G/7G
-        - iPod Video 5G/5.5G
         - Unsupported / other
     validations:
       required: true

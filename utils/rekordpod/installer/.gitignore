@@ -1,0 +1,9 @@
+/.venv-macos/
+/.venv-windows/
+/.pip-cache/
+/.pyinstaller/
+/assets/*.zip
+/build/
+/dist/
+/dist-release/
+/__pycache__/

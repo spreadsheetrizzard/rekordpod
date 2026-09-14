@@ -1,0 +1,30 @@
+name: Rekordpod host checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Python syntax
+        run: |
+          python -m compileall -q utils/rekordpod
+      - name: Test geometry translation
+        run: |
+          python utils/rekordpod/test_geometry.py
+      - name: Test edit formats
+        run: |
+          python -m unittest -v utils/rekordpod/test_edit_formats.py
+      - name: Test desktop installer core
+        working-directory: utils/rekordpod/installer
+        run: |
+          python -m unittest -v test_installer_core.py

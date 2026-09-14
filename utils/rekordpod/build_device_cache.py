@@ -47,6 +47,17 @@ CUE_COLORS = {
     "#0000FF": 5,
     "#4D00FF": 6,
     "#FF00A1": 7,
+    # Rekordpod builds before public beta used the LCD palette in PCO2.
+    # Accept those values so already-burned green cues do not fall through
+    # to red when the compact cache is rebuilt.
+    "#FF4646": 0,
+    "#FF9128": 1,
+    "#FADC2D": 2,
+    "#37EB5F": 3,
+    "#32E1E1": 4,
+    "#3787FF": 5,
+    "#AF5AFF": 6,
+    "#FF50B9": 7,
 }
 
 
@@ -356,7 +367,12 @@ def build_genre_index(connection: sqlite3.Connection) -> bytes:
 
 
 def cue_color(value: object) -> int:
-    return CUE_COLORS.get(str(value or "").upper(), 0)
+    # Rekordbox leaves legacy/default cue RGB empty (or black).  Rekordpod's
+    # natural cue colour is green, so absence must not masquerade as red.
+    normalized = str(value or "").strip().upper()
+    if normalized in ("", "#000000"):
+        return 3
+    return CUE_COLORS.get(normalized, 3)
 
 
 def build_track_cache(connection: sqlite3.Connection, stable_key: str,
