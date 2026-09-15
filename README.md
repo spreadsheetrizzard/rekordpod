@@ -9,7 +9,7 @@ exports.
 
 **What does this smart DJ drive actually do?** It lets you browse and search the
 collection, preview tracks, inspect analysis, edit cues and beat grids, organize
-playlists, update metadata, and retain that work without a laptop nearby.
+playlists, rate tracks, and retain that work without a laptop nearby.
 
 The iPod still carries the music and connects to a computer or compatible
 player as USB storage, but it also has its own screen, controls, playback engine,
@@ -54,7 +54,7 @@ configurations, not interchangeable proof of reliability.
 - Rekordbox-style collection search, precomputed sort orders, playlist and
   folder browsing, favorites, shuffle, and ordered playlist work.
 - A playback-first Prep Deck with seek, scrub, zoom, gain, hot-cue, beat-grid,
-  metadata, key, tempo/RPM, loop, playlist, and quantize tools, plus two
+  rating, tempo/RPM, loop, playlist, and quantize tools, plus two
   persistent workflow pads.
 - RGB waveform and seven audio/analysis views: 20-band EQ, phrase map,
   harmonic constellation, spectral canyon, boombox, stereo orbit, and
@@ -107,6 +107,24 @@ plus DAT/EXT analysis files. Supported edits are written directly to that data
 on the iPod for use by Rekordbox and compatible players that support the
 traditional Device Library.
 
+The public-beta return contract is deliberately narrow:
+
+| On-iPod action | Rekordbox return path |
+| --- | --- |
+| Hot cues, cue colors, and beat grid | **Update Collection** (`CUE / GRID / INFO`) |
+| Star rating | **Update Collection** (`CUE / GRID / INFO`) |
+| Create, add to, or permanently reorder an ordinary playlist | **Import Playlist from Device**; imported as a static playlist |
+| Rekordpod smart-playlist query | Device-local only; current results may be materialized as an ordinary playlist, but the rule does not round-trip |
+| Genre, track color, year, musical key, comments, and tags | Visible/searchable reference data; read-only in Rekordpod |
+
+Anything Rekordpod creates is placed beneath the top-level
+`REKORDPOD - IMPORT ME` folder. Add-to-playlist is idempotent and permanent
+reordering validates that every original member occurs exactly once. Rekordbox
+playlist import is not a live two-way merge: importing the same device playlist
+again may create another desktop copy, and desktop export can replace later
+device-only organization. Import the Rekordpod folder deliberately, verify it,
+then merge or replace desktop playlists in Rekordbox.
+
 Rekordpod does not read or write OneLibrary / Device Library Plus. The same
 iPod can contain a separately generated OneLibrary export and serve as the
 physical USB drive for that export, but that does not make the newer database
@@ -121,8 +139,8 @@ Rekordpod can still be part of a OneLibrary preparation workflow:
 
 1. Export a traditional Device Library from Rekordbox to the iPod.
 2. Prepare tracks and make supported changes in Rekordpod.
-3. Reconnect the iPod and import those recognized metadata and preparation
-   changes into the main Rekordbox collection.
+3. Reconnect the iPod and update cue/grid/rating information; separately import
+   playlists beneath `REKORDPOD - IMPORT ME` into the main Rekordbox collection.
 4. Create or update the OneLibrary / Device Library Plus export from Rekordbox,
    either on the same iPod or on separate performance media.
 
@@ -145,16 +163,17 @@ use, solid-state storage or flash cards in a known-compatible third-party iPod
 adapter are recommended. That reduces mechanical risk but does not guarantee
 player, filesystem, adapter, or power compatibility.
 
-The desktop utilities in [`utils/rekordpod`](utils/rekordpod) convert an existing
-Device Library and ANLZ corpus into the compact index and waveform cache used by
-the plugin. They are provisioning, recovery, and diagnostic tools. Normal
-supported edits are made on the device once that cache exists.
+Rekordpod converts an existing Device Library and ANLZ corpus into its compact
+index and waveform cache on the iPod. The desktop utilities in
+[`utils/rekordpod`](utils/rekordpod) remain available to maintainers for
+recovery, diagnostics, and reproducible format tests, but they are not required
+for ordinary installation or updates.
 
 ## What setup requires
 
 Rekordpod is not installed by copying `rekordpod.rock` onto an arbitrary
 Rockbox build. The plugin, modified Rockbox firmware, codecs, USB behavior, and
-generated device cache are a matched set.
+on-device cache format are a matched set.
 
 You need:
 
@@ -164,50 +183,46 @@ You need:
 2. **A traditional Rekordbox Device Library already exported to the iPod.**
    Analyze the tracks in Rekordbox before exporting them because Rekordpod does
    not perform full audio analysis on the iPod.
-3. **One desktop installer for your computer:** `Rekordpod Installer.exe` on
-   Windows or `Rekordpod Installer.app` on macOS. They provide the same setup
-   workflow; you do not need both.
+3. **The matching iPod Classic release overlay:**
+   `rekordpod-public-beta-1-ipod6g.zip`. It is the same ZIP on Windows, macOS,
+   and Linux.
 
-### Why the desktop installer is required
+### Why no desktop executable is required
 
-The executable is the provisioning bridge between a Rekordbox export and the
-iPod application. It:
+The release ZIP contains the matched Rockbox firmware, codecs, plugin, theme,
+and boot configuration. After the overlay is copied, Rekordpod itself:
 
-- reads only the mounted volume you choose and verifies that it is a supported
-  Rockbox iPod with a usable traditional Device Library;
-- verifies and installs the matching iPod Classic Rekordpod build;
-- converts the existing database and ANLZ material into the compact index and
-  waveform cache that the iPod can browse quickly;
-- installs the matched Rockbox overlay, Rekordpod plugin, theme, and cache.
+- validates the traditional Device Library on the iPod;
+- builds its compact collection and playlist index locally;
+- offers to prepare all existing Rekordbox waveform, beat-grid, and cue data;
+- prepares skipped tracks individually the first time they are opened; and
+- repeats the library update after a deliberate USB Data Transfer session.
 
-It does **not** format the iPod, install the Rockbox bootloader, analyze or
-re-encode music, erase the `Contents` tree, or remain necessary while Rekordpod
-is running. The `.exe` and `.app` are operating-system packages around the same
-installer logic; they exist so users do not need Python or command-line setup.
-Run the installer for the first installation and again when a Rekordpod update
-or newly exported desktop library requires a fresh device cache.
+This local preparation is a conversion of analysis already produced by
+Rekordbox. It does **not** analyze or re-encode audio. The overlay does not
+format the iPod, install the Rockbox bootloader, or erase the `Contents` or
+`PIONEER` trees.
 
 ### Setup in four steps
 
 1. Install and boot the normal Rockbox build for the exact iPod model.
 2. Analyze the collection in Rekordbox and export a traditional Device Library
    to the iPod.
-3. Mount the iPod, open the installer for Windows or macOS, choose that volume,
-   and let it build and install the matched package.
-4. Eject cleanly, boot without USB attached, and complete the first-boot and
-   write-parity checks in [TESTING.md](TESTING.md).
+3. Mount the iPod and merge the release ZIP's `.rockbox` directory into the
+   existing `.rockbox` directory. Do not replace the whole directory.
+4. Eject cleanly, boot without USB attached, and choose **Prepare** when
+   Rekordpod offers to build its local analysis bridge. **Later** is safe and
+   leaves each track to be prepared on first open.
 
 For the safe clean-install rehearsal, translated USB-storage warning, and
-recovery checkpoints, follow [INSTALL.md](INSTALL.md). Installer packaging and
-platform-specific signing details are in
-[`utils/rekordpod/installer/README.md`](utils/rekordpod/installer/README.md).
+recovery checkpoints, follow [INSTALL.md](INSTALL.md).
 
 ## Upgrades and user state
 
-Use the desktop installer for ordinary installation and upgrades. This public
-beta intentionally starts with a clean Rekordpod state namespace; it does not
-import settings, caches, or workflows from earlier pre-release namespaces.
-Create a new device cache and configure the app anew on the first install.
+Merge the new release overlay for ordinary installation and upgrades. This
+public beta intentionally starts with a clean Rekordpod state namespace; it
+does not import settings, caches, or workflows from earlier pre-release
+namespaces. Rekordpod creates its device cache locally on first launch.
 Preserve these user-owned files across later Rekordpod upgrades:
 
 - `/.rockbox/rekordpod/state/`

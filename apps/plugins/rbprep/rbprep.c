@@ -19,6 +19,7 @@
 #define RBPREP_INDEX "/.rockbox/rekordpod/library.rbi"
 #define RBPREP_GENRES "/.rockbox/rekordpod/genres.rbg"
 #define RBPREP_CUSTOM_GENRES "/.rockbox/rekordpod/custom-genres.txt"
+#define RBPREP_IMPORT_FOLDER_NAME "REKORDPOD - IMPORT ME"
 #define RBPREP_TRACK_DIR "/.rockbox/rekordpod/tracks"
 #define RBPREP_POINTS 131072
 #define RBPREP_BEATS 16384
@@ -285,7 +286,8 @@ enum rbprep_confirm_action {
     CONFIRM_PLAYLIST_SEED,
     CONFIRM_PLAYLIST_REORDER,
     CONFIRM_FAVORITE_ONE,
-    CONFIRM_FAVORITE_TWO
+    CONFIRM_FAVORITE_TWO,
+    CONFIRM_ANALYSIS_BRIDGE
 };
 
 enum rbprep_burn_request {
@@ -538,6 +540,7 @@ static enum rbprep_burn_request burn_request;
 static bool playlist_playback;
 static bool playlist_add_mode;
 static bool playlist_move_mode;
+static bool playlist_import_root_virtual;
 static int playlist_action_selection;
 static int playlist_action_node = -1;
 static int playlist_action_parent = -1;
@@ -775,6 +778,7 @@ static int tree_top;
 static int playlist_carousel_offset_fp;
 static int tree_child_count;
 static int tree_children[RBPREP_TREE_NODES];
+static int rekordpod_import_root_node = -1;
 static int favorite_playlist_nodes[2] = { -1, -1 };
 static unsigned char favorite_playlist_kinds[2];
 static char favorite_playlist_names[2][48];
@@ -837,6 +841,17 @@ static bool usb_library_context_captured;
 static bool usb_persistence_warning;
 static bool usb_unsaved_edit_valid;
 static unsigned char usb_unsaved_edit[RBPREP_EDIT_RECORD_SIZE];
+static int analysis_bridge_missing_count;
+#define RBPREP_ANALYSIS_CACHE_ID_CAPACITY 16384
+static uint32_t analysis_bridge_cache_ids[
+    RBPREP_ANALYSIS_CACHE_ID_CAPACITY];
+static int analysis_bridge_cache_id_count;
+static bool analysis_bridge_cache_index_complete;
+static uint32_t usb_previous_track_ids[
+    RBPREP_ANALYSIS_CACHE_ID_CAPACITY];
+static int usb_previous_track_id_count;
+static bool usb_previous_track_index_complete;
+static bool analysis_bridge_batch_active;
 
 static void stop_editor_audio(void);
 static void reset_play_clock(int anchor, long tick);
@@ -863,6 +878,8 @@ static void draw_screen(void);
 static bool save_rbprep_config(void);
 static bool save_tool_macros(void);
 static bool persist_usb_arm_state(void);
+static uint32_t rekordpod_import_root_source_id(void);
+static uint32_t enforced_rekordpod_import_parent(uint32_t child_id);
 static void begin_track_load_confirmation(int index, int row,
                                           enum rbprep_mode return_mode,
                                           bool force_reload);
@@ -1328,16 +1345,14 @@ static struct rbprep_tool_page tool_pages[] = {
     { MODE_PNAV, "PLNAV", 3,
       { TOOL_PLAYLIST_PREVIOUS, TOOL_PLAYLIST_NEXT,
         TOOL_RESTART_PLAYBACK } },
-    { MODE_GRID, "BTGRID", 3,
-      { TOOL_GRID_NUDGE, TOOL_GRID_ORIGIN, TOOL_GRID_BPM } },
+    { MODE_GRID, "BTGRID", 4,
+      { TOOL_GRID_NUDGE, TOOL_GRID_ORIGIN, TOOL_GRID_BPM,
+        TOOL_META_RATING } },
     { MODE_LIST, "LISTS", 4,
       { TOOL_PLAYLIST_MODE, TOOL_ADD_PLAYLIST,
         TOOL_FAVORITE_ONE, TOOL_FAVORITE_TWO } },
     { MODE_CUES, "HOTCUE", 4,
       { TOOL_CUE_SLOT, TOOL_CUE_DELETE, TOOL_CUE_COLOR, TOOL_CUE_MOVE } },
-    { MODE_METADATA, "DETAIL", 5,
-      { TOOL_META_RATING, TOOL_META_COLOR, TOOL_META_YEAR, TOOL_META_GENRE,
-        TOOL_META_KEY } },
     { MODE_VISUALIZER, "VIZ", 4,
       { TOOL_WAVEFORM_STYLE, TOOL_VIS_EQ, TOOL_VIS_PHRASE,
         TOOL_VIS_HARMONIC } },
@@ -2109,6 +2124,50 @@ static void reset_tool_macros(void)
     macro_dirty = false;
 }
 
+static bool remove_retired_metadata_steps(void)
+{
+    bool changed = false;
+    int slot;
+
+    for (slot = 0; slot < RBPREP_MACRO_COUNT; slot++) {
+        struct rbprep_tool_macro *macro = &tool_macros[slot];
+        int original_count = macro->count;
+        int source;
+        int target = 0;
+
+        for (source = 0; source < macro->count; source++) {
+            enum rbprep_tool tool = macro->steps[source].tool;
+
+            if (tool == TOOL_META_COLOR || tool == TOOL_META_YEAR ||
+                tool == TOOL_META_GENRE || tool == TOOL_META_KEY) {
+                changed = true;
+                continue;
+            }
+            if (target != source)
+                macro->steps[target] = macro->steps[source];
+            target++;
+        }
+        source = target;
+        while (target < original_count) {
+            macro->steps[target].tool = TOOL_SEEK;
+            macro->steps[target].flags = 0;
+            macro->steps[target].value = RBPREP_MACRO_CHOOSE;
+            target++;
+        }
+        macro->count = source;
+    }
+    if (macro_active >= 0 && macro_active < RBPREP_MACRO_COUNT) {
+        if (tool_macros[macro_active].count <= 0) {
+            macro_active = -1;
+            macro_position = 0;
+        } else {
+            macro_position = MIN(macro_position,
+                                 tool_macros[macro_active].count - 1);
+        }
+    }
+    return changed;
+}
+
 static bool macro_v5_validate(const unsigned char *data, int size,
                               uint32_t *generation)
 {
@@ -2411,8 +2470,10 @@ static bool load_tool_macros(void)
         macro_generation = choose_b ? generation_b : generation_a;
         macro_generation_slot = choose_b ? 1 : 0;
         macro_store_valid = true;
-        macro_dirty = false;
-        return true;
+        macro_dirty = remove_retired_metadata_steps();
+        if (macro_dirty && !save_tool_macros())
+            macro_store_valid = false;
+        return macro_store_valid;
     }
 
     for (source = 0; source < (int)ARRAYLEN(legacy_stores); source++) {
@@ -2430,6 +2491,7 @@ static bool load_tool_macros(void)
            files remain untouched until two new generations exist. */
         macro_generation = 0;
         macro_generation_slot = -1;
+        remove_retired_metadata_steps();
         macro_dirty = true;
         if (!save_tool_macros())
             macro_store_valid = false;
@@ -2854,16 +2916,43 @@ static int child_node_at(uint32_t parent, int ordinal,
     return -1;
 }
 
-static int playlist_browser_count(void)
+static int playlist_favorite_count(void)
 {
     int favorites = 0;
     int slot;
 
-    if (tree_parent == RBPREP_ROOT_NODE)
+    if (tree_parent == RBPREP_ROOT_NODE &&
+        !playlist_import_root_virtual)
         for (slot = 0; slot < 2; slot++)
             if (favorite_playlist_nodes[slot] >= 0)
                 favorites++;
-    return tree_child_count + favorites + (playlist_add_mode ? 1 : 0);
+    return favorites;
+}
+
+static bool playlist_create_context(void)
+{
+    return playlist_add_mode &&
+           (playlist_import_root_virtual ||
+            (rekordpod_import_root_node >= 0 &&
+             tree_parent == (uint32_t)rekordpod_import_root_node));
+}
+
+static bool playlist_virtual_import_root_at(int ordinal)
+{
+    return playlist_add_mode && !playlist_import_root_virtual &&
+           tree_parent == RBPREP_ROOT_NODE &&
+           rekordpod_import_root_node < 0 &&
+           ordinal == playlist_favorite_count();
+}
+
+static int playlist_browser_count(void)
+{
+    int virtual_root = playlist_add_mode && !playlist_import_root_virtual &&
+                       tree_parent == RBPREP_ROOT_NODE &&
+                       rekordpod_import_root_node < 0;
+
+    return tree_child_count + playlist_favorite_count() +
+           (playlist_create_context() ? 1 : 0) + virtual_root;
 }
 
 static int playlist_node_at_visible(int ordinal,
@@ -2874,12 +2963,13 @@ static int playlist_node_at_visible(int ordinal,
 
     if (favorite_slot)
         *favorite_slot = -1;
-    if (playlist_add_mode) {
+    if (playlist_create_context()) {
         if (ordinal == 0)
             return -1;
         ordinal--;
     }
-    if (tree_parent == RBPREP_ROOT_NODE) {
+    if (tree_parent == RBPREP_ROOT_NODE &&
+        !playlist_import_root_virtual) {
         for (slot = 0; slot < 2; slot++) {
             int node_index = favorite_playlist_nodes[slot];
 
@@ -2892,6 +2982,10 @@ static int playlist_node_at_visible(int ordinal,
                     *favorite_slot = slot;
                 return node_index;
             }
+        }
+        if (rekordpod_import_root_node < 0 && playlist_add_mode) {
+            if (ordinal-- == 0)
+                return -2;
         }
     }
     return child_node_at(tree_parent, ordinal, result);
@@ -2915,7 +3009,7 @@ static bool cached_playlist_visible(int ordinal, bool load,
     struct rbprep_playlist_cache_row *cached;
 
     if (ordinal < 0 || ordinal >= playlist_browser_count() ||
-        (playlist_add_mode && ordinal == 0))
+        (playlist_create_context() && ordinal == 0))
         return false;
     slot = ordinal % RBPREP_PLAYLIST_CACHE_ROWS;
     cached = &playlist_cache[slot];
@@ -2931,6 +3025,17 @@ static bool cached_playlist_visible(int ordinal, bool load,
         cached->ordinal = ordinal;
         cached->node_index = playlist_node_at_visible(
             ordinal, &cached->node, &cached->favorite_slot);
+        if (cached->node_index == -2) {
+            rb->memset(&cached->node, 0, sizeof(cached->node));
+            cached->node.parent = RBPREP_ROOT_NODE;
+            cached->node.kind = 0;
+            cached->node.source_id = playlist_action_parent_id;
+            rb->strlcpy(cached->name, RBPREP_IMPORT_FOLDER_NAME,
+                        sizeof(cached->name));
+            cached->valid = true;
+            *result = cached;
+            return true;
+        }
         if (cached->node_index < 0 ||
             !read_index_string(cached->node.name_offset, cached->name,
                                sizeof(cached->name)))
@@ -2954,6 +3059,7 @@ static void refresh_tree_children(uint32_t parent)
     tree_child_count = 0;
     tree_parent_name[0] = '\0';
     favorite_playlist_nodes[0] = favorite_playlist_nodes[1] = -1;
+    rekordpod_import_root_node = -1;
     favorite_playlist_names[0][0] = favorite_playlist_names[1][0] = '\0';
     favorite_playlist_kinds[0] = favorite_playlist_kinds[1] = 0;
     /* A rebuilt tree is a new carousel anchor.  In-flight easing from the
@@ -2989,6 +3095,36 @@ static void refresh_tree_children(uint32_t parent)
                 tree_children[tree_child_count++] = node_index;
         }
         index += count;
+    }
+    for (index = 0; index < library_node_count; index++) {
+        char node_name[80];
+
+        if (!read_node_record(index, &node) ||
+            node.parent != RBPREP_ROOT_NODE || node.kind != 0 ||
+            !node.source_id ||
+            !read_index_string(node.name_offset, node_name,
+                               sizeof(node_name)))
+            continue;
+        if (!rb->strcasecmp(node_name, RBPREP_IMPORT_FOLDER_NAME)) {
+            rekordpod_import_root_node = index;
+            break;
+        }
+    }
+    if (parent == RBPREP_ROOT_NODE && rekordpod_import_root_node >= 0) {
+        int position;
+
+        for (position = 0; position < tree_child_count; position++)
+            if (tree_children[position] == rekordpod_import_root_node)
+                break;
+        if (position < tree_child_count) {
+            int node_index = tree_children[position];
+
+            while (position > 0) {
+                tree_children[position] = tree_children[position - 1];
+                position--;
+            }
+            tree_children[0] = node_index;
+        }
     }
     for (index = 0; index < 2; index++) {
         if (favorite_playlist_nodes[index] >= 0 &&
@@ -3236,7 +3372,7 @@ static bool service_playlist_cache_prefetch(void)
         else
             ordinal = tree_selection - distance / 2;
         if (ordinal < 0 || ordinal >= playlist_browser_count() ||
-            (playlist_add_mode && ordinal == 0) ||
+            (playlist_create_context() && ordinal == 0) ||
             cached_playlist_visible(ordinal, false, &cached))
             continue;
         if (cached_playlist_visible(ordinal, true, &cached)) {
@@ -6103,6 +6239,26 @@ static void read_burn_offsets(uint32_t *edit_offset,
     }
 }
 
+static bool parse_playlist_u32(const char *text, uint32_t *value)
+{
+    uint32_t result = 0;
+
+    if (!text || !text[0])
+        return false;
+    while (*text) {
+        unsigned int digit;
+
+        if (*text < '0' || *text > '9')
+            return false;
+        digit = *text++ - '0';
+        if (result > (UINT32_MAX - digit) / 10)
+            return false;
+        result = result * 10 + digit;
+    }
+    *value = result;
+    return true;
+}
+
 static bool write_burn_offsets(uint32_t edit_offset,
                                uint32_t playlist_offset)
 {
@@ -6149,6 +6305,7 @@ static bool parse_playlist_journal_line(
     char *line, struct rbprep_pending_playlist *entry)
 {
     char *field[6];
+    uint32_t kind;
     int count = 1;
     char *cursor;
 
@@ -6162,21 +6319,24 @@ static bool parse_playlist_journal_line(
     }
     if (count == 3) {
         /* RBI1/RBI2 compatibility: track<TAB>playlist<TAB>name. */
+        if (!parse_playlist_u32(field[0], &entry->track_id) ||
+            !parse_playlist_u32(field[1], &entry->playlist_id))
+            return false;
         entry->operation = PLAYLIST_OP_ADD;
         entry->kind = 1;
-        entry->track_id = rb->strtoul(field[0], NULL, 10);
-        entry->playlist_id = rb->strtoul(field[1], NULL, 10);
         rb->strlcpy(entry->name, field[2], sizeof(entry->name));
         return entry->track_id && entry->playlist_id;
     }
     if (count != 6 || field[0][1] != '\0' ||
         !rb->strchr("ACRMDO", field[0][0]))
         return false;
+    if (!parse_playlist_u32(field[1], &entry->track_id) ||
+        !parse_playlist_u32(field[2], &entry->playlist_id) ||
+        !parse_playlist_u32(field[3], &entry->parent_id) ||
+        !parse_playlist_u32(field[4], &kind) || kind > 2)
+        return false;
     entry->operation = field[0][0];
-    entry->track_id = rb->strtoul(field[1], NULL, 10);
-    entry->playlist_id = rb->strtoul(field[2], NULL, 10);
-    entry->parent_id = rb->strtoul(field[3], NULL, 10);
-    entry->kind = MIN(2, rb->strtoul(field[4], NULL, 10));
+    entry->kind = kind;
     rb->strlcpy(entry->name, field[5], sizeof(entry->name));
     return entry->playlist_id &&
            (entry->operation != PLAYLIST_OP_ADD || entry->track_id);
@@ -7112,6 +7272,7 @@ static int load_playlist_order_sidecar(uint32_t playlist_id,
 /* Keep the validated, rollback-safe DeviceSQL/RBI transaction out of the UI
    core while sharing its already-coalesced pending state. */
 #include "rbprep_burn.h"
+#include "rbprep_refresh.h"
 
 static int find_node_index_by_source_id(uint32_t source_id)
 {
@@ -7493,21 +7654,48 @@ static int waveform_index_progress(void)
 static void draw_waveform_preparation(int progress, const char *stage)
 {
     bool first_frame = !waveform_preparation_visible && !display_locked;
+    const int x = 22;
+    const int y = 70;
+    const int width = LCD_WIDTH - 44;
+    const int height = 94;
+    int fill;
 
-    (void)stage;
     if (first_frame)
         animate_context_dissolve(false, 2);
     activity_ticker_ping(progress * 10);
     rb->lcd_set_background(LCD_BLACK);
     rb->lcd_clear_display();
     draw_status_bar();
+    rb->lcd_set_foreground(LCD_RGBPACK(5, 7, 6));
+    rb->lcd_fillrect(x, y, width, height);
+    rb->lcd_set_foreground(LCD_RGBPACK(92, 104, 96));
+    rb->lcd_drawrect(x, y, width, height);
+    centered_text(x, width, y + 9,
+                  analysis_bridge_batch_active ? "ANALYSIS BRIDGE" :
+                                                 "TRACK LOAD PAUSED",
+                  theme_accent);
+    centered_text(x, width, y + 29, stage, LCD_WHITE);
+    centered_text(x, width, y + 47,
+                  "Preparing waveform, beat grid and cues",
+                  LCD_LIGHTGRAY);
+    centered_text(x, width, y + 59,
+                  analysis_bridge_batch_active ?
+                      "MENU: STOP AFTER CURRENT TRACK" :
+                      "before playback resumes",
+                  LCD_LIGHTGRAY);
+    rb->lcd_set_foreground(LCD_RGBPACK(30, 36, 32));
+    rb->lcd_fillrect(x + 16, y + 78, width - 32, 4);
+    fill = (width - 32) * MAX(0, MIN(100, progress)) / 100;
+    if (fill > 0) {
+        rb->lcd_set_foreground(theme_accent);
+        rb->lcd_fillrect(x + 16, y + 78, fill, 4);
+    }
     if (first_frame) {
         capture_main_transition_thumbnail();
         waveform_preparation_visible = true;
         animate_context_dissolve(true, 2);
-        /* Restore the native top ticker after the dissolve without exposing
-           a softened final frame.  Ordinary track changes intentionally have
-           no centered loading card or progress bar. */
+        /* Restore the native top ticker and crisp preparation card after the
+           dissolve without exposing a softened final frame. */
         draw_waveform_preparation(progress, stage);
     } else {
         rb->lcd_update();
@@ -7581,6 +7769,11 @@ static bool load_waveform(int track_id)
     rb->snprintf(filename, sizeof(filename), "%s/%06d.rbw",
                  RBPREP_TRACK_DIR, track_id);
     fd = rb->open(filename, O_RDONLY);
+    if (fd < 0) {
+        draw_waveform_preparation(2, "TRANSLATING REKORDBOX ANALYSIS");
+        if (rbprep_refresh_build_track_cache(track_id))
+            fd = rb->open(filename, O_RDONLY);
+    }
     if (fd < 0)
         return false;
     if (!read_exact(fd, header, sizeof(header)) ||
@@ -7982,6 +8175,232 @@ static bool quiesce_audio_for_track_load(bool *resume_after_prepare)
         rb->audio_resume();
     reset_play_clock(playhead, *rb->current_tick);
     return settled;
+}
+
+static int compare_analysis_cache_id(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *)left;
+    uint32_t b = *(const uint32_t *)right;
+
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static bool sorted_track_ids_contain(const uint32_t *ids, int count,
+                                     uint32_t track_id)
+{
+    int low = 0;
+    int high = count;
+
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+
+        if (ids[middle] < track_id)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    return low < count && ids[low] == track_id;
+}
+
+static void capture_track_ids_before_usb(void)
+{
+    struct rbprep_track_record track;
+    uint32_t index;
+
+    usb_previous_track_id_count = 0;
+    usb_previous_track_index_complete =
+        library_fd >= 0 &&
+        library_track_count <= RBPREP_ANALYSIS_CACHE_ID_CAPACITY;
+    if (!usb_previous_track_index_complete)
+        return;
+    for (index = 0; index < library_track_count; index++) {
+        if (!read_track_record(index, &track)) {
+            usb_previous_track_id_count = 0;
+            usb_previous_track_index_complete = false;
+            return;
+        }
+        usb_previous_track_ids[usb_previous_track_id_count++] = track.id;
+        if (!(index & 127))
+            rb->yield();
+    }
+    rb->qsort(usb_previous_track_ids, usb_previous_track_id_count,
+              sizeof(usb_previous_track_ids[0]), compare_analysis_cache_id);
+}
+
+static bool parse_analysis_cache_id(const char *name, uint32_t *track_id)
+{
+    size_t length = rb->strlen(name);
+    size_t digits;
+    size_t index;
+    uint32_t value = 0;
+
+    if (length <= 4 || rb->strcasecmp(name + length - 4, ".rbw"))
+        return false;
+    digits = length - 4;
+    for (index = 0; index < digits; index++) {
+        unsigned int digit;
+
+        if (name[index] < '0' || name[index] > '9')
+            return false;
+        digit = name[index] - '0';
+        if (value > (UINT32_MAX - digit) / 10)
+            return false;
+        value = value * 10 + digit;
+    }
+    *track_id = value;
+    return true;
+}
+
+static void index_analysis_bridge_caches(void)
+{
+    DIR *directory = rb->opendir(RBPREP_TRACK_DIR);
+    struct dirent *entry;
+
+    analysis_bridge_cache_id_count = 0;
+    analysis_bridge_cache_index_complete = directory != NULL;
+    if (!directory)
+        return;
+    while ((entry = rb->readdir(directory)) != NULL) {
+        uint32_t track_id;
+
+        if (!parse_analysis_cache_id(entry->d_name, &track_id))
+            continue;
+        if (analysis_bridge_cache_id_count >=
+            RBPREP_ANALYSIS_CACHE_ID_CAPACITY) {
+            analysis_bridge_cache_index_complete = false;
+            break;
+        }
+        analysis_bridge_cache_ids[analysis_bridge_cache_id_count++] =
+            track_id;
+    }
+    rb->closedir(directory);
+    if (analysis_bridge_cache_index_complete)
+        rb->qsort(analysis_bridge_cache_ids,
+                  analysis_bridge_cache_id_count,
+                  sizeof(analysis_bridge_cache_ids[0]),
+                  compare_analysis_cache_id);
+}
+
+static bool analysis_bridge_cache_exists(uint32_t track_id,
+                                         const char *path)
+{
+    if (!analysis_bridge_cache_index_complete)
+        return rb->file_exists(path);
+    return sorted_track_ids_contain(analysis_bridge_cache_ids,
+                                    analysis_bridge_cache_id_count,
+                                    track_id);
+}
+
+static int count_new_analysis_bridges(void)
+{
+    struct rbprep_track_record track;
+    char path[MAX_PATH];
+    uint32_t index;
+    int missing = 0;
+
+    if (library_fd < 0 || !usb_previous_track_index_complete)
+        return 0;
+    index_analysis_bridge_caches();
+    for (index = 0; index < library_track_count; index++) {
+        if (!read_track_record(index, &track))
+            continue;
+        if (sorted_track_ids_contain(usb_previous_track_ids,
+                                     usb_previous_track_id_count,
+                                     track.id))
+            continue;
+        rb->snprintf(path, sizeof(path), "%s/%06lu.rbw",
+                     RBPREP_TRACK_DIR, (unsigned long)track.id);
+        if (!analysis_bridge_cache_exists(track.id, path))
+            missing++;
+        if (!(index & 127))
+            rb->yield();
+    }
+    return missing;
+}
+
+static void prepare_missing_analysis_bridges(void)
+{
+    struct rbprep_track_record track;
+    char path[MAX_PATH];
+    char stage[48];
+    bool resume_after_prepare = false;
+    bool capture_was_active = spectrum_capture_active;
+    bool cancelled = false;
+    int total = count_new_analysis_bridges();
+    int processed = 0;
+    int prepared = 0;
+    int failed = 0;
+    uint32_t index;
+
+    analysis_bridge_missing_count = total;
+    if (total <= 0) {
+        rb->splash(HZ, "New track analysis is ready");
+        usb_previous_track_id_count = 0;
+        usb_previous_track_index_complete = false;
+        restore_black_canvas();
+        return;
+    }
+    if (!quiesce_audio_for_track_load(&resume_after_prepare)) {
+        rb->splash(HZ * 2, "Could not pause playback");
+        usb_previous_track_id_count = 0;
+        usb_previous_track_index_complete = false;
+        restore_black_canvas();
+        return;
+    }
+    stop_spectrum_capture();
+    analysis_bridge_batch_active = true;
+    waveform_preparation_visible = false;
+    for (index = 0; index < library_track_count && processed < total;
+         index++) {
+        if (!read_track_record(index, &track))
+            continue;
+        if (sorted_track_ids_contain(usb_previous_track_ids,
+                                     usb_previous_track_id_count,
+                                     track.id))
+            continue;
+        rb->snprintf(path, sizeof(path), "%s/%06lu.rbw",
+                     RBPREP_TRACK_DIR, (unsigned long)track.id);
+        if (analysis_bridge_cache_exists(track.id, path))
+            continue;
+        if (rb->button_get(false) & BUTTON_MENU) {
+            cancelled = true;
+            break;
+        }
+        rb->snprintf(stage, sizeof(stage), "PREPARING TRACK %d OF %d",
+                     processed + 1, total);
+        draw_waveform_preparation(
+            2 + processed * 96 / MAX(1, total), stage);
+        if (rbprep_refresh_build_track_cache(track.id))
+            prepared++;
+        else
+            failed++;
+        processed++;
+        rb->yield();
+    }
+    draw_waveform_preparation(cancelled ?
+        2 + processed * 96 / MAX(1, total) : 100,
+        cancelled ? "STOPPED SAFELY" : "ANALYSIS BRIDGE COMPLETE");
+    waveform_preparation_visible = false;
+    analysis_bridge_batch_active = false;
+    analysis_bridge_missing_count = failed;
+    usb_previous_track_id_count = 0;
+    usb_previous_track_index_complete = false;
+    if (capture_was_active && !display_locked)
+        start_spectrum_capture();
+    if (resume_after_prepare &&
+        (rb->audio_status() & AUDIO_STATUS_PAUSE))
+        rb->audio_resume();
+    restore_black_canvas();
+    if (cancelled)
+        rb->splashf(HZ * 2, "Stopped after %d track%s",
+                    prepared, prepared == 1 ? "" : "s");
+    else if (failed)
+        rb->splashf(HZ * 3, "%d prepared; %d need Rekordbox analysis",
+                    prepared, failed);
+    else
+        rb->splashf(HZ * 2, "%d track%s prepared",
+                    prepared, prepared == 1 ? "" : "s");
+    restore_black_canvas();
 }
 
 static void restore_failed_track_load(int old_track_id,
@@ -8666,7 +9085,10 @@ static void draw_playlist_browser(void)
     draw_blade_shell(playlist_add_mode ? "ADD TO PLAYLIST" :
                      playlist_move_mode ? "MOVE PLAYLIST" : "PLAYLISTS",
                      RBPREP_GREEN);
-    if (tree_parent == RBPREP_ROOT_NODE) {
+    if (playlist_import_root_virtual) {
+        text(112, RBPREP_STATUS_HEIGHT + 4,
+             RBPREP_IMPORT_FOLDER_NAME, LCD_LIGHTGRAY);
+    } else if (tree_parent == RBPREP_ROOT_NODE) {
         text(112, RBPREP_STATUS_HEIGHT + 3, "/", LCD_LIGHTGRAY);
     } else if (tree_parent_name[0])
         text(112, RBPREP_STATUS_HEIGHT + 4, tree_parent_name,
@@ -8678,7 +9100,7 @@ static void draw_playlist_browser(void)
 
         if (ordinal < 0 || ordinal >= playlist_browser_count())
             continue;
-        if (playlist_add_mode && ordinal == 0)
+        if (playlist_create_context() && ordinal == 0)
             draw_playlist_carousel_blade(delta, NULL, true);
         else
             draw_playlist_carousel_blade(
@@ -8702,7 +9124,7 @@ static void draw_playlist_browser(void)
 static void draw_playlist_actions(void)
 {
     static const char * const actions[] = {
-        "CREATE PLAYLIST HERE", "RENAME PLAYLIST",
+        "CREATE IN IMPORT FOLDER", "RENAME PLAYLIST",
         "MOVE PLAYLIST", "DELETE PLAYLIST", "WORKFLOW PAD",
         "SET AS FAVORITE 1", "SET AS FAVORITE 2", "CLEAR FAVORITE"
     };
@@ -8715,7 +9137,11 @@ static void draw_playlist_actions(void)
     int i;
 
     draw_blade_shell("PLAYLIST MANAGER", RBPREP_GREEN);
-    if (has_target && read_index_string(node.name_offset, name, sizeof(name)))
+    if (playlist_action_selection == 0)
+        rb->snprintf(line, sizeof(line), "ROOT: %s",
+                     RBPREP_IMPORT_FOLDER_NAME);
+    else if (has_target &&
+             read_index_string(node.name_offset, name, sizeof(name)))
         rb->snprintf(line, sizeof(line), "SELECTED: %.42s", name);
     else
         rb->snprintf(line, sizeof(line), "DESTINATION: CURRENT FOLDER");
@@ -11578,26 +12004,88 @@ static bool append_playlist_seed_operation(uint32_t playlist_id,
                                            uint32_t parent_id,
                                            const char *name)
 {
-    char data[384];
-    int first;
-    int second;
+    char data[512];
+    int length = 0;
+    int written;
+    int i;
+    bool root_present;
 
     if (!playlist_id || selected_track_id < 0 || !name || !name[0])
         return false;
-    first = rb->snprintf(data, sizeof(data),
-                         "%c\t0\t%lu\t%lu\t1\t%s\n",
-                         PLAYLIST_OP_CREATE, (unsigned long)playlist_id,
-                         (unsigned long)parent_id, name);
-    if (first <= 0 || first >= (int)sizeof(data))
+    (void)parent_id;
+    parent_id = enforced_rekordpod_import_parent(playlist_id);
+    if (!parent_id || parent_id == playlist_id)
         return false;
-    second = rb->snprintf(data + first, sizeof(data) - first,
-                          "%c\t%lu\t%lu\t0\t1\t%s\n",
-                          PLAYLIST_OP_ADD,
-                          (unsigned long)selected_track_id,
-                          (unsigned long)playlist_id, name);
-    if (second <= 0 || first + second >= (int)sizeof(data))
+    root_present = find_node_index_by_source_id(parent_id) >= 0;
+    for (i = 0; i < pending_playlist_count && !root_present; i++)
+        root_present = pending_playlists[i].operation == PLAYLIST_OP_CREATE &&
+                       pending_playlists[i].playlist_id == parent_id &&
+                       pending_playlists[i].kind == 0;
+    if (!root_present) {
+        written = rb->snprintf(data + length, sizeof(data) - length,
+                               "%c\t0\t%lu\t0\t0\t%s\n",
+                               PLAYLIST_OP_CREATE,
+                               (unsigned long)parent_id,
+                               RBPREP_IMPORT_FOLDER_NAME);
+        if (written <= 0 || written >= (int)sizeof(data) - length)
+            return false;
+        length += written;
+    }
+    written = rb->snprintf(data + length, sizeof(data) - length,
+                           "%c\t0\t%lu\t%lu\t1\t%s\n",
+                           PLAYLIST_OP_CREATE, (unsigned long)playlist_id,
+                           (unsigned long)parent_id, name);
+    if (written <= 0 || written >= (int)sizeof(data) - length)
         return false;
-    return append_playlist_records_verified(data, first + second);
+    length += written;
+    written = rb->snprintf(data + length, sizeof(data) - length,
+                           "%c\t%lu\t%lu\t0\t1\t%s\n",
+                           PLAYLIST_OP_ADD,
+                           (unsigned long)selected_track_id,
+                           (unsigned long)playlist_id, name);
+    if (written <= 0 || written >= (int)sizeof(data) - length)
+        return false;
+    return append_playlist_records_verified(data, length + written);
+}
+
+static bool append_rekordpod_playlist_create(uint32_t playlist_id,
+                                             uint32_t parent_id,
+                                             const char *name)
+{
+    char data[384];
+    int length = 0;
+    int written;
+    int i;
+    bool root_present;
+
+    if (!playlist_id || !name || !name[0])
+        return false;
+    (void)parent_id;
+    parent_id = enforced_rekordpod_import_parent(playlist_id);
+    if (!parent_id || parent_id == playlist_id)
+        return false;
+    root_present = find_node_index_by_source_id(parent_id) >= 0;
+    for (i = 0; i < pending_playlist_count && !root_present; i++)
+        root_present = pending_playlists[i].operation == PLAYLIST_OP_CREATE &&
+                       pending_playlists[i].playlist_id == parent_id &&
+                       pending_playlists[i].kind == 0;
+    if (!root_present) {
+        written = rb->snprintf(data + length, sizeof(data) - length,
+                               "%c\t0\t%lu\t0\t0\t%s\n",
+                               PLAYLIST_OP_CREATE,
+                               (unsigned long)parent_id,
+                               RBPREP_IMPORT_FOLDER_NAME);
+        if (written <= 0 || written >= (int)sizeof(data) - length)
+            return false;
+        length += written;
+    }
+    written = rb->snprintf(data + length, sizeof(data) - length,
+                           "%c\t0\t%lu\t%lu\t1\t%s\n",
+                           PLAYLIST_OP_CREATE, (unsigned long)playlist_id,
+                           (unsigned long)parent_id, name);
+    if (written <= 0 || written >= (int)sizeof(data) - length)
+        return false;
+    return append_playlist_records_verified(data, length + written);
 }
 
 static bool append_playlist_journal(int node_index)
@@ -11706,6 +12194,56 @@ static uint32_t next_playlist_source_id(void)
     return maximum + 1;
 }
 
+static uint32_t rekordpod_import_root_source_id(void)
+{
+    struct rbprep_node_record node;
+    char name[80];
+    uint32_t index;
+    int i;
+
+    for (index = 0; index < library_node_count; index++) {
+        if (!read_node_record(index, &node) || node.kind != 0 ||
+            node.parent != RBPREP_ROOT_NODE || !node.source_id ||
+            !read_index_string(node.name_offset, name, sizeof(name)))
+            continue;
+        if (!rb->strcasecmp(name, RBPREP_IMPORT_FOLDER_NAME))
+            return node.source_id;
+    }
+    for (i = 0; i < pending_playlist_count; i++) {
+        const struct rbprep_pending_playlist *entry = &pending_playlists[i];
+
+        if (entry->operation == PLAYLIST_OP_CREATE && entry->kind == 0 &&
+            entry->parent_id == 0 &&
+            !rb->strcasecmp(entry->name, RBPREP_IMPORT_FOLDER_NAME))
+            return entry->playlist_id;
+    }
+    return 0;
+}
+
+static uint32_t enforced_rekordpod_import_parent(uint32_t child_id)
+{
+    uint32_t root = rekordpod_import_root_source_id();
+
+    if (!root)
+        root = next_playlist_source_id();
+    if (root == child_id)
+        root++;
+    return root;
+}
+
+static void prepare_rekordpod_playlist_identity(void)
+{
+    uint32_t root = rekordpod_import_root_source_id();
+    uint32_t next = next_playlist_source_id();
+
+    if (!root) {
+        root = next;
+        next++;
+    }
+    playlist_action_parent_id = root;
+    playlist_action_id = next;
+}
+
 static void apply_grid_origin(int origin)
 {
     int index = nearest_beat_index(origin);
@@ -11784,11 +12322,17 @@ static void finish_confirmation(bool apply)
     if (!apply) {
         if (action == CONFIRM_KEEP_EDIT)
             discard_staged_edit();
+        if (action == CONFIRM_ANALYSIS_BRIDGE) {
+            usb_previous_track_id_count = 0;
+            usb_previous_track_index_complete = false;
+        }
         restore_black_canvas();
         return;
     }
 
-    if (action == CONFIRM_EXIT) {
+    if (action == CONFIRM_ANALYSIS_BRIDGE) {
+        prepare_missing_analysis_bridges();
+    } else if (action == CONFIRM_EXIT) {
         if (flush_deferred_edit()) {
             exit_requested = true;
         } else {
@@ -11829,6 +12373,7 @@ static void finish_confirmation(bool apply)
                                            playlist_action_parent_id,
                                            playlist_action_name)) {
             playlist_add_mode = false;
+            playlist_import_root_virtual = false;
             mode = MODE_DECK;
             if (!burn_playlist_changes_now())
                 rb->splash(HZ * 2,
@@ -11884,10 +12429,15 @@ static void finish_confirmation(bool apply)
             action == CONFIRM_PLAYLIST_RENAME ? PLAYLIST_OP_RENAME :
             action == CONFIRM_PLAYLIST_MOVE ? PLAYLIST_OP_MOVE :
                                               PLAYLIST_OP_DELETE;
-        if (append_playlist_operation(operation, 0, playlist_action_id,
-                                      playlist_action_parent_id, 1,
-                                      playlist_action_name)) {
+        if ((action == CONFIRM_PLAYLIST_CREATE
+                 ? append_rekordpod_playlist_create(
+                       playlist_action_id, playlist_action_parent_id,
+                       playlist_action_name)
+                 : append_playlist_operation(operation, 0,
+                       playlist_action_id, playlist_action_parent_id, 1,
+                       playlist_action_name))) {
             playlist_move_mode = false;
+            playlist_import_root_virtual = false;
             mode = MODE_PLAYLISTS;
             tree_selection = tree_top = 0;
             refresh_tree_children(RBPREP_ROOT_NODE);
@@ -11911,16 +12461,22 @@ static void finish_confirmation(bool apply)
 static void draw_confirmation(void)
 {
     const int x = 25;
-    const int y = confirm_action == CONFIRM_TRACK_LOAD ? 72 : 83;
+    const bool bridge_confirmation =
+        confirm_action == CONFIRM_ANALYSIS_BRIDGE;
+    const int y = confirm_action == CONFIRM_TRACK_LOAD ? 72 :
+                  bridge_confirmation ? 60 : 83;
     const int width = LCD_WIDTH - 50;
-    const int height = confirm_action == CONFIRM_TRACK_LOAD ? 96 : 76;
+    const int height = confirm_action == CONFIRM_TRACK_LOAD ? 96 :
+                       bridge_confirmation ? 120 : 76;
     char fitted[64];
 
     rb->lcd_set_foreground(LCD_RGBPACK(4, 4, 4));
     rb->lcd_fillrect(x, y, width, height);
     rb->lcd_set_foreground(LCD_RGBPACK(105, 115, 108));
     rb->lcd_drawrect(x, y, width, height);
-    text(x + 10, y + 9, "CONFIRM", RBPREP_GREEN);
+    text(x + 10, y + 9,
+         bridge_confirmation ? "ANALYSIS BRIDGE" : "CONFIRM",
+         RBPREP_GREEN);
     fit_text(fitted, sizeof(fitted), confirm_message, width - 20);
     text(x + 10, y + 29, fitted, LCD_WHITE);
 
@@ -11951,6 +12507,34 @@ static void draw_confirmation(void)
             left += widths[choice] + 4;
         }
         text(x + 10, y + 79, "LEFT/RIGHT: CHOOSE   SELECT: CONFIRM",
+             LCD_LIGHTGRAY);
+        return;
+    }
+
+    if (bridge_confirmation) {
+        text(x + 10, y + 47,
+             "Build waveform, grid and cue data now.", LCD_LIGHTGRAY);
+        text(x + 10, y + 60,
+             "Or wait until each track first opens.", LCD_LIGHTGRAY);
+
+        rb->lcd_set_foreground(LCD_RGBPACK(13, 17, 15));
+        rb->lcd_fillrect(x + 12, y + 78, 76, 20);
+        centered_text(x + 12, 76, y + 83, "LATER", LCD_WHITE);
+        rb->lcd_set_foreground(confirm_ok ? LCD_RGBPACK(52, 61, 56)
+                                          : theme_accent);
+        rb->lcd_drawrect(x + 12, y + 78, 76, 20);
+        if (!confirm_ok)
+            rb->lcd_drawrect(x + 13, y + 79, 74, 18);
+
+        rb->lcd_set_foreground(LCD_RGBPACK(13, 17, 15));
+        rb->lcd_fillrect(x + width - 92, y + 78, 80, 20);
+        centered_text(x + width - 92, 80, y + 83, "PREPARE", LCD_WHITE);
+        rb->lcd_set_foreground(confirm_ok ? theme_accent
+                                          : LCD_RGBPACK(52, 61, 56));
+        rb->lcd_drawrect(x + width - 92, y + 78, 80, 20);
+        if (confirm_ok)
+            rb->lcd_drawrect(x + width - 91, y + 79, 78, 18);
+        text(x + 10, y + 104, "LEFT/RIGHT: CHOOSE   SELECT: CONFIRM",
              LCD_LIGHTGRAY);
         return;
     }
@@ -12874,18 +13458,12 @@ static void choose_playlist_action(void)
                     sizeof(playlist_action_name));
         if (!playlist_name_with_keyboard(playlist_action_name,
                                          sizeof(playlist_action_name),
-                                         "CREATE PLAYLIST"))
+                                         "CREATE IN IMPORT FOLDER"))
             return;
-        playlist_action_id = next_playlist_source_id();
-        playlist_action_parent_id =
-            playlist_parent_source_id(playlist_action_parent);
-        if (playlist_action_parent >= 0 && !playlist_action_parent_id) {
-            rb->splash(HZ * 2, "Rebuild cache for stable folder IDs");
-            restore_black_canvas();
-            return;
-        }
+        prepare_rekordpod_playlist_identity();
         rb->snprintf(confirm_message, sizeof(confirm_message),
-                     "CREATE %.30s?", playlist_action_name);
+                     "CREATE %.22s IN IMPORT FOLDER?",
+                     playlist_action_name);
         begin_confirmation(CONFIRM_PLAYLIST_CREATE);
     } else if (playlist_action_selection >= 5) {
         int slot;
@@ -13060,6 +13638,8 @@ static void activate_main_selection(int item)
     } else if (item == 1 && library_fd >= 0) {
         start_shuffled_collection();
     } else if (item == 2 && library_fd >= 0) {
+        playlist_add_mode = false;
+        playlist_import_root_virtual = false;
         tree_selection = tree_top = 0;
         refresh_tree_children(RBPREP_ROOT_NODE);
         mode = MODE_PLAYLISTS;
@@ -13103,28 +13683,29 @@ static void short_select(void)
         struct rbprep_node_record node;
         int index;
 
-        if (playlist_add_mode && tree_selection == 0) {
+        if (playlist_create_context() && tree_selection == 0) {
             rb->strlcpy(playlist_action_name, "NEW PLAYLIST",
                         sizeof(playlist_action_name));
             if (!playlist_name_with_keyboard(playlist_action_name,
                                              sizeof(playlist_action_name),
                                              "CREATE + ADD TRACK"))
                 return;
-            playlist_action_id = next_playlist_source_id();
-            playlist_action_parent_id =
-                playlist_parent_source_id(
-                    tree_parent == RBPREP_ROOT_NODE ? -1
-                                                    : (int)tree_parent);
-            if (tree_parent != RBPREP_ROOT_NODE &&
-                !playlist_action_parent_id) {
-                rb->splash(HZ * 2,
-                           "Rebuild cache for stable folder IDs");
-                restore_black_canvas();
-                return;
-            }
+            prepare_rekordpod_playlist_identity();
             rb->snprintf(confirm_message, sizeof(confirm_message),
-                         "CREATE %.22s + ADD?", playlist_action_name);
+                         "CREATE %.18s IN IMPORT + ADD?",
+                         playlist_action_name);
             begin_confirmation(CONFIRM_PLAYLIST_SEED);
+            return;
+        }
+        if (playlist_virtual_import_root_at(tree_selection)) {
+            playlist_import_root_virtual = true;
+            tree_selection = tree_top = 0;
+            tree_child_count = 0;
+            playlist_carousel_offset_fp = 0;
+            rb->strlcpy(tree_parent_name, RBPREP_IMPORT_FOLDER_NAME,
+                        sizeof(tree_parent_name));
+            invalidate_playlist_cache();
+            force_full_redraw = true;
             return;
         }
         index = playlist_node_at_visible(tree_selection, &node, NULL);
@@ -13189,8 +13770,15 @@ static void short_select(void)
         }
     } else if (mode == MODE_USB) {
         int choice = usb_selection;
+        bool ready = choice == 0 || persist_usb_arm_state();
 
-        if (choice != 0 && !persist_usb_arm_state()) {
+        if (ready && choice == 1) {
+            capture_track_ids_before_usb();
+            ready = rbprep_refresh_mark_pending();
+        }
+        if (!ready) {
+            usb_previous_track_id_count = 0;
+            usb_previous_track_index_complete = false;
             apply_usb_choice(0);
             rb->splash(HZ * 2, "USB arm failed; power only");
         } else {
@@ -13431,8 +14019,9 @@ static void short_select(void)
             quantize = !quantize;
         }
         if (staged_tool == tool) {
-            rb->snprintf(confirm_message, sizeof(confirm_message),
-                         "KEEP GRID CHANGE?");
+            rb->snprintf(confirm_message, sizeof(confirm_message), "%s",
+                         tool == TOOL_META_RATING ? "KEEP RATING?" :
+                                                    "KEEP GRID CHANGE?");
             begin_confirmation(CONFIRM_KEEP_EDIT);
         }
     } else if (mode == MODE_LOOP) {
@@ -13499,6 +14088,8 @@ static void short_select(void)
         } else if (tool == TOOL_ADD_PLAYLIST) {
             if (selected_track_id >= 0) {
                 playlist_add_mode = true;
+                playlist_import_root_virtual = false;
+                prepare_rekordpod_playlist_identity();
                 tree_selection = tree_top = 0;
                 refresh_tree_children(RBPREP_ROOT_NODE);
                 mode = MODE_PLAYLISTS;
@@ -14247,6 +14838,9 @@ static void apply_macro_step(const struct rbprep_macro_step *step)
     if (!step || step->tool >= TOOL_COUNT)
         return;
     tool = step->tool;
+    if (tool == TOOL_META_COLOR || tool == TOOL_META_YEAR ||
+        tool == TOOL_META_GENRE || tool == TOOL_META_KEY)
+        return;
     value = step->value;
     tool_menu_active = false;
     select_tool(tool);
@@ -14556,16 +15150,26 @@ static void handle_escape_once(void)
         playlist_reorder_grabbed = false;
         playlist_order_dirty = false;
         apply_playlist_view_order(previous_view);
+    } else if (mode == MODE_PLAYLISTS && playlist_import_root_virtual) {
+        playlist_import_root_virtual = false;
+        refresh_tree_children(RBPREP_ROOT_NODE);
+        tree_selection = tree_top = playlist_favorite_count();
     } else if (mode == MODE_PLAYLISTS &&
                tree_parent != RBPREP_ROOT_NODE) {
         struct rbprep_node_record parent;
+        bool was_import_root =
+            tree_parent == (uint32_t)rekordpod_import_root_node;
+
         if (read_node_record(tree_parent, &parent))
             refresh_tree_children(parent.parent);
         else
             refresh_tree_children(RBPREP_ROOT_NODE);
-        tree_selection = tree_top = 0;
+        tree_selection = tree_top =
+            was_import_root && tree_parent == RBPREP_ROOT_NODE
+            ? playlist_favorite_count() : 0;
     } else if (mode == MODE_PLAYLISTS && playlist_add_mode) {
         playlist_add_mode = false;
+        playlist_import_root_virtual = false;
         mode = MODE_DECK;
     } else if (mode == MODE_PLAYLISTS && playlist_move_mode) {
         playlist_move_mode = false;
@@ -14924,6 +15528,7 @@ static void resume_rekordpod_after_usb(void)
 {
     struct mp3entry *id3;
     bool library_ready;
+    int refresh_result;
 
     /* The stock USB screen blocks until disconnect. Resume this plugin in
        place afterwards: restarting through PLUGIN_GOTO_PLUGIN is dependent
@@ -14933,12 +15538,23 @@ static void resume_rekordpod_after_usb(void)
     restore_dac_gain();
     apply_usb_choice(0);
     recent_tracks_ready = false;
+    refresh_result = rbprep_refresh_library_if_needed(true);
+    if (refresh_result >= 0)
+        rbprep_refresh_clear_pending();
     library_ready = open_library_index();
     load_smart_query_flags();
     restore_usb_library_context(library_ready);
     load_genre_rollup();
     if (!library_ready) {
         rb->splash(HZ * 2, "Library index unavailable");
+        restore_black_canvas();
+    } else if (refresh_result < 0) {
+        char message[112];
+        rb->snprintf(message, sizeof(message),
+                     "Library update failed: %s",
+                     rbprep_burn_failure_detail[0]
+                         ? rbprep_burn_failure_detail : "previous index kept");
+        rb->splash(HZ * 3, message);
         restore_black_canvas();
     }
     if (library_ready && selected_track_id >= 0 &&
@@ -15023,6 +15639,30 @@ static void resume_rekordpod_after_usb(void)
         usb_persistence_warning = false;
         restore_black_canvas();
     }
+    analysis_bridge_missing_count = 0;
+    if (library_ready && refresh_result > 0) {
+        waveform_preparation_visible = false;
+        activity_ticker_ping(100);
+        rb->lcd_set_background(LCD_BLACK);
+        rb->lcd_clear_display();
+        draw_status_bar();
+        centered_text(0, LCD_WIDTH, LCD_HEIGHT / 2 - 4,
+                      "CHECKING TRACK ANALYSIS", LCD_WHITE);
+        rb->lcd_update();
+        analysis_bridge_missing_count = count_new_analysis_bridges();
+        restore_black_canvas();
+        if (analysis_bridge_missing_count > 0) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "PREPARE %d TRACK%s NOW?",
+                         analysis_bridge_missing_count,
+                         analysis_bridge_missing_count == 1 ? "" : "S");
+            begin_confirmation(CONFIRM_ANALYSIS_BRIDGE);
+        }
+    }
+    if (!confirm_active) {
+        usb_previous_track_id_count = 0;
+        usb_previous_track_index_complete = false;
+    }
     rb->button_clear_queue();
 }
 
@@ -15057,6 +15697,7 @@ enum plugin_status plugin_start(const void *parameter)
     long frame_deadline;
     int frame_rate = 0;
     int frame_remainder = 0;
+    int refresh_result;
     void *beat_workspace;
     void *index_workspace;
 
@@ -15144,6 +15785,7 @@ enum plugin_status plugin_start(const void *parameter)
     playlist_playback = !!autoplay_enabled;
     playlist_add_mode = false;
     playlist_move_mode = false;
+    playlist_import_root_virtual = false;
     playlist_order_count = 0;
     playlist_view_order = PLAYLIST_VIEW_ORIGINAL;
     playlist_order_menu_selection = 0;
@@ -15158,6 +15800,10 @@ enum plugin_status plugin_start(const void *parameter)
     playing_track_row = -1;
     audio_was_running = !!(rb->audio_status() & AUDIO_STATUS_PLAY);
     confirm_active = false;
+    analysis_bridge_missing_count = 0;
+    usb_previous_track_id_count = 0;
+    usb_previous_track_index_complete = false;
+    analysis_bridge_batch_active = false;
     exit_requested = false;
     staged_tool = -1;
     staged_cue_slot = -1;
@@ -15276,6 +15922,18 @@ enum plugin_status plugin_start(const void *parameter)
         rb->splash(HZ * 4, "Rekordpod database recovery failed");
         return PLUGIN_ERROR;
     }
+    refresh_result = rbprep_refresh_library_if_needed(
+        rb->file_exists(RBPREP_REFRESH_PENDING));
+    if (refresh_result >= 0)
+        rbprep_refresh_clear_pending();
+    else {
+        char message[112];
+        rb->snprintf(message, sizeof(message),
+                     "Library update failed: %s",
+                     rbprep_burn_failure_detail[0]
+                         ? rbprep_burn_failure_detail : "previous index kept");
+        rb->splash(HZ * 3, message);
+    }
     open_library_index();
     load_genre_rollup();
     load_tool_macros();
@@ -15284,6 +15942,32 @@ enum plugin_status plugin_start(const void *parameter)
     refresh_pending_summary();
     if (autoboot_launch)
         draw_rekordpod_boot_splash();
+    if (library_fd >= 0 && refresh_result > 0) {
+        /* A plain release-ZIP overlay has no desktop-built waveform cache.
+           Treat every library track as a candidate on the first refreshed
+           index and offer the same interruptible bridge used after USB sync.
+           Existing valid RBW files are skipped, so upgrades stay cheap. */
+        usb_previous_track_id_count = 0;
+        usb_previous_track_index_complete = true;
+        activity_ticker_ping(100);
+        rb->lcd_set_background(LCD_BLACK);
+        rb->lcd_clear_display();
+        draw_status_bar();
+        centered_text(0, LCD_WIDTH, LCD_HEIGHT / 2 - 4,
+                      "CHECKING REKORDBOX DATA", LCD_WHITE);
+        rb->lcd_update();
+        analysis_bridge_missing_count = count_new_analysis_bridges();
+        restore_black_canvas();
+        if (analysis_bridge_missing_count > 0) {
+            rb->snprintf(confirm_message, sizeof(confirm_message),
+                         "PREPARE %d TRACK%s NOW?",
+                         analysis_bridge_missing_count,
+                         analysis_bridge_missing_count == 1 ? "" : "S");
+            begin_confirmation(CONFIRM_ANALYSIS_BRIDGE);
+        } else {
+            usb_previous_track_index_complete = false;
+        }
+    }
     if (auto_burn && (pending_snapshot_count > 0 ||
                       pending_playlist_count > 0))
         burn_request = BURN_REQUEST_ALL;

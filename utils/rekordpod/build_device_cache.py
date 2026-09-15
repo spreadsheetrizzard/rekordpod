@@ -25,6 +25,7 @@ TRACK_RECORD_SIZE = 44
 NODE_RECORD_SIZE = 24
 ROOT_NODE = 0xFFFFFFFF
 TRACK_COLOR_NONE = 8
+SOURCE_STATE_SIZE = 16
 
 COLOR_LABELS = {
     "sample": 0,
@@ -93,6 +94,37 @@ class StringTable:
         self.data.extend(text.encode("utf-8", "replace") + b"\0")
         self.offsets[text] = offset
         return offset
+
+
+def fnv1a_file(path: Path) -> tuple[int, int]:
+    """Return the compact source identity used by the on-device refresher."""
+    fingerprint = 2166136261
+    size = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(64 * 1024):
+            size += len(chunk)
+            for value in chunk:
+                fingerprint ^= value
+                fingerprint = (fingerprint * 16777619) & 0xFFFFFFFF
+    if not 0 < size <= 0xFFFFFFFF:
+        raise ValueError(f"unsupported export.pdb size: {size}")
+    return size, fingerprint
+
+
+def build_source_state(connection: sqlite3.Connection) -> bytes | None:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key='source'"
+    ).fetchone()
+    if row is None:
+        return None
+    source = Path(str(row[0])).expanduser()
+    if not source.is_file():
+        return None
+    size, fingerprint = fnv1a_file(source)
+    payload = struct.pack("<4sHHII", b"RLS1", 1, SOURCE_STATE_SIZE,
+                          size, fingerprint)
+    assert len(payload) == SOURCE_STATE_SIZE
+    return payload
 
 
 def peak_resample(samples: bytes, source_points: int,
@@ -442,6 +474,7 @@ def build(args: argparse.Namespace) -> None:
     index = build_index(connection)
     genres = build_genre_index(connection)
     smart_queries = build_smart_query_file(connection)
+    source_state = build_source_state(connection)
 
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -461,6 +494,11 @@ def build(args: argparse.Namespace) -> None:
                     target.writestr(item, source.read(item.filename))
             target.writestr(zip_info(".rockbox/rekordpod/library.rbi"), index)
             target.writestr(zip_info(".rockbox/rekordpod/genres.rbg"), genres)
+            if source_state is not None:
+                target.writestr(
+                    zip_info(".rockbox/rekordpod/library-source.rbs"),
+                    source_state,
+                )
             if smart_queries is not None:
                 target.writestr(
                     zip_info(".rockbox/rekordpod/smart-playlists.rbq"),

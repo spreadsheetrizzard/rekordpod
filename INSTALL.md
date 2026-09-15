@@ -51,8 +51,7 @@ below for a bootloader recovery. The corresponding instructions are also in
 - The exact Rekordpod release files and hashes from the release manifest.
 - A stock Rockbox iPod Classic build obtained through Rockbox Utility or the
   official Rockbox download site.
-- `Build Full Rekordpod Waveform Cache.command` and
-  `Install Rekordpod on RIZZPOD.command` beside the Rekordpod release ZIP.
+- The `rekordpod-public-beta-1-ipod6g.zip` release overlay.
 - A terminal window kept open for recording the before/after disk geometry.
 
 ## Stage 1: back up and prove recovery
@@ -60,8 +59,8 @@ below for a bootloader recovery. The corresponding instructions are also in
 1. In Rekordpod, select **USB → Data Transfer** and wait for `RIZZPOD` to mount.
 2. Copy the current `.rockbox` directory and
    `PIONEER/rekordbox/export.pdb` to a dated folder on the Mac or another drive.
-   The 133 GB `Contents` tree remains in place and is not touched by the cache
-   builder or installer.
+   The 133 GB `Contents` tree remains in place and is not touched by the
+   overlay or Rekordpod's local cache builder.
 3. Do not use the current `.rockbox/rekordpod` directory as the new installation
    seed. Keep it only as rollback evidence; this rehearsal intentionally starts
    with a new Rekordpod state namespace.
@@ -161,50 +160,50 @@ test -d /Volumes/RIZZPOD/.rockbox-pre-rekordpod-test
 All four commands must exit successfully. Save a directory listing and the
 stock `.rockbox/rockbox-info.txt` as evidence.
 
-For an installer-overlay rehearsal, it is sufficient to verify this stock
+For an overlay rehearsal, it is sufficient to verify this stock
 filesystem baseline without booting it. This avoids depending on the stock USB
 presentation of a nonstandard 1 TB storage conversion. A separate stock-boot
 test is optional: perform it only if a tested path back to a writable mounted
 volume is already available, because stock USB lacks Rekordpod's translated
 geometry. Otherwise continue without ejecting or rebooting.
 
-## Stage 5: build a fresh Rekordpod cache
+## Stage 5: merge the Rekordpod overlay
 
-Because `PIONEER` and the music stayed in place, no terabyte-scale restore is
-needed. Run `Build Full Rekordpod Waveform Cache.command` from the release
-folder. It:
+Extract `rekordpod-public-beta-1-ipod6g.zip` on the computer. Merge the
+extracted `.rockbox` directory into `/Volumes/RIZZPOD/.rockbox`; do not replace
+the entire destination directory. On macOS, one reliable merge is:
 
-1. reads `export.pdb` and `USBANLZ` from the mounted iPod;
-2. displays terminal progress for tracks, playlists, analysis, and packaging;
-3. creates a fresh compact Rekordpod index and per-track waveform files;
-4. packages them with the exact iPod Classic release ZIP as
-   `rekordpod-rizzpod-full.zip`;
-5. leaves the mounted iPod unchanged.
+```sh
+ditto "/path/to/extracted/.rockbox" "/Volumes/RIZZPOD/.rockbox"
+```
 
-The resulting full ZIP contains private library metadata. Do not publish or
-attach it to a public issue. Keep the generic release ZIP and source ZIP as the
-public artifacts.
+On Windows, enable hidden items if necessary, then copy the extracted
+`.rockbox` folder onto the iPod and choose **Merge** and **Replace files in the
+destination** when prompted. Do not delete the existing `.rockbox` folder.
 
-**Checkpoint C:** the builder must reach 100 percent with no parser warning for
-a track used in the smoke test, and `unzip -t rekordpod-rizzpod-full.zip` must
-report no errors.
+Verify that both `/Volumes/RIZZPOD/.rockbox/rockbox.ipod` and
+`/Volumes/RIZZPOD/.rockbox/rocks/apps/rekordpod.rock` exist. Eject the iPod
+cleanly before unplugging it.
 
-## Stage 6: run the one-click installer
+**Checkpoint C:** the active `.rockbox` tree contains the matched firmware and
+plugin, while `PIONEER` and `Contents` retain their pre-install hashes and
+sizes.
 
-Run `Install Rekordpod on RIZZPOD.command`. The installer:
+## Stage 6: build the library on the iPod
 
-- refuses to run unless `RIZZPOD` is mounted and writable;
-- requires the freshly generated `rekordpod-rizzpod-full.zip`;
-- asks for confirmation before copying;
-- overlays Rockbox, `rekordpod.rock`, theme files, and the new cache;
-- writes the device name under `/.rockbox/rekordpod`;
-- flushes pending writes and ejects the iPod.
+Boot with USB disconnected. On first launch, Rekordpod reads
+`PIONEER/rekordbox/export.pdb` and builds its compact collection and playlist
+index on the iPod. It then offers to **Prepare** every track whose local
+waveform cache is missing. This reads Rekordbox's existing DAT/EXT analysis and
+writes only derived files beneath `/.rockbox/rekordpod`.
 
-It does not format the disk, replace the partition table, or import the retired
-pre-release state.
+This is not audio analysis: BPM, waveform, beat-grid, and cue data must already
+exist in the Rekordbox export. Thousands of tracks can take time, so keep the
+iPod charged. The operation has visible progress and can be stopped safely with
+MENU. Choosing **Later** is also safe; Rekordpod prepares each missing track the
+first time it is opened.
 
-After installation, do not unplug until macOS reports that the volume was
-ejected.
+No `.app`, `.exe`, Python runtime, or device-specific cache ZIP is required.
 
 ## Stage 7: first boot acceptance test
 
@@ -226,13 +225,14 @@ Boot with no USB cable attached and record each result:
 
 Use backed-up test tracks, not an irreplaceable performance set.
 
-1. Change one harmless metadata field on one track and unload it.
+1. Change the star rating on one track and unload it.
 2. Confirm Save; reboot; reopen the track and verify the value.
 3. Create one green cue, move it, save, reboot, and verify it.
 4. Create one test playlist and add one track; confirm it updates immediately.
 5. Enter Data Transfer deliberately, eject cleanly, and open the device in
    rekordbox.
-6. Verify the metadata, cue time/color, and playlist membership.
+6. Verify rating, cue time/color, beat grid, and playlist membership. Genre,
+   track color, year, key, comments, and tags are intentionally read-only.
 7. Preserve before/after copies and hashes of `export.pdb` and affected ANLZ
    files.
 

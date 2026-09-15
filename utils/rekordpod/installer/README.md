@@ -1,6 +1,12 @@
-# Rekordpod desktop installer
+# Optional Rekordpod desktop recovery tool
 
-This directory builds the same Rekordpod installer for Windows and macOS. The
+This packaging path is retained for maintainers, recovery experiments, and
+cross-checking the on-device cache format. It is not distributed with the
+public beta and is not required on Windows or macOS. Ordinary users install the
+same Rockbox overlay ZIP on every desktop platform, then let Rekordpod build its
+index and analysis bridge on the iPod.
+
+This directory can build the same optional tool for Windows and macOS. The
 GUI, validation, cache generation, safety backup, copy order, messages, and
 progress stages are shared Python code. Only packaging and the operating
 system's final eject request differ.
@@ -29,8 +35,8 @@ in Git.
 
 The iPod Classic ZIP is embedded in the finished installer. The selected iPod's
 `.rockbox/rockbox-info.txt` must identify the supported `ipod6g` target. The
-installer must not mix a Rekordpod plugin or codecs with an unrelated Rockbox
-daily build. Other targets are rejected by the public-beta installer.
+tool must not mix a Rekordpod plugin or codecs with an unrelated Rockbox daily
+build. Other targets are rejected by the diagnostic tool.
 
 ## Windows EXE
 
@@ -47,9 +53,8 @@ assets and place the result in `dist-release`.
 PyInstaller is not a cross-compiler: the Windows executable must be produced
 on Windows or a Windows CI runner.
 
-An unsigned test executable can trigger Microsoft SmartScreen. Public builds
-should be Authenticode-signed after PyInstaller finishes and before the final
-SHA-256 is recorded.
+An unsigned test executable can trigger Microsoft SmartScreen. Do not publish
+these maintainer builds as public-beta installation assets.
 
 ## macOS app
 
@@ -63,10 +68,9 @@ This creates `Rekordpod Installer.app` and a ZIP that preserves the app bundle.
 The app replaces the `.command` user experience; the old command remains a
 transparent fallback for testing.
 
-An unsigned development build must be opened with Control-click, Open. Public
-distribution should use a Developer ID Application signature, notarization,
-and stapling. Set `REKORDPOD_CODESIGN_IDENTITY` while building to pass a signing
-identity to PyInstaller; notarization still occurs after the app is built.
+An unsigned development build must be opened with Control-click, Open. Set
+`REKORDPOD_CODESIGN_IDENTITY` while building to pass a signing identity to
+PyInstaller for controlled internal distribution.
 
 ## Cache and safety behavior
 
@@ -98,7 +102,7 @@ The core safety tests do not need Rekordbox parser dependencies:
 python3 -m unittest -v test_installer_core.py
 ```
 
-Before publishing, test the frozen executable on both operating systems with a
-disposable FAT32 fixture and one real, independently backed-up iPod. Confirm
-that the user-selected-path guarantee, target refusal, cache reuse, backup,
-overlay install, failure handling, and eject behavior match on both systems.
+Before using a frozen recovery tool, test it with a disposable FAT32 fixture
+and an independently backed-up iPod. Confirm that the user-selected-path
+guarantee, target refusal, cache reuse, backup, overlay install, failure
+handling, and eject behavior match on that operating system.

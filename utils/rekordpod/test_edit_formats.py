@@ -4,12 +4,14 @@
 """Regression tests for Rekordpod's append-only edit and cue formats."""
 
 import importlib.util
+import sqlite3
 import struct
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 # The format helpers do not need rekordbox-pdb.  Supply a minimal import stub
@@ -100,6 +102,75 @@ class EditFormatTests(unittest.TestCase):
         self.assertEqual(cache_formats.cue_color("#37EB5F"), 3)
         self.assertEqual(cache_formats.cue_color(""), 3)
         self.assertEqual(cache_formats.cue_color("#000000"), 3)
+
+    def test_device_cache_records_source_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "export.pdb"
+            source.write_bytes(b"DeviceSQL test bytes\0")
+            connection = sqlite3.connect(":memory:")
+            try:
+                connection.execute(
+                    "CREATE TABLE metadata (key TEXT, value TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO metadata VALUES ('source', ?)",
+                    (str(source),),
+                )
+                state = cache_formats.build_source_state(connection)
+                expected_fingerprint = cache_formats.fnv1a_file(source)[1]
+            finally:
+                connection.close()
+        self.assertIsNotNone(state)
+        magic, version, size, source_size, fingerprint = struct.unpack(
+            "<4sHHII", state
+        )
+        self.assertEqual((magic, version, size), (b"RLS1", 1, 16))
+        self.assertEqual(source_size, len(b"DeviceSQL test bytes\0"))
+        self.assertEqual(fingerprint, expected_fingerprint)
+
+    def test_recovery_writer_leaves_descriptive_metadata_read_only(self):
+        class FakeEditor:
+            source = None
+
+            def __init__(self, _data=None):
+                self.calls = []
+                self.db = SimpleNamespace(
+                    tracks=[SimpleNamespace(
+                        id=1234, rating=0, year=1999, tempo=12000,
+                        color_id=2, genre_id=7,
+                        analyze_path="/PIONEER/USBANLZ/missing.DAT")],
+                    playlist_tree=[], playlist_entries=[])
+
+            @classmethod
+            def from_file(cls, _path):
+                cls.source = cls()
+                return cls.source
+
+            def set_track_field(self, track_id, field, value):
+                self.calls.append((track_id, field, value))
+
+            def to_bytes(self):
+                return b"validated-pdb"
+
+        original = formats.PdbEditor
+        formats.PdbEditor = FakeEditor
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                _pdb, _analysis, changes, _warnings = formats.plan_changes(
+                    Path(directory), {1234: snapshot()}, [])
+            calls = FakeEditor.source.calls
+        finally:
+            formats.PdbEditor = original
+        self.assertEqual(calls, [
+            (1234, "rating", 4),
+            (1234, "tempo", 12800),
+        ])
+        self.assertIn("track 1234: rating 0 -> 4", changes)
+        self.assertIn("track 1234: tempo 12000 -> 12800", changes)
+        self.assertFalse(any("year" in change or "color" in change or
+                             "genre" in change or "key" in change
+                             for change in changes))
 
 
 if __name__ == "__main__":

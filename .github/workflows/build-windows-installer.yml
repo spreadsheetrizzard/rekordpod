@@ -1,18 +1,18 @@
-name: Build Windows installer
+name: Build optional Windows recovery tool
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Draft release tag containing the iPod firmware archive
+        description: Test release tag containing the iPod firmware archive
         required: true
         default: v1.0.0-beta.1
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  windows-installer:
+  windows-recovery-tool:
     runs-on: windows-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -47,11 +47,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Rekordpod-Installer-Windows
+          name: Rekordpod-Recovery-Tool-Windows
           path: release-output/Rekordpod-Installer-Windows.zip
-
-      - name: Attach installer to the draft release
-        shell: pwsh
-        run: |
-          gh release upload "${{ inputs.release_tag }}" `
-            "release-output/Rekordpod-Installer-Windows.zip" --clobber

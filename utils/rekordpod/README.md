@@ -1,5 +1,14 @@
 # Rekordpod Rekordbox metadata importer
 
+These host-side utilities are optional maintainer, recovery, and format-test
+tools. They are not part of ordinary Rekordpod installation. Public-beta users
+merge the single Rockbox overlay on Windows, macOS, or Linux; Rekordpod then
+builds its collection index and converts existing Rekordbox analysis locally on
+the iPod. The device does not analyze or re-encode the audio itself.
+
+The commands below document the reproducible host implementation used to
+inspect formats, construct fixtures, and recover a damaged beta installation.
+
 `import_rekordbox.py` reads the `PIONEER/rekordbox/export.pdb` Device Library
 database and produces two inputs:
 
@@ -31,7 +40,8 @@ python3 utils/rekordpod/import_rekordbox.py \
 The importer builds the SQLite cache under a temporary name and atomically
 replaces the completed cache. It never changes `export.pdb`.
 
-`build_device_cache.py` combines that SQLite library with a Rockbox ZIP. Its
+For maintainer testing, `build_device_cache.py` combines that SQLite library
+with a Rockbox ZIP. Its
 RBI3 index remains readable by the plugin's RBI1 compatibility path and adds a
 single-read search string per track, year/comments/tags/import-date metadata,
 six compact precomputed sort maps, musical keys, and stable Rekordbox playlist IDs. The
@@ -63,9 +73,11 @@ turntable combines a readable horizontal oscilloscope with platter, Phase,
 cue, RPM, and tonearm motion. Non-waveform analyzers intentionally omit edit
 overlays; beatgrid, loop, and cue detail stays on the RGB waveform.
 
-Prep Deck tools are arranged in eleven pages: PLAYER, PLNAV, BTGRID, LISTS,
-HOTCUE, DETAIL, VIZ, MORVIZ, TEMPO, LOOPS, and LOCK. Pages contain at most five
-orbs; PLAYER and DETAIL use the fifth position and the rest use four or fewer.
+Prep Deck tools are arranged in ten pages: PLAYER, PLNAV, BTGRID, LISTS,
+HOTCUE, VIZ, MORVIZ, TEMPO, LOOPS, and LOCK. Pages contain at most five orbs;
+PLAYER uses the fifth position and the rest use four or fewer. Star rating is
+the fourth BTGRID tool. Genre, track color, year, and musical key are imported
+for display/search but are not editable.
 While the tool picker is open, LEFT/RIGHT or the wheel moves within a page and
 physical up/down banks pages while preserving (or clamping) the orb column.
 Two named workflow pads can retain up to 48 ordered tool selections each;
@@ -110,18 +122,20 @@ animated `rekordpod` wordmark using the bundled Adobe Helvetica font. Holding
 MENU during boot bypasses Rekordpod, and Rekordpod's Exit to Rockbox item returns to
 the ordinary root menu without relaunching it. Main and browser selections use
 rounded capsule geometry; the main menu is icon-first and the playlist tree has
-separate folder and playlist glyphs. Search and Add Genre use a Rekordpod wheel
-keyboard with selectable Space, Backspace, and Done keys plus direct LEFT,
+separate folder and playlist glyphs. Search and playlist naming use a Rekordpod
+wheel keyboard with selectable Space, Backspace, and Done keys plus direct LEFT,
 RIGHT, PLAY, and MENU shortcuts.
 
-Local burn updates the traditional Rekordbox Device Library (`export.pdb`) and
-its DAT/EXT analysis files. Those changes are intended for players that browse
-the traditional Device Library. Hardware that reads only OneLibrary / Device
+Local burn updates cue/grid/rating data in the traditional Rekordbox Device
+Library (`export.pdb`) and its DAT/EXT analysis files. Playlist curation is
+written beneath the `REKORDPOD - IMPORT ME` root folder. Smart-playlist rules
+remain device-local and only their materialized membership can be represented
+as an ordinary Device Library playlist. Hardware that reads only OneLibrary / Device
 Library Plus needs a matching Plus-library update; Rekordpod does not write that
 second database yet.
 
 `apply_device_edits.py` is an optional host-side recovery and diagnostic tool,
-not part of the normal Rekordpod workflow. Normal metadata, beat-grid, hot-cue,
+not part of the normal Rekordpod workflow. Normal rating, beat-grid, hot-cue,
 and playlist burns happen entirely on the iPod. The utility can preview or
 apply a surviving device journal when investigating a damaged beta install;
 it builds and validates all outputs before replacement, creates timestamped

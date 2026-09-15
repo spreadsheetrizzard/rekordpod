@@ -57,8 +57,7 @@ All of these must pass on the release commit:
    `.pyc` files, device libraries, journals, or screenshots.
 8. Record plugin-region use from the Classic linker report. Do not release an
    image that crosses the target's plugin memory budget.
-9. Record SHA-256 digests for the binary archive, installers, and source
-   archive.
+9. Record SHA-256 digests for the firmware overlay and source archive.
 
 For the private build only, compile once with
 `REKORDPOD_PRIVATE_SCREENSHOTS=1` to ensure the retained capture code does not rot.
@@ -72,16 +71,17 @@ for an already prepared test volume.
 
 1. Verify the ZIP target and SHA-256 against the release manifest.
 2. Overlay the ZIP's `.rockbox` directory; do not delete the existing directory
-   first. For this clean namespace release, generate a fresh Rekordpod device
-   cache and configure the app anew.
+   first. Do not use a desktop-generated cache for this release test.
 3. On later Rekordpod overlay tests, confirm workflow/config/state files survive
    unchanged unless a documented format migration applies.
 4. Eject cleanly and boot with no USB cable attached.
-5. Confirm the complete intro animation, `rekordpod` title, screen zoom, and
+5. When offered, choose **Prepare** and confirm the on-device bridge completes
+   or reports only tracks whose Rekordbox analysis is genuinely missing.
+6. Confirm the complete intro animation, `rekordpod` title, screen zoom, and
    clean main menu. Watch for flashes of the default Rockbox background.
-6. Reboot with MENU held and confirm the one-time autoboot bypass.
-7. Toggle Autoboot off and on in Rekordpod Settings, rebooting after each.
-8. Confirm HOLD behaves normally. While locked, confirm the screen and
+7. Reboot with MENU held and confirm the one-time autoboot bypass.
+8. Toggle Autoboot off and on in Rekordpod Settings, rebooting after each.
+9. Confirm HOLD behaves normally. While locked, confirm the screen and
    visualizer update rate fall and audio continues without interruption.
 
 ## Main menu and common controls
@@ -126,7 +126,9 @@ Test a library large enough to expose cache and lazy-loading behavior.
 3. Create, rename, move, reorder, favorite, and delete a test playlist and a
    test folder. Test backspace and space in the on-device keyboard.
 4. Add the current track to an existing playlist and create a new playlist from
-   that flow. Confirm the new track is visible immediately in Rekordpod.
+   that flow. Confirm `NEW PLAYLIST...` is offered only after opening
+   `REKORDPOD - IMPORT ME`, the create screen names that fixed root, and the
+   new track is visible immediately in Rekordpod.
 5. Test Favorite Playlist 1 and 2. Selecting a tool must be immediate; no
    playlist write or folder scan begins until the user confirms its dialog.
 6. Test temporary sorting and shuffle without changing permanent order, then
@@ -164,7 +166,7 @@ files, VBR audio, a dense grid, and a track with no cues.
 9. Test Cue audition independently and confirm it lasts only for the intended
    hold, with no stuck cue state.
 
-## Grid, cues, loops, metadata, and workflows
+## Grid, cues, loops, rating, and workflows
 
 ### Beat grid
 
@@ -187,13 +189,14 @@ files, VBR audio, a dense grid, and a track with no cues.
 - Cue flags stay readable on the main and miniature waveform and scale with
   zoom.
 
-### Loops and metadata
+### Loops and rating
 
 - Verify Loop In, Loop Out, size, active state, and tinted waveform region.
-- Burn rating, no color, every named track color, year (including a blank year
-  that starts at 2000), genre including Add Genre, key, and BPM/grid.
+- Burn rating, cues/cue colors, and BPM/grid changes.
+- Confirm genre, track color, year, musical key, comments, and tags remain
+  visible/searchable but have no editing tools and are not rewritten by a burn.
 - Check Original, flat Chromatic, and Camelot display preferences without
-  changing the stored key unless Key Editor is confirmed.
+  changing the stored key.
 - Confirm `[year] Artist - Title [extension] || comments ||` scrolls and wraps
   without overwriting time or battery status.
 
@@ -212,18 +215,26 @@ files, VBR audio, a dense grid, and a track with no cues.
 
 Use a cloned library for this section.
 
-1. Make one metadata change, unload the track, choose Save, and confirm the
+1. Make one rating change, unload the track, choose Save, and confirm the
    change burns before the next track becomes active.
 2. Repeat and choose Discard. Confirm neither PDB nor analysis files change.
-3. Test combined metadata, cue, and grid edits on one track.
-4. Test cue deletion as the only change and metadata as the only change.
-5. Test playlist-only create/add/remove/reorder/delete operations.
+3. Test combined rating, cue, and grid edits on one track.
+4. Test cue deletion as the only change and rating as the only change.
+5. Test playlist-only create/add/remove/reorder/delete operations. Confirm the
+   first Rekordpod-created playlist also creates one top-level
+   `REKORDPOD - IMPORT ME` folder, subsequent creations reuse it, duplicate
+   adds remain single entries, and permanent reordering preserves every member
+   exactly once with contiguous order values. At playlist root, confirm the
+   import folder is always the first ordinary blade immediately after FAV1 and
+   FAV2 (when configured), independent of DeviceSQL insertion order.
 6. Reboot immediately after a completed save and verify state.
 7. On a disposable clone only, interrupt power during each safe transaction
    phase. Reboot, retain all `.rekordpod-*` recovery files, and verify the original
    library is either intact or recoverable; never accept a partial success.
 8. Connect by Data Transfer, eject cleanly, and open the export in rekordbox.
-   Verify track fields, cue slots/colors/times, beat grid, and playlist order.
+   Verify rating, cue slots/colors/times, beat grid, and playlist order. Import
+   the Rekordpod folder separately and record whether repeated imports create a
+   second desktop copy.
 9. Browse and load changed tracks on every claimed CDJ/XDJ model. Record exact
    models and firmware versions. Rekordbox parity alone does not prove hardware
    compatibility.

@@ -24,7 +24,7 @@ jobs:
       - name: Test edit formats
         run: |
           python -m unittest -v utils/rekordpod/test_edit_formats.py
-      - name: Test desktop installer core
+      - name: Test optional desktop recovery core
         working-directory: utils/rekordpod/installer
         run: |
           python -m unittest -v test_installer_core.py

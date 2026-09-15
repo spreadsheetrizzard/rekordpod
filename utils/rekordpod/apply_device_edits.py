@@ -315,10 +315,6 @@ def resolve_analysis_files(volume: Path, analyze_path: str) -> list[Path]:
     return [path for path in (dat, stem.with_suffix(".EXT")) if path.exists()]
 
 
-def current_color_index(color_id: int) -> int:
-    return color_id - 1 if 1 <= color_id <= 8 else 8
-
-
 def source_bpm_from_cache(volume: Path, track_id: int, fallback: int) -> int:
     path = volume / f".rockbox/rekordpod/tracks/{track_id:06d}.rbw"
     try:
@@ -336,7 +332,6 @@ def plan_changes(volume: Path, snapshots: dict[int, EditSnapshot],
     pdb_path = volume / PDB_PATH
     editor = PdbEditor.from_file(pdb_path)
     tracks = {track.id: track for track in editor.db.tracks}
-    genre_names = {genre.id: genre.name for genre in editor.db.genres}
     changes: list[str] = []
     warnings: list[str] = []
     analysis_outputs: dict[Path, bytes] = {}
@@ -348,27 +343,12 @@ def plan_changes(volume: Path, snapshots: dict[int, EditSnapshot],
             continue
         fields = (
             ("rating", track.rating, min(5, snapshot.rating)),
-            ("year", track.year, snapshot.year),
             ("tempo", track.tempo, snapshot.bpm_x100),
         )
         for field, current, desired in fields:
             if desired >= 0 and current != desired:
                 editor.set_track_field(track_id, field, desired)
                 changes.append(f"track {track_id}: {field} {current} -> {desired}")
-        desired_color = (snapshot.color_index + 1
-                         if snapshot.color_index < 8 else 0)
-        if current_color_index(track.color_id) != snapshot.color_index:
-            editor.set_track_field(track_id, "color_id", desired_color)
-            changes.append(
-                f"track {track_id}: color {track.color_id} -> {desired_color}")
-        current_genre = genre_names.get(track.genre_id, "")
-        if snapshot.genre and current_genre.casefold() != snapshot.genre.casefold():
-            genre_id = editor.get_or_create_genre(snapshot.genre)
-            editor.set_track_field(track_id, "genre_id", genre_id)
-            genre_names[genre_id] = snapshot.genre
-            changes.append(
-                f"track {track_id}: genre {current_genre!r} -> {snapshot.genre!r}")
-
         analysis_files = resolve_analysis_files(volume, track.analyze_path)
         if not analysis_files:
             warnings.append(

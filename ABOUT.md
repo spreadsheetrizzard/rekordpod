@@ -7,23 +7,25 @@ is away from the laptop?
 
 A normal export stores music and preparation data. Rekordpod adds a screen,
 click-wheel controls, playback, detailed waveforms, collection search,
-playlist organization, cue and beat-grid editing, metadata tools, and a writer
-for the traditional Rekordbox Device Library. The result is a portable library
+playlist organization, cue and beat-grid editing, star ratings, and a writer
+for the traditional Rekordbox Device Library. Descriptive metadata stays
+visible and searchable; the intentionally narrow editor changes cues, grids,
+ratings, and playlist curation. The result is a portable library
 that can help prepare itself.
 
 Rekordpod is not a skin or a single `.rock` file. It is a substantial
 GPL-licensed fork of [Rockbox](https://www.rockbox.org/) with matched firmware,
-plugin, USB-storage behavior, desktop provisioning tools, and a compact cache
-built from an existing Rekordbox export.
+plugin, USB-storage behavior, and an on-device compact cache built from an
+existing Rekordbox export.
 
 ## How the workflow fits together
 
 Rekordbox remains the heavy analysis and export station. It analyzes audio and
-writes a traditional Device Library to the iPod. The Rekordpod desktop
-installer validates that export, builds an iPod-friendly index and waveform
-cache, and installs the matched Rockbox distribution. After that, Rekordpod can
-browse, play, organize, and make supported preparation changes without a
-laptop nearby.
+writes a traditional Device Library to the iPod. The user then merges one
+matched Rockbox overlay, and Rekordpod validates the export and builds its
+iPod-friendly index and waveform cache locally. No platform-specific installer
+is required. After that, Rekordpod can browse, play, organize, and make
+supported preparation changes without a laptop nearby.
 
 When the iPod returns to Rekordbox, recognized changes can be imported into the
 main collection. Rekordbox can then publish them to other media or to a

@@ -8,23 +8,24 @@ preparation tools for an existing traditional Rekordbox Device Library.
 
 The GitHub release is expected to contain:
 
-- `Rekordpod-Installer-macOS.zip` — the macOS desktop installer;
-- `Rekordpod-Installer-Windows.zip` — the Windows desktop installer;
-- `rekordpod-public-beta-1-ipod6g.zip` — the expert/manual iPod Classic
-  overlay; and
+- `rekordpod-public-beta-1-ipod6g.zip` — the cross-platform iPod Classic
+  Rockbox overlay; and
 - a source archive generated from the exact release tag.
 
-Most users should choose the installer for their computer. The installer
-validates the selected iPod, builds its library cache, preserves existing
-Rekordpod settings during upgrades, and applies the matched firmware and plugin
-set. Copying `rekordpod.rock` by itself is not supported.
+No macOS or Windows executable is required. Users merge the ZIP's `.rockbox`
+directory into an existing iPod Classic Rockbox installation; Rekordpod builds
+and updates its compact index and analysis bridge on the device. Copying
+`rekordpod.rock` by itself is not supported.
 
 ## Highlights
 
 - Collection search and sorting, playlist/folder browsing, favorites, shuffle,
   and ordered playlist work.
+- Rekordpod-created playlists are confined to `REKORDPOD - IMPORT ME`; that
+  folder is pinned immediately after the two favorite slots in the root
+  playlist carousel.
 - A click-wheel Prep Deck with seek, scrub, zoom, gain, grid, cue, loop,
-  metadata, key, tempo/RPM, pitch-lock, quantize, and workflow-pad tools.
+  star-rating, tempo/RPM, pitch-lock, quantize, and workflow-pad tools.
 - Detailed RGB waveforms plus 20-band EQ, phrase map, harmonic constellation,
   spectral canyon, boombox, stereo orbit, and Oscillo-Turntable views.
 - Confirmed on-device writes to supported traditional Device Library and ANLZ
@@ -37,7 +38,7 @@ set. Copying `rekordpod.rock` by itself is not supported.
 
 - iPod Classic 6G/7G with a working Rockbox installation and bootloader;
 - a Rekordbox-analyzed traditional Device Library already exported to the iPod;
-- Windows or macOS for initial provisioning;
+- any computer capable of merging a ZIP onto the mounted FAT32 volume;
 - an independent backup of `.rockbox` and the complete `PIONEER` directory; and
 - enough time to complete the first-boot and write-parity checks in
   [TESTING.md](TESTING.md).
