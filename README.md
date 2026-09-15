@@ -34,6 +34,9 @@ export.
 > successful compile is not evidence that database writes are safe on every
 > library, storage adapter, or player.
 
+**[Download Rekordpod Public Beta 2](https://github.com/spreadsheetrizzard/rekordpod/releases/tag/v1.0.0-beta.2)**
+— one cross-platform iPod Classic overlay ZIP; no desktop installer is required.
+
 ![Rekordpod main menu on an iPod Classic](docs/screenshots/rekordpod/main-menu.png)
 
 *A DJ library inside the click wheel: Rekordpod's CDJ-inspired main menu.*
