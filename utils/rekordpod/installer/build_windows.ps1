@@ -11,7 +11,7 @@ $Python = Join-Path $PSScriptRoot ".venv-windows\Scripts\python.exe"
 $env:PIP_CACHE_DIR = Join-Path $PSScriptRoot ".pip-cache"
 $env:PYINSTALLER_CONFIG_DIR = Join-Path $PSScriptRoot ".pyinstaller"
 $Required = @(
-    "rekordpod-public-beta-1-ipod6g.zip"
+    "rekordpod-public-beta-2-ipod6g.zip"
 )
 
 foreach ($Archive in $Required) {

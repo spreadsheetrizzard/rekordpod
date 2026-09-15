@@ -51,7 +51,7 @@ below for a bootloader recovery. The corresponding instructions are also in
 - The exact Rekordpod release files and hashes from the release manifest.
 - A stock Rockbox iPod Classic build obtained through Rockbox Utility or the
   official Rockbox download site.
-- The `rekordpod-public-beta-1-ipod6g.zip` release overlay.
+- The `rekordpod-public-beta-2-ipod6g.zip` release overlay.
 - A terminal window kept open for recording the before/after disk geometry.
 
 ## Stage 1: back up and prove recovery
@@ -169,7 +169,7 @@ geometry. Otherwise continue without ejecting or rebooting.
 
 ## Stage 5: merge the Rekordpod overlay
 
-Extract `rekordpod-public-beta-1-ipod6g.zip` on the computer. Merge the
+Extract `rekordpod-public-beta-2-ipod6g.zip` on the computer. Merge the
 extracted `.rockbox` directory into `/Volumes/RIZZPOD/.rockbox`; do not replace
 the entire destination directory. On macOS, one reliable merge is:
 

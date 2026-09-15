@@ -184,7 +184,7 @@ You need:
    Analyze the tracks in Rekordbox before exporting them because Rekordpod does
    not perform full audio analysis on the iPod.
 3. **The matching iPod Classic release overlay:**
-   `rekordpod-public-beta-1-ipod6g.zip`. It is the same ZIP on Windows, macOS,
+   `rekordpod-public-beta-2-ipod6g.zip`. It is the same ZIP on Windows, macOS,
    and Linux.
 
 ### Why no desktop executable is required

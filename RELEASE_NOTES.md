@@ -1,6 +1,6 @@
-# Rekordpod public beta 1
+# Rekordpod public beta 2
 
-Rekordpod public beta 1 turns an iPod Classic 6G/7G into a smart DJ drive built
+Rekordpod public beta 2 turns an iPod Classic 6G/7G into a smart DJ drive built
 on Rockbox. It combines portable playback and library browsing with on-device
 preparation tools for an existing traditional Rekordbox Device Library.
 
@@ -8,7 +8,7 @@ preparation tools for an existing traditional Rekordbox Device Library.
 
 The GitHub release is expected to contain:
 
-- `rekordpod-public-beta-1-ipod6g.zip` — the cross-platform iPod Classic
+- `rekordpod-public-beta-2-ipod6g.zip` — the cross-platform iPod Classic
   Rockbox overlay; and
 - a source archive generated from the exact release tag.
 

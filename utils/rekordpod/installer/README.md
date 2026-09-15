@@ -27,7 +27,7 @@ On Windows the system drive is rejected even if entered explicitly.
 
 Place these exact files together in an asset directory:
 
-- `rekordpod-public-beta-1-ipod6g.zip`
+- `rekordpod-public-beta-2-ipod6g.zip`
 
 The build scripts default to `installer/assets`, but accept another asset
 directory as their first argument. Release archives are deliberately not kept

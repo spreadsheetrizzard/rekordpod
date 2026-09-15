@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Test release tag containing the iPod firmware archive
         required: true
-        default: v1.0.0-beta.1
+        default: v1.0.0-beta.2
 
 permissions:
   contents: read
@@ -28,7 +28,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path release-assets -Force | Out-Null
           gh release download "${{ inputs.release_tag }}" `
-            --pattern rekordpod-public-beta-1-ipod6g.zip `
+            --pattern rekordpod-public-beta-2-ipod6g.zip `
             --dir release-assets
 
       - name: Build the Windows installer

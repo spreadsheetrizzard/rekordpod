@@ -25,7 +25,7 @@ if [ -z "$PYTHON" ]; then
 fi
 
 for archive in \
-    rekordpod-public-beta-1-ipod6g.zip
+    rekordpod-public-beta-2-ipod6g.zip
 do
     if [ ! -f "$ASSET_DIR/$archive" ]; then
         echo "Missing $ASSET_DIR/$archive" >&2

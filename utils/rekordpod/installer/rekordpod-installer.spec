@@ -12,7 +12,7 @@ rekordpod_dir = installer_dir.parent
 rekordbox_pdb_src = installer_dir / "vendor" / "rekordbox-pdb" / "src"
 pyrekordbox_src = installer_dir / "vendor" / "pyrekordbox"
 asset_dir = Path(os.environ.get("REKORDPOD_ASSET_DIR", installer_dir / "assets"))
-ipod6g = asset_dir / "rekordpod-public-beta-1-ipod6g.zip"
+ipod6g = asset_dir / "rekordpod-public-beta-2-ipod6g.zip"
 
 for required in (ipod6g,):
     if not required.is_file():
@@ -94,7 +94,7 @@ if sys.platform == "darwin":
         version="1.0.0b1",
         info_plist={
             "CFBundleDisplayName": "Rekordpod Installer",
-            "CFBundleShortVersionString": "1.0.0-beta.1",
+            "CFBundleShortVersionString": "1.0.0-beta.2",
             "NSHighResolutionCapable": True,
             "NSRemovableVolumesUsageDescription": (
                 "Rekordpod reads the iPod you select and installs its firmware "

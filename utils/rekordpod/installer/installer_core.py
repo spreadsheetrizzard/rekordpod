@@ -31,11 +31,11 @@ import zipfile
 
 
 APP_NAME = "Rekordpod Installer"
-APP_VERSION = "1.0.0-beta.1"
+APP_VERSION = "1.0.0-beta.2"
 CACHE_FORMAT_VERSION = "rekordpod-installer-cache-1"
 
 TARGET_ASSETS = {
-    "ipod6g": "rekordpod-public-beta-1-ipod6g.zip",
+    "ipod6g": "rekordpod-public-beta-2-ipod6g.zip",
 }
 
 PERSISTENT_FILES = (
